@@ -2052,7 +2052,29 @@ def run_once(args: argparse.Namespace) -> dict[str, object]:
     manifest = remote.claim()
     if manifest is None:
         return {"ok": True, "worker": args.worker, "job": None}
-    return run_claimed_job(args, remote, manifest)
+    heartbeat_stop = threading.Event()
+
+    def heartbeat_loop() -> None:
+        while not heartbeat_stop.wait(args.heartbeat_interval):
+            try:
+                remote.heartbeat()
+            except Exception as exc:
+                print(
+                    f"van-compute-worker[{remote.worker}] heartbeat: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_loop,
+        name=f"van-compute-heartbeat-{remote.worker}",
+    )
+    heartbeat_thread.start()
+    try:
+        return run_claimed_job(args, remote, manifest)
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join()
 
 
 class PersistentScheduler:

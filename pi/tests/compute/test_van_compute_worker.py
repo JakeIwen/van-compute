@@ -83,6 +83,61 @@ class RemoteQueueProtocolTests(unittest.TestCase):
         )
 
 
+class RunOnceTests(unittest.TestCase):
+    def test_claimed_job_heartbeats_until_execution_finishes(self):
+        job_started = threading.Event()
+        heartbeat_during_job = threading.Event()
+        release_job = threading.Event()
+        calls = []
+        calls_lock = threading.Lock()
+
+        class Remote:
+            worker = "m4mac"
+
+            def heartbeat(self):
+                with calls_lock:
+                    calls.append("heartbeat")
+                    # One heartbeat happens before claim. Require two more
+                    # while the claimed job is blocked to prove repetition.
+                    if job_started.is_set() and len(calls) >= 3:
+                        heartbeat_during_job.set()
+                return {"worker": self.worker}
+
+            @staticmethod
+            def claim():
+                return {"id": "20260722T120000Z-00000001"}
+
+        def run_job(_args, _remote, manifest):
+            job_started.set()
+            self.assertTrue(release_job.wait(2), "test job was not released")
+            return {"ok": True, "job": manifest["id"]}
+
+        args = argparse.Namespace(worker="m4mac", heartbeat_interval=0.01)
+        result = []
+        with mock.patch.object(worker, "make_remote", return_value=Remote()), mock.patch.object(
+            worker, "run_claimed_job", side_effect=run_job
+        ):
+            thread = threading.Thread(target=lambda: result.append(worker.run_once(args)))
+            thread.start()
+            self.assertTrue(job_started.wait(1), "run-once job did not start")
+            self.assertTrue(
+                heartbeat_during_job.wait(1),
+                "run-once lease was not refreshed during execution",
+            )
+            release_job.set()
+            thread.join(2)
+
+        self.assertFalse(thread.is_alive(), "run-once worker did not stop")
+        self.assertEqual(result[0]["ok"], True)
+        with calls_lock:
+            count_after_finish = len(calls)
+        self.assertGreaterEqual(count_after_finish, 3)
+        heartbeat_during_job.clear()
+        self.assertFalse(heartbeat_during_job.wait(0.03))
+        with calls_lock:
+            self.assertEqual(len(calls), count_after_finish)
+
+
 def scheduler_args():
     return argparse.Namespace(
         worker="m4mac",
