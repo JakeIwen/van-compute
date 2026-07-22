@@ -122,8 +122,8 @@ ssh pi@vanpi '
   cd /home/pi/dev/obd-things
   test ! -e .van-compute.json
   test ! -L .van-compute.json
-  install -m 600 /home/pi/scripts/van-compute-obd.example.json .van-compute.json
-  /home/pi/scripts/pi_compute.py tasks
+  install -m 600 /home/pi/scripts/compute/van-compute-obd.example.json .van-compute.json
+  /home/pi/scripts/compute/pi_compute.py tasks
 '
 ```
 
@@ -158,44 +158,44 @@ configured on the Mac.
 List the named tasks:
 
 ```bash
-/home/pi/scripts/pi_compute.py tasks
+/home/pi/scripts/compute/pi_compute.py tasks
 ```
 
 Submit work and wait for a bounded time:
 
 ```bash
 # Portable AlfaOBD DAT smoke tests; pass another -k expression to select a subset.
-/home/pi/scripts/pi_compute.py run repo-tests --wait 1800
+/home/pi/scripts/compute/pi_compute.py run repo-tests --wait 1800
 
 # Existing fixed offline capture summary.
-/home/pi/scripts/pi_compute.py run can-capture-summary \
+/home/pi/scripts/compute/pi_compute.py run can-capture-summary \
   --input /home/pi/dev/obd-things/tmp/captures/ccan/drive.log \
   --arg=--snapshot --wait 600
 
 # Exactly one read-only SQL query.
-/home/pi/scripts/pi_compute.py run sqlite-query \
+/home/pi/scripts/compute/pi_compute.py run sqlite-query \
   --input /home/pi/dev/obd-things/tmp/example.sqlite3 \
   --arg='SELECT name FROM sqlite_master ORDER BY name' --wait 600
 
 # Remote-only corpus search through a configured dataset alias.
-/home/pi/scripts/pi_compute.py run oem-corpus-search \
+/home/pi/scripts/compute/pi_compute.py run oem-corpus-search \
   --arg='diagnostic trouble code' --wait 600
 
 # Remote-only decompilation; the declared directory returns as jadx.tar.gz.
-/home/pi/scripts/pi_compute.py run apk-decompile \
+/home/pi/scripts/compute/pi_compute.py run apk-decompile \
   --input /home/pi/dev/obd-things/tmp/android/base.apk --wait 3600
 ```
 
 Inspect and retrieve results without knowing the queue layout:
 
 ```bash
-/home/pi/scripts/pi_compute.py list
-/home/pi/scripts/pi_compute.py status JOB_ID
-/home/pi/scripts/pi_compute.py wait JOB_ID --timeout 3600
-/home/pi/scripts/pi_compute.py result JOB_ID stdout.txt
-/home/pi/scripts/pi_compute.py result JOB_ID stderr.txt >&2
-/home/pi/scripts/pi_compute.py result JOB_ID summary.json > tmp/summary.json
-/home/pi/scripts/pi_compute.py result JOB_ID jadx.tar.gz > tmp/jadx.tar.gz
+/home/pi/scripts/compute/pi_compute.py list
+/home/pi/scripts/compute/pi_compute.py status JOB_ID
+/home/pi/scripts/compute/pi_compute.py wait JOB_ID --timeout 3600
+/home/pi/scripts/compute/pi_compute.py result JOB_ID stdout.txt
+/home/pi/scripts/compute/pi_compute.py result JOB_ID stderr.txt >&2
+/home/pi/scripts/compute/pi_compute.py result JOB_ID summary.json > tmp/summary.json
+/home/pi/scripts/compute/pi_compute.py result JOB_ID jadx.tar.gz > tmp/jadx.tar.gz
 ```
 
 Inputs must be regular, non-symlink files inside the selected source root. The
@@ -233,7 +233,7 @@ tail -n 100 "$HOME/Library/Caches/van-compute/logs/worker.stderr.log"
 ```
 
 ```bash
-ssh pi@vanpi '/home/pi/scripts/van_compute.py available'
+ssh pi@vanpi '/home/pi/scripts/compute/van_compute.py available'
 ssh pi@vanpi 'systemctl status van-compute-broker --no-pager'
 ssh pi@vanpi 'journalctl -u van-compute-broker -n 100 --no-pager'
 ```
@@ -241,7 +241,7 @@ ssh pi@vanpi 'journalctl -u van-compute-broker -n 100 --no-pager'
 ## Drop-in agent instructions
 
 ```markdown
-Always send CPU- or memory-intensive offline commands—including repository tests, APK/decompilation, SQLite queries, large corpus searches, Python analysis, and saved CAN or AlfaOBD log analysis—to `/home/pi/scripts/pi_compute.py` as named tasks; never run those commands directly on vanpi. The compute service decides availability, Mac-versus-Pi placement, fallback, resource limits, and scheduling. Use `/home/pi/scripts/pi_compute.py tasks` to discover task names. If no suitable task exists, add or review a `.van-compute.json` task instead of bypassing the service. Submit independent jobs before waiting when work can run in parallel.
+Always send CPU- or memory-intensive offline commands—including repository tests, APK/decompilation, SQLite queries, large corpus searches, Python analysis, and saved CAN or AlfaOBD log analysis—to `/home/pi/scripts/compute/pi_compute.py` as named tasks; never run those commands directly on vanpi. The compute service decides availability, Mac-versus-Pi placement, fallback, resource limits, and scheduling. Use `/home/pi/scripts/compute/pi_compute.py tasks` to discover task names. If no suitable task exists, add or review a `.van-compute.json` task instead of bypassing the service. Submit independent jobs before waiting when work can run in parallel.
 
 Never send live CAN/SocketCAN access, interface setup, bus wake or UDS transmission, ADB/device access, network changes, mounts/storage operations, or service control through `pi_compute`; those remain local under their existing safety and authorization rules.
 ```

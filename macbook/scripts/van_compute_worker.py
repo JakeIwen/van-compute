@@ -44,7 +44,7 @@ from shared.python import van_compute_protocol as protocol
 
 
 DEFAULT_HOST = "pi@vanpi"
-DEFAULT_REMOTE_CLI = "/home/pi/scripts/van_compute.py"
+DEFAULT_REMOTE_CLI = "/home/pi/scripts/compute/van_compute.py"
 DEFAULT_PRIVATE_ROOT = Path.home() / "Library" / "Caches" / "van-compute"
 DEFAULT_WORK_ROOT = DEFAULT_PRIVATE_ROOT / "jobs"
 DEFAULT_CONTROL_PATH = DEFAULT_PRIVATE_ROOT / "ssh" / "control.sock"

@@ -39,14 +39,14 @@ import time
 from typing import Callable, Mapping, Sequence
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 if (REPOSITORY_ROOT / "shared" / "python").is_dir():
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 
 def _import_queue():
     try:
-        from pi.scripts import van_compute as queue_module
+        from pi.scripts.compute import van_compute as queue_module
 
         return queue_module
     except ModuleNotFoundError:

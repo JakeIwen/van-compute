@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 from macbook.scripts import van_compute_worker as worker
-from pi.scripts import van_compute as queue
+from pi.scripts.compute import van_compute as queue
 from shared.python import van_compute_protocol as protocol
 from shared.python import van_compute_metrics as metrics
 

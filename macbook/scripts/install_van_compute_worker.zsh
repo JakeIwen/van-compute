@@ -17,6 +17,8 @@ dataset_target="$support_root/datasets.json"
 user_id="$(id -u)"
 install_id="$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
 remote_stage="/home/pi/.cache/van-compute-install.$install_id"
+remote_compute_root="/home/pi/scripts/compute"
+upgrade_public_root=""
 allow_unsandboxed="${VAN_COMPUTE_ALLOW_UNSANDBOXED:-0}"
 dataset_source="${VAN_COMPUTE_DATASET_CONFIG:-}"
 installer_lock="$support_root/installer.lock"
@@ -35,7 +37,7 @@ rollback_safe=1
 
 restore_submission_cli() {
   /usr/bin/ssh "$pi_host" \
-    "/usr/bin/python3 '$remote_stage/van_compute_upgrade_gate.py' --restore --owner '$maintenance_owner'"
+    "/usr/bin/python3 '$remote_stage/van_compute_upgrade_gate.py' --restore --owner '$maintenance_owner' --script-root '$upgrade_public_root'"
 }
 
 cleanup() {
@@ -371,10 +373,10 @@ echo "Deploying the Pi queue CLI and shared protocol..."
 /usr/bin/ssh "$pi_host" "install -d -m 700 '$remote_stage'"
 remote_stage_created=1
 /usr/bin/scp \
-  "$repo_root/pi/scripts/van_compute.py" \
-  "$repo_root/pi/scripts/pi_compute.py" \
-  "$repo_root/pi/scripts/van_compute_broker.py" \
-  "$repo_root/pi/scripts/van_compute_upgrade_gate.py" \
+  "$repo_root/pi/scripts/compute/van_compute.py" \
+  "$repo_root/pi/scripts/compute/pi_compute.py" \
+  "$repo_root/pi/scripts/compute/van_compute_broker.py" \
+  "$repo_root/pi/scripts/compute/van_compute_upgrade_gate.py" \
   "$repo_root/pi/services/van-compute-broker.service" \
   "$repo_root/pi/configs/van-compute-obd.example.json" \
   "$repo_root/shared/python/van_compute_protocol.py" \
@@ -409,6 +411,42 @@ echo "Validating the staged Pi broker before stopping the current worker..."
   sudo -n /usr/bin/systemd-analyze verify '$remote_stage/van-compute-broker.service' >/dev/null
 "
 
+# The first run after this layout change fences the legacy public CLI; later
+# runs fence the new compute-directory CLI. An interrupted migration keeps its
+# owner record beside the exact target that must be resumed.
+upgrade_public_root="$(
+  /usr/bin/ssh "$pi_host" '
+    set -eu
+    legacy=/home/pi/scripts
+    current=/home/pi/scripts/compute
+    legacy_owner=$legacy/.van-compute-upgrade-owner
+    current_owner=$current/.van-compute-upgrade-owner
+    if { test -e "$legacy_owner" || test -L "$legacy_owner"; } && \
+       { test -e "$current_owner" || test -L "$current_owner"; }; then
+      echo "Both legacy and current compute upgrade owners exist." >&2
+      exit 1
+    elif test -e "$current_owner" || test -L "$current_owner"; then
+      printf "%s\n" "$current"
+    elif test -e "$legacy_owner" || test -L "$legacy_owner"; then
+      printf "%s\n" "$legacy"
+    elif test -L "$current/van_compute.py" || test -L "$legacy/van_compute.py"; then
+      echo "A deployed compute CLI is a symlink; refusing migration." >&2
+      exit 1
+    elif test -f "$current/van_compute.py"; then
+      printf "%s\n" "$current"
+    elif test -f "$legacy/van_compute.py"; then
+      printf "%s\n" "$legacy"
+    else
+      echo "No deployed van_compute.py exists to upgrade." >&2
+      exit 1
+    fi
+  '
+)"
+if [[ "$upgrade_public_root" != /home/pi/scripts && "$upgrade_public_root" != "$remote_compute_root" ]]; then
+  echo "Invalid deployed compute root returned by $pi_host: $upgrade_public_root" >&2
+  exit 1
+fi
+
 active_queue_jobs() {
   /usr/bin/ssh "$pi_host" "/usr/bin/python3 -c '
 from pathlib import Path
@@ -433,6 +471,7 @@ activate_submission_gate() {
     /usr/bin/python3 "$remote_stage/van_compute_upgrade_gate.py"
     --acquire --owner "$maintenance_owner"
     --gate "$remote_stage/van_compute_upgrade_gate.py"
+    --script-root "$upgrade_public_root"
   )
   if [[ "$allow_existing_backup" == 1 ]]; then
     gate_arguments+=(--allow-existing-backup)
@@ -579,23 +618,25 @@ remote_upgrade_started=1
   /home/pi/.local/share/van-compute/venv/bin/python3 -c 'import isotp, pytest'
 
   install -d -m 700 \
+    /home/pi/scripts/compute \
+    /home/pi/scripts/compute/python-automation \
     /home/pi/scripts/python-automation \
     /home/pi/scripts/python-automation/templates \
     /home/pi/scripts/python-automation/static
   # The public CLI is still the all-blocking gate here. Install its protocol
   # dependency and the other consumers before atomically publishing the CLI.
-  install -m 600 '$remote_stage/van_compute_protocol.py' /home/pi/scripts/python-automation/van_compute_protocol.py
+  install -m 600 '$remote_stage/van_compute_protocol.py' /home/pi/scripts/compute/python-automation/van_compute_protocol.py
   install -m 600 '$remote_stage/van_compute_metrics.py' /home/pi/scripts/python-automation/van_compute_metrics.py
-  install -m 700 '$remote_stage/van_compute_broker.py' /home/pi/scripts/van_compute_broker.py
-  install -m 700 '$remote_stage/van_compute_upgrade_gate.py' /home/pi/scripts/van_compute_upgrade_gate.py
-  install -m 600 '$remote_stage/van-compute-obd.example.json' /home/pi/scripts/van-compute-obd.example.json
+  install -m 700 '$remote_stage/van_compute_broker.py' /home/pi/scripts/compute/van_compute_broker.py
+  install -m 700 '$remote_stage/van_compute_upgrade_gate.py' /home/pi/scripts/compute/van_compute_upgrade_gate.py
+  install -m 600 '$remote_stage/van-compute-obd.example.json' /home/pi/scripts/compute/van-compute-obd.example.json
   install -m 600 '$remote_stage/van_dashboard.html' /home/pi/scripts/python-automation/templates/van_dashboard.html
   install -m 600 '$remote_stage/van_dashboard.js' /home/pi/scripts/python-automation/static/van_dashboard.js
   install -m 600 '$remote_stage/van_dashboard.css' /home/pi/scripts/python-automation/static/van_dashboard.css
   sudo -n install -m 644 '$remote_stage/van-compute-broker.service' /etc/systemd/system/van-compute-broker.service
-  install -m 700 '$remote_stage/pi_compute.py' /home/pi/scripts/pi_compute.py
-  install -m 700 '$remote_stage/van_compute.py' /home/pi/scripts/.van_compute.py.install.$install_id
-  mv -f -- /home/pi/scripts/.van_compute.py.install.$install_id /home/pi/scripts/van_compute.py
+  install -m 700 '$remote_stage/pi_compute.py' /home/pi/scripts/compute/pi_compute.py
+  install -m 700 '$remote_stage/van_compute.py' /home/pi/scripts/compute/.van_compute.py.install.$install_id
+  mv -f -- /home/pi/scripts/compute/.van_compute.py.install.$install_id /home/pi/scripts/compute/van_compute.py
 
   rm -f \
     '$remote_stage/van_compute.py' \
@@ -612,8 +653,8 @@ remote_upgrade_started=1
   rm -f '$remote_stage/python-automation/van_compute_protocol.py'
   rmdir '$remote_stage/python-automation'
   rmdir '$remote_stage'
-  /home/pi/scripts/van_compute.py tasks >/dev/null
-  /home/pi/scripts/pi_compute.py tasks >/dev/null
+  /home/pi/scripts/compute/van_compute.py tasks >/dev/null
+  /home/pi/scripts/compute/pi_compute.py tasks >/dev/null
   sudo -n systemctl daemon-reload
   sudo -n systemctl enable van-compute-broker.service
   sudo -n systemctl restart van-compute-broker.service
@@ -654,7 +695,7 @@ fi
 /usr/bin/install -m 600 "$plist_stage" "$target_plist"
 
 previous_coordinator_seen="$(
-  /usr/bin/ssh "$pi_host" /home/pi/scripts/van_compute.py available |
+  /usr/bin/ssh "$pi_host" /home/pi/scripts/compute/van_compute.py available |
     /opt/homebrew/bin/python3 -c '
 import json
 import sys
@@ -671,7 +712,7 @@ restore_previous_agent=0
 echo "Installed. Waiting for the 10-slot scheduler heartbeat..."
 heartbeat=""
 for attempt in {1..45}; do
-  heartbeat="$(/usr/bin/ssh "$pi_host" /home/pi/scripts/van_compute.py available)"
+  heartbeat="$(/usr/bin/ssh "$pi_host" /home/pi/scripts/compute/van_compute.py available)"
   if print -r -- "$heartbeat" | /opt/homebrew/bin/python3 -c '
 import json
 import sys
@@ -689,10 +730,30 @@ raise SystemExit(
 ' "$worker_name" "$previous_coordinator_seen"; then
     # The helper holds a Pi-side cross-installer lock while it verifies this
     # owner, removes rollback artifacts, and releases queue maintenance.
-    /usr/bin/ssh "$pi_host" \
-      "/usr/bin/python3 /home/pi/scripts/van_compute_upgrade_gate.py --finalize --owner '$maintenance_owner'" >/dev/null
+    finalize_arguments=(
+      /usr/bin/python3 /home/pi/scripts/compute/van_compute_upgrade_gate.py
+      --finalize --owner "$maintenance_owner"
+      --script-root "$upgrade_public_root"
+    )
+    if [[ "$upgrade_public_root" == /home/pi/scripts ]]; then
+      finalize_arguments+=(
+        --queue-cli /home/pi/scripts/compute/van_compute.py
+        --retire-target
+      )
+    fi
+    /usr/bin/ssh "$pi_host" "${(q)finalize_arguments[@]}" >/dev/null
     maintenance_active=0
     submission_gate_active=0
+    # The new CLI has released maintenance; remove only the retired flat-layout
+    # compute files now that every installed reference points at compute/.
+    /usr/bin/ssh "$pi_host" "/bin/rm -f -- \
+      /home/pi/scripts/van_compute.py \
+      /home/pi/scripts/pi_compute.py \
+      /home/pi/scripts/van_compute_broker.py \
+      /home/pi/scripts/van_compute_upgrade_gate.py \
+      /home/pi/scripts/van-compute-obd.example.json \
+      /home/pi/scripts/.van-compute-upgrade.lock \
+      /home/pi/scripts/python-automation/van_compute_protocol.py"
     previous_kept=0
     for candidate in "$release_parent"/*(N/om); do
       [[ "$candidate" == "$release" ]] && continue

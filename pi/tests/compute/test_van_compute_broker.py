@@ -12,9 +12,9 @@ import time
 import unittest
 from unittest import mock
 
-from pi.scripts import pi_compute
-from pi.scripts import van_compute as queue
-from pi.scripts import van_compute_broker as broker
+from pi.scripts.compute import pi_compute
+from pi.scripts.compute import van_compute as queue
+from pi.scripts.compute import van_compute_broker as broker
 from shared.python import van_compute_protocol as protocol
 
 
