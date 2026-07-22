@@ -122,6 +122,10 @@ class VanComputeDeploymentTests(unittest.TestCase):
         installer = INSTALLER.read_text(encoding="utf-8")
 
         self.assertLess(
+            installer.index("Checking macOS sandbox capability"),
+            installer.index("Checking and provisioning local worker dependencies"),
+        )
+        self.assertLess(
             installer.index("Checking SSH access and Pi prerequisites"),
             installer.index("Building an isolated Python environment"),
         )
@@ -138,6 +142,18 @@ class VanComputeDeploymentTests(unittest.TestCase):
         self.assertIn("release_published=0", installer)
         self.assertIn("if (( ! release_published ))", installer)
         self.assertIn("release_published=1", installer)
+        self.assertIn('sandbox_check "profile application"', installer)
+        self.assertIn('sandbox_check "Python imports and isolation policy"', installer)
+        self.assertIn('sandbox_check "ripgrep runtime"', installer)
+        self.assertIn('sandbox_check "SQLite runtime"', installer)
+        self.assertIn('sandbox_check "JADX runtime"', installer)
+        self.assertIn('cd "$sandbox_test"', installer)
+        self.assertIn('/usr/bin/env -i', installer)
+        self.assertIn('PYTHONNOUSERSITE=1', installer)
+        self.assertGreater(
+            installer.index("Checking Mac process-group resource watchdog"),
+            installer.index("WARNING: VAN_COMPUTE_ALLOW_UNSANDBOXED=1"),
+        )
 
     def test_example_tasks_are_a_valid_repository_manifest(self):
         with tempfile.TemporaryDirectory() as directory:

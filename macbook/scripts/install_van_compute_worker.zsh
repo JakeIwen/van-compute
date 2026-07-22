@@ -29,6 +29,7 @@ staging=""
 release=""
 release_published=0
 dataset_staging=""
+sentinel=""
 restore_previous_agent=0
 remote_upgrade_started=0
 remote_stage_created=0
@@ -37,6 +38,14 @@ maintenance_active=0
 maintenance_owner=""
 submission_gate_active=0
 rollback_safe=1
+
+cleanup_sandbox_sentinel() {
+  if [[ -n "$sentinel" && -f "$sentinel" && ! -L "$sentinel" && \
+        "$sentinel" == "$cache_root"/.sandbox-sentinel.* ]]; then
+    /bin/rm -f -- "$sentinel"
+    sentinel=""
+  fi
+}
 
 restore_submission_cli() {
   /usr/bin/ssh "$pi_host" \
@@ -79,6 +88,7 @@ cleanup() {
   if [[ -n "$dataset_staging" && -f "$dataset_staging" && "$dataset_staging" == "$support_root"/.datasets.json.* ]]; then
     /bin/rm -f -- "$dataset_staging"
   fi
+  cleanup_sandbox_sentinel
   if (( previous_agent_disabled && rollback_safe )); then
     /bin/launchctl enable "gui/$user_id/$label" >/dev/null 2>&1 || true
   fi
@@ -96,6 +106,25 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+# Applying a second Seatbelt profile from an already sandboxed parent fails
+# with status 71. Detect that before Homebrew or pip can do expensive work.
+if [[ "$allow_unsandboxed" != 1 ]]; then
+  echo "Checking macOS sandbox capability..."
+  sandbox_capability_output=""
+  if sandbox_capability_output="$(
+    /usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true 2>&1
+  )"; then
+    :
+  else
+    sandbox_capability_status=$?
+    [[ -z "$sandbox_capability_output" ]] || print -r -- "$sandbox_capability_output" >&2
+    echo "macOS could not apply a sandbox profile (status $sandbox_capability_status)." >&2
+    echo "Open a fresh Terminal.app or iTerm window outside Codex/another sandbox and rerun." >&2
+    echo "Do not use VAN_COMPUTE_ALLOW_UNSANDBOXED solely to bypass this environment check." >&2
+    exit 1
+  fi
+fi
 
 echo "Checking local installer prerequisites..."
 [[ -x /opt/homebrew/bin/brew ]] || {
@@ -330,10 +359,42 @@ if [[ "$allow_unsandboxed" != 1 ]]; then
     sandbox_arguments+=(-D "DATASET_${index}=/dev/null")
   done
   sandbox_run() {
-    /usr/bin/sandbox-exec "${sandbox_arguments[@]}" \
-      /usr/bin/env HOME="$sandbox_test" TMPDIR="$sandbox_test/" "$@"
+    (
+      cd "$sandbox_test"
+      /usr/bin/sandbox-exec "${sandbox_arguments[@]}" \
+        /usr/bin/env -i \
+          HOME="$sandbox_test" \
+          TMPDIR="$sandbox_test/" \
+          XDG_CACHE_HOME="$sandbox_test" \
+          XDG_CONFIG_HOME="$sandbox_test/.config" \
+          LANG="en_US.UTF-8" \
+          LC_ALL="en_US.UTF-8" \
+          PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+          PYTHONNOUSERSITE=1 \
+          PYTHONDONTWRITEBYTECODE=1 \
+          "$@"
+    )
   }
-  if ! sandbox_run "$staging/venv/bin/python" -c '
+  sandbox_check() {
+    local label="$1"
+    shift
+    local output=""
+    local status=0
+    if output="$(sandbox_run "$@" 2>&1)"; then
+      return 0
+    else
+      status=$?
+    fi
+    [[ -z "$output" ]] || print -r -- "$output" >&2
+    echo "Sandbox validation stage failed: $label (status $status)." >&2
+    return "$status"
+  }
+  if ! sandbox_check "profile application" /usr/bin/true; then
+    cleanup_sandbox_sentinel
+    echo "The generated sandbox profile could not be applied; the existing LaunchAgent was not replaced." >&2
+    exit 1
+  fi
+  if ! sandbox_check "Python imports and isolation policy" "$staging/venv/bin/python" -c '
 import errno
 from pathlib import Path
 import socket
@@ -359,30 +420,48 @@ for index, raw_sentinel in enumerate(sys.argv[2:]):
             raise
     else:
         raise SystemExit(f"sandbox read a private-home sentinel via {sentinel}")
-probe_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+probe_socket = None
 try:
+    probe_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     probe_socket.sendto(b"x", ("127.0.0.1", 9))
 except OSError as exc:
     if exc.errno not in {errno.EACCES, errno.EPERM}:
         raise
 else:
     raise SystemExit("sandbox allowed network output")
+finally:
+    if probe_socket is not None:
+        probe_socket.close()
 ' "$sandbox_test" "$sentinel" "/System/Volumes/Data$sentinel"; then
-    /bin/rm -f -- "$sentinel"
-    echo "Sandbox validation failed. The existing LaunchAgent was not replaced." >&2
-    echo "Run this installer from a normal Terminal, outside another app sandbox." >&2
-    echo "Emergency review-only escape hatch: VAN_COMPUTE_ALLOW_UNSANDBOXED=1 $0" >&2
+    cleanup_sandbox_sentinel
+    echo "The Python sandbox policy check failed; the existing LaunchAgent was not replaced." >&2
     exit 1
   fi
-  if ! sandbox_run /opt/homebrew/bin/rg --fixed-strings ok "$sandbox_test/allowed.txt" >/dev/null \
-    || ! sandbox_run /usr/bin/sqlite3 -readonly -batch :memory: 'select 1;' >/dev/null \
-    || ! sandbox_run /opt/homebrew/bin/jadx --version >/dev/null; then
-    /bin/rm -f -- "$sentinel"
-    echo "Sandbox blocked a required worker runtime (rg, sqlite3, or jadx)." >&2
-    echo "The existing LaunchAgent was not replaced; inspect the denial before relaxing policy." >&2
+  if ! sandbox_check "ripgrep runtime" \
+      /opt/homebrew/bin/rg --fixed-strings ok "$sandbox_test/allowed.txt"; then
+    cleanup_sandbox_sentinel
+    echo "The existing LaunchAgent was not replaced." >&2
     exit 1
   fi
-  if ! "$staging/venv/bin/python" -c '
+  if ! sandbox_check "SQLite runtime" \
+      /usr/bin/sqlite3 -readonly -batch :memory: 'select 1;'; then
+    cleanup_sandbox_sentinel
+    echo "The existing LaunchAgent was not replaced." >&2
+    exit 1
+  fi
+  if ! sandbox_check "JADX runtime" /opt/homebrew/bin/jadx --version; then
+    cleanup_sandbox_sentinel
+    echo "The existing LaunchAgent was not replaced." >&2
+    exit 1
+  fi
+  cleanup_sandbox_sentinel
+else
+  echo "WARNING: VAN_COMPUTE_ALLOW_UNSANDBOXED=1 disables OS-level job isolation." >&2
+  echo "Jobs still get private HOME/TMP/env and limits, but can address host files/network." >&2
+fi
+
+echo "Checking Mac process-group resource watchdog..."
+if ! "$staging/venv/bin/python" -c '
 import os
 import subprocess
 result = subprocess.run(
@@ -395,15 +474,9 @@ group = os.getpgrp()
 rows = [line.split() for line in result.stdout.splitlines()]
 assert any(len(row) == 2 and int(row[0]) == group and int(row[1]) >= 0 for row in rows)
 '; then
-    /bin/rm -f -- "$sentinel"
-    echo "The Mac process-group resource watchdog cannot inspect processes." >&2
-    echo "Run this installer from a normal Terminal, outside another app sandbox." >&2
-    exit 1
-  fi
-  /bin/rm -f -- "$sentinel"
-else
-  echo "WARNING: VAN_COMPUTE_ALLOW_UNSANDBOXED=1 disables OS-level job isolation." >&2
-  echo "Jobs still get private HOME/TMP/env and limits, but can address host files/network." >&2
+  echo "The Mac process-group resource watchdog cannot inspect processes." >&2
+  echo "Run this installer from a normal Terminal, outside another app sandbox." >&2
+  exit 1
 fi
 
 release_id="$(/bin/date -u +%Y%m%dT%H%M%SZ)-$$"

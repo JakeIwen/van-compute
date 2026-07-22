@@ -86,11 +86,16 @@ system.
 
 ## Install
 
-From this checkout on the Mac:
+From this checkout in a freshly opened Terminal.app or iTerm window—not a
+Codex-managed or otherwise sandboxed shell:
 
 ```zsh
 ./macbook/scripts/install_van_compute_worker.zsh
 ```
+
+macOS cannot apply the worker's Seatbelt profile from inside another sandbox.
+The installer checks that capability before downloading or building anything
+and fails closed if profiles cannot be nested in its current environment.
 
 The installer provisions a private Mac Python environment and required offline
 tools, validates the Mac sandbox, deploys the Pi queue/frontend/broker plus the
