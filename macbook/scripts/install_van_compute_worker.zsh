@@ -50,4 +50,17 @@ echo "Installing the local worker and per-user LaunchAgent..."
 /bin/launchctl kickstart -k "gui/$user_id/$label"
 
 echo "Installed. Worker heartbeat:"
-/usr/bin/ssh "$pi_host" /home/pi/scripts/van_compute.py available
+heartbeat=""
+for attempt in {1..20}; do
+  heartbeat="$(/usr/bin/ssh "$pi_host" /home/pi/scripts/van_compute.py available)"
+  if print -r -- "$heartbeat" | /opt/homebrew/bin/python3 -c \
+    'import json, sys; raise SystemExit(not json.load(sys.stdin).get("available", False))'; then
+    print -r -- "$heartbeat"
+    exit 0
+  fi
+  /bin/sleep 1
+done
+
+print -r -- "$heartbeat"
+echo "Worker did not publish a fresh heartbeat within 20 seconds." >&2
+exit 1
