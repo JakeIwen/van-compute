@@ -379,15 +379,15 @@ if [[ "$allow_unsandboxed" != 1 ]]; then
     local label="$1"
     shift
     local output=""
-    local status=0
+    local exit_code=0
     if output="$(sandbox_run "$@" 2>&1)"; then
       return 0
     else
-      status=$?
+      exit_code=$?
     fi
     [[ -z "$output" ]] || print -r -- "$output" >&2
-    echo "Sandbox validation stage failed: $label (status $status)." >&2
-    return "$status"
+    echo "Sandbox validation stage failed: $label (status $exit_code)." >&2
+    return "$exit_code"
   }
   if ! sandbox_check "profile application" /usr/bin/true; then
     cleanup_sandbox_sentinel
