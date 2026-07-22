@@ -6,21 +6,36 @@
     <string>com.jacobr.van-compute-worker</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/homebrew/bin/python3</string>
-        <string>/Users/jacobr/Library/Application Support/van-compute/macbook/scripts/van_compute_worker.py</string>
+        <string>/Users/jacobr/Library/Caches/van-compute/venv/bin/python</string>
+        <string>/Users/jacobr/Library/Caches/van-compute/app/macbook/scripts/van_compute_worker.py</string>
+        <string>--serve</string>
         <string>--host</string>
         <string>pi@vanpi</string>
         <string>--worker</string>
         <string>m4mac</string>
+        <string>--python</string>
+        <string>/Users/jacobr/Library/Caches/van-compute/venv/bin/python</string>
+        <string>--work-root</string>
+        <string>/Users/jacobr/Library/Caches/van-compute/jobs</string>
+        <string>--control-path</string>
+        <string>/Users/jacobr/Library/Caches/van-compute/ssh/control.sock</string>
+        <string>--sandbox-profile</string>
+        <string>/Users/jacobr/Library/Caches/van-compute/sandbox.sb</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
-    <key>StartInterval</key>
-    <integer>15</integer>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/jacobr/Library/Caches/van-compute/logs/worker.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jacobr/Library/Caches/van-compute/logs/worker.stderr.log</string>
     <key>ProcessType</key>
     <string>Background</string>
-    <key>Nice</key>
-    <integer>10</integer>
     <key>LowPriorityIO</key>
     <true/>
 </dict>

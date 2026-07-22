@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "name": "repo-tests",
+      "description": "Run portable selected offline obd-things tests (AlfaOBD DAT smoke tests by default).",
+      "profile": "repo-test",
+      "source_paths": [
+        "lib",
+        "tools",
+        "tests",
+        "live_data",
+        "projects/ecu_mapping",
+        "projects/tpms"
+      ],
+      "minimum_inputs": 0,
+      "maximum_inputs": 0,
+      "argv": [
+        "-q",
+        "tests",
+        "-k",
+        "alfaobd_dat",
+        "{arguments}"
+      ],
+      "outputs": []
+    },
+    {
+      "name": "alfaobd-apk-extract",
+      "description": "Extract the AlfaOBD SQLite catalog and English labels from a submitted APK.",
+      "profile": "python-script",
+      "source_paths": [
+        "tools/alfaobd_apk_db.py"
+      ],
+      "minimum_inputs": 1,
+      "maximum_inputs": 1,
+      "argv": [
+        "{source:tools/alfaobd_apk_db.py}",
+        "{input:0}",
+        "--output",
+        "{result:alfaobd.db}",
+        "--labels-output",
+        "{result:alfaobd5_en.txt}"
+      ],
+      "outputs": [
+        "alfaobd.db",
+        "alfaobd5_en.txt"
+      ]
+    },
+    {
+      "name": "alfaobd-dat-inventory",
+      "description": "Inventory one saved AlfaOBD plot-series DAT file.",
+      "profile": "python-script",
+      "source_paths": [
+        "tools/alfaobd_dat.py"
+      ],
+      "minimum_inputs": 1,
+      "maximum_inputs": 1,
+      "argv": [
+        "{source:tools/alfaobd_dat.py}",
+        "{input:0}",
+        "--json",
+        "{result:dat-report.json}"
+      ],
+      "outputs": [
+        "dat-report.json"
+      ]
+    },
+    {
+      "name": "alfaobd-dat-compare",
+      "description": "Compare current and baseline AlfaOBD plot-series DAT files.",
+      "profile": "can-log-batch",
+      "source_paths": [
+        "tools/alfaobd_dat.py"
+      ],
+      "minimum_inputs": 2,
+      "maximum_inputs": 2,
+      "argv": [
+        "{source:tools/alfaobd_dat.py}",
+        "{input:0}",
+        "--baseline",
+        "{input:1}",
+        "--json",
+        "{result:dat-comparison.json}"
+      ],
+      "outputs": [
+        "dat-comparison.json"
+      ]
+    },
+    {
+      "name": "alfaobd-gauge-inventory",
+      "description": "Inventory an exported AlfaOBD Gauges_Data archive.",
+      "profile": "python-script",
+      "source_paths": [
+        "tools/alfaobd_gauges.py"
+      ],
+      "minimum_inputs": 1,
+      "maximum_inputs": 1,
+      "argv": [
+        "{source:tools/alfaobd_gauges.py}",
+        "{input:0}",
+        "--out-dir",
+        "{result:gauge-reports}"
+      ],
+      "outputs": [
+        "gauge-reports"
+      ]
+    },
+    {
+      "name": "alfaobd-catalog-export",
+      "description": "Export read-only AlfaOBD catalog evidence from a database and label file.",
+      "profile": "python-script",
+      "source_paths": [
+        "tools/alfaobd_catalog.py"
+      ],
+      "minimum_inputs": 2,
+      "maximum_inputs": 2,
+      "argv": [
+        "{source:tools/alfaobd_catalog.py}",
+        "{input:0}",
+        "{input:1}",
+        "{arguments}",
+        "--output",
+        "{result:catalog.json}"
+      ],
+      "outputs": [
+        "catalog.json"
+      ]
+    },
+    {
+      "name": "sqlite-query",
+      "description": "Run one read-only SQL query against a submitted SQLite database.",
+      "profile": "sqlite-readonly",
+      "source_paths": [],
+      "minimum_inputs": 1,
+      "maximum_inputs": 1,
+      "argv": [
+        "-json",
+        "{input:0}",
+        "{arguments}"
+      ],
+      "outputs": []
+    },
+    {
+      "name": "oem-corpus-search",
+      "description": "Search the configured read-only OEM service-document corpus.",
+      "profile": "corpus-search",
+      "source_paths": [],
+      "minimum_inputs": 0,
+      "maximum_inputs": 0,
+      "datasets": [
+        "oem-service-docs"
+      ],
+      "argv": [
+        "--line-number",
+        "--smart-case",
+        "{arguments}",
+        "{dataset:oem-service-docs}"
+      ],
+      "outputs": []
+    },
+    {
+      "name": "apk-decompile",
+      "description": "Decompile a submitted APK into a returned JADX archive.",
+      "profile": "apk-analyze",
+      "source_paths": [],
+      "minimum_inputs": 1,
+      "maximum_inputs": 1,
+      "argv": [
+        "--output-dir",
+        "{result:jadx}",
+        "{arguments}",
+        "{input:0}"
+      ],
+      "outputs": [
+        "jadx"
+      ]
+    }
+  ]
+}

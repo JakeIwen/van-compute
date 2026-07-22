@@ -1,0 +1,59 @@
+[Unit]
+Description=Van compute placement broker with guarded Pi fallback
+After=local-fs.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+SupplementaryGroups=video
+WorkingDirectory=/home/pi/dev/obd-things
+ExecStartPre=/usr/bin/python3 /home/pi/scripts/van_compute_broker.py --self-test --root /home/pi/dev/obd-things/tmp/compute --work-root /home/pi/dev/obd-things/tmp/compute/local-work --python /home/pi/.local/share/van-compute/venv/bin/python3
+ExecStart=/usr/bin/python3 /home/pi/scripts/van_compute_broker.py --root /home/pi/dev/obd-things/tmp/compute --work-root /home/pi/dev/obd-things/tmp/compute/local-work --python /home/pi/.local/share/van-compute/venv/bin/python3
+Restart=always
+RestartSec=5
+KillMode=control-group
+Nice=10
+UMask=0077
+
+ReadWritePaths=/home/pi/dev/obd-things/tmp/compute
+
+MemoryHigh=768M
+MemoryMax=1G
+MemorySwapMax=0
+CPUQuota=150%
+IOWeight=10
+TasksMax=128
+
+NoNewPrivileges=true
+PrivateDevices=true
+# The parent health probe needs read/write opens for vcgencmd ioctls. Job
+# sandboxes replace /dev entirely, so these devices never reach task code.
+BindPaths=-/dev/vcio -/dev/vchiq
+DeviceAllow=/dev/vcio rw
+DeviceAllow=/dev/vchiq rw
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=user mnt pid net ipc uts
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+InaccessiblePaths=-/run/dbus -/run/systemd -/run/user -/var/run/dbus
+KeyringMode=private
+RemoveIPC=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
