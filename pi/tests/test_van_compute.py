@@ -8,6 +8,7 @@ import unittest
 from macbook.scripts import van_compute_worker as worker
 from pi.scripts import van_compute as queue
 from shared.python import van_compute_protocol as protocol
+from shared.python import van_compute_metrics as metrics
 
 
 SUMMARY_STUB = """#!/usr/bin/env python3
@@ -169,11 +170,91 @@ class WorkerExecutionTests(unittest.TestCase):
             )
             self.assertEqual(exit_code, 0)
             self.assertFalse(execution["timed_out"])
+            self.assertGreaterEqual(execution["resource_usage"]["cpu_seconds"], 0)
+            self.assertGreater(execution["resource_usage"]["peak_rss_bytes"], 0)
+            self.assertEqual(execution["input_bytes"], 0)
             self.assertEqual(
                 json.loads((result / "summary.json").read_text(encoding="utf-8")),
                 {"bytes": 6, "snapshot": True},
             )
             self.assertIn("summarized 6 bytes", (result / "stdout.txt").read_text())
+
+
+class ComputeMetricsTests(unittest.TestCase):
+    NOW = 1_784_681_600.0
+
+    @staticmethod
+    def write_json(path, payload):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_aggregates_worker_resources_and_current_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "compute"
+            self.write_json(
+                root / "workers" / "m4mac.json",
+                {"worker": "m4mac", "seen_at": "2026-07-22T01:59:50+00:00"},
+            )
+            done = root / "done" / "20260722T015900Z-1234abcd"
+            self.write_json(
+                done / "manifest.json",
+                {
+                    "id": done.name,
+                    "task": "can-capture-summary",
+                    "state": "done",
+                    "worker": "m4mac",
+                    "exit_code": 0,
+                    "submitted_at": "2026-07-22T01:58:50+00:00",
+                    "started_at": "2026-07-22T01:59:00+00:00",
+                    "finished_at": "2026-07-22T01:59:05+00:00",
+                    "inputs": [{"size": 10_000}],
+                    "sources": [{"size": 1_000}],
+                    "results": [{"size": 2_000}],
+                },
+            )
+            self.write_json(
+                done / "result" / "execution.json",
+                {
+                    "duration_seconds": 4.0,
+                    "resource_usage": {
+                        "cpu_seconds": 6.0,
+                        "average_cpu_percent": 150.0,
+                        "peak_rss_bytes": 256 * 1024 * 1024,
+                    },
+                },
+            )
+            queued = root / "queued" / "20260722T015950Z-8765abcd"
+            self.write_json(
+                queued / "manifest.json",
+                {
+                    "id": queued.name,
+                    "task": "can-field-finder",
+                    "state": "queued",
+                    "submitted_at": "2026-07-22T01:59:50+00:00",
+                    "inputs": [{"size": 20_000}],
+                },
+            )
+
+            report = metrics.ComputeMetricsReader(root, clock=lambda: self.NOW).report(168)
+
+        self.assertTrue(report["status"]["available"])
+        self.assertEqual(report["status"]["queued"], 1)
+        self.assertEqual(report["summary"]["jobs"], 1)
+        self.assertEqual(report["summary"]["telemetry_jobs"], 1)
+        self.assertEqual(report["summary"]["mac_cpu_seconds"], 6.0)
+        self.assertEqual(report["summary"]["mac_wall_seconds"], 4.0)
+        self.assertEqual(report["summary"]["aggregate_cpu_percent"], 150.0)
+        self.assertEqual(report["summary"]["peak_rss_bytes"], 256 * 1024 * 1024)
+        self.assertEqual(report["summary"]["input_bytes"], 10_000)
+        self.assertEqual(report["tasks"][0]["task"], "can-capture-summary")
+        self.assertEqual(report["tasks"][0]["telemetry_jobs"], 1)
+        self.assertEqual([job["state"] for job in report["jobs"]], ["queued", "done"])
+
+    def test_rejects_unbounded_time_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reader = metrics.ComputeMetricsReader(directory)
+            with self.assertRaisesRegex(ValueError, "6, 24, 168, or 720"):
+                reader.report(999)
 
 
 if __name__ == "__main__":

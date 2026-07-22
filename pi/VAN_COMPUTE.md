@@ -116,6 +116,24 @@ The worker defaults to a one-hour wall-time limit, 128 MiB per result file, at m
 files, one job at a time, and process niceness 10. It uses the Homebrew Python at
 `/opt/homebrew/bin/python3`; NumPy is required by `signal-correlate-analyze`.
 
+## Resource telemetry and dashboard
+
+Each upgraded-worker job records analysis-child user/system CPU time, wall time, average CPU
+utilization, process-tree peak RSS, page faults, context switches, input/source bytes, queue delay,
+and returned-result bytes. The van dashboard reads queue manifests directly through the read-only
+`/api/compute` endpoint and presents:
+
+- current worker heartbeat plus running and queued counts;
+- jobs completed on the Mac rather than on vanpi;
+- measured Mac CPU, wall time, peak job memory, and transferred bytes;
+- recent-job CPU/memory bars and totals grouped by task; and
+- 6-hour, 24-hour, 7-day, and 30-day ranges.
+
+Mac CPU seconds are evidence of work kept off the Pi, but are not a Pi-equivalent time estimate.
+Hardware and implementation performance differ; calibrating that claim would require occasionally
+benchmarking the same representative input on both hosts. Jobs completed before telemetry was
+added remain visible, labeled as lacking resource measurements.
+
 ## Current limitations
 
 - There is no automatic pruning yet; completed jobs must be reviewed before adding deliberate

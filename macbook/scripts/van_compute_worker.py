@@ -239,6 +239,34 @@ def child_limits(nice: int, timeout: int, maximum_file_size: int) -> None:
             pass
 
 
+def child_resource_usage(before, after, wall_seconds: float) -> dict[str, object]:
+    """Return measured analysis-child usage, excluding earlier SSH helpers."""
+    user_seconds = max(0.0, after.ru_utime - before.ru_utime)
+    system_seconds = max(0.0, after.ru_stime - before.ru_stime)
+    cpu_seconds = user_seconds + system_seconds
+    # Darwin reports ru_maxrss in bytes; Linux and most BSD-derived Python
+    # builds report KiB.  The production worker is Darwin, but keeping the
+    # conversion explicit makes local protocol tests portable.
+    peak_rss_bytes = int(after.ru_maxrss)
+    if sys.platform != "darwin":
+        peak_rss_bytes *= 1024
+    return {
+        "user_cpu_seconds": round(user_seconds, 6),
+        "system_cpu_seconds": round(system_seconds, 6),
+        "cpu_seconds": round(cpu_seconds, 6),
+        "average_cpu_percent": (
+            round(100 * cpu_seconds / wall_seconds, 2) if wall_seconds > 0 else None
+        ),
+        "peak_rss_bytes": peak_rss_bytes,
+        "minor_page_faults": max(0, after.ru_minflt - before.ru_minflt),
+        "major_page_faults": max(0, after.ru_majflt - before.ru_majflt),
+        "voluntary_context_switches": max(0, after.ru_nvcsw - before.ru_nvcsw),
+        "involuntary_context_switches": max(0, after.ru_nivcsw - before.ru_nivcsw),
+        "scope": "analysis child process tree",
+        "peak_rss_note": "process-tree upper bound from getrusage(RUSAGE_CHILDREN)",
+    }
+
+
 def execute_job(
     manifest: dict[str, object],
     *,
@@ -286,6 +314,7 @@ def execute_job(
     started = utc_now()
     started_monotonic = time.monotonic()
     timed_out = False
+    usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
         process = subprocess.Popen(
             command,
@@ -308,6 +337,8 @@ def execute_job(
                 os.killpg(process.pid, signal.SIGKILL)
                 exit_code = process.wait()
             exit_code = 124
+    usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    duration_seconds = time.monotonic() - started_monotonic
     execution = {
         "schema_version": protocol.SCHEMA_VERSION,
         "job_id": manifest.get("id"),
@@ -315,10 +346,21 @@ def execute_job(
         "worker": socket.gethostname(),
         "started_at": started,
         "finished_at": utc_now(),
-        "duration_seconds": round(time.monotonic() - started_monotonic, 6),
+        "duration_seconds": round(duration_seconds, 6),
         "exit_code": exit_code,
         "timed_out": timed_out,
         "command": command,
+        "resource_usage": child_resource_usage(
+            usage_before, usage_after, duration_seconds
+        ),
+        "input_bytes": sum(
+            int(item.get("size", 0)) for item in inputs if isinstance(item, dict)
+        ),
+        "source_bytes": sum(
+            int(item.get("size", 0))
+            for item in manifest.get("sources", [])
+            if isinstance(item, dict)
+        ),
     }
     (result_root / "execution.json").write_text(
         json.dumps(execution, indent=2, sort_keys=True) + "\n", encoding="utf-8"
