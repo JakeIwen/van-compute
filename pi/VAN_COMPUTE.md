@@ -110,9 +110,11 @@ This installer is the sole deployment path for `pi/scripts/compute/`,
 `van_compute_protocol.py`, and `van-compute-broker.service`. The general
 `pi/sync_scripts.sh` deployment deliberately excludes them so it cannot publish
 half of a Pi/Mac protocol upgrade or start an unprovisioned broker. The current
-installer upgrades an existing legacy or current deployment; it fails closed if
-neither CLI exists or if both layouts exist without an installer ownership
-record.
+installer requires the deployed CLI under `/home/pi/scripts/compute/`. The
+one-time flat-layout migration has completed and its compatibility branch was
+retired; any flat CLI, owner record, or rollback backup now makes installation
+fail closed for deliberate cleanup instead of guessing which entry point owns
+the queue.
 
 Upgrades are drain-first. The installer requires the running queue to be empty,
 disables new launches, asks a current persistent scheduler to stop claiming,
@@ -163,6 +165,10 @@ Then rerun the installer with:
 VAN_COMPUTE_DATASET_CONFIG=/absolute/path/to/datasets.json \
   ./macbook/scripts/install_van_compute_worker.zsh
 ```
+
+This checkout's active private source is the ignored, mode-0600 file
+`pi/secrets/van-compute-datasets.json`; keep the physical corpus path there and
+pass that file through `VAN_COMPUTE_DATASET_CONFIG` on future installs.
 
 The example `oem-corpus-search` task is listed even without this private
 configuration, but it is not runnable until the `oem-service-docs` alias is
@@ -232,12 +238,29 @@ timings, input and result bytes, and maximum RSS. The broker automatically
 records measured Pi-local runs; `van_compute.py missed-offload` remains
 available for explicitly recording eligible work that bypassed the broker.
 
-These measurements show that work was placed away from or left on the Pi, but
-they are not a calibrated Pi-equivalent savings estimate. `wait4` maximum RSS
-does not sum concurrent child-process memory, so current Mac telemetry uses the
-higher of that leader-process maximum and the sampled process-group aggregate.
-A representative same-input benchmark on both machines would still be required
-for a hardware-equivalent claim.
+The dashboard passively recognizes an exact-content benchmark when a successful
+task has measured executions on both the Mac and the Pi within the selected
+time range. A match requires the same task and arguments, embedded execution
+policy, ordered input names, sizes, values and SHA-256 hashes, and snapshotted
+source paths, sizes and hashes. Dataset-backed jobs are never matched because a
+dataset alias does not fingerprint the private corpus. The scheduler does not
+force a Pi run or duplicate work to manufacture a benchmark.
+
+For each matched workload, measured Pi samples are averaged and applied only to
+the matching completed Mac jobs. The dashboard reports estimated Pi analysis
+time and CPU avoided, the observed Pi-to-Mac ratios, and maximum measured Pi job
+RSS. It does not extrapolate those estimates to unmatched work. These are
+analysis-process estimates rather than net system-load measurements: Pi input
+fingerprinting, source snapshots, queue handling, and SSH streaming for the Mac
+run are not measured or subtracted. `wait4` maximum RSS does not sum concurrent
+child-process memory, while Mac telemetry uses the higher of that leader maximum
+and a sampled process-group aggregate, so the two RSS scopes also differ.
+
+To deliberately seed a calibration, temporarily stop the Mac worker, let one
+eligible unchanged task run through the ordinary guarded Pi fallback, restart
+the worker, and submit that exact task again without changing its inputs,
+arguments, source snapshot, or task policy. Do this only when the extra Pi load
+is acceptable. There is intentionally no forced-placement benchmark command.
 
 ## Diagnostics
 

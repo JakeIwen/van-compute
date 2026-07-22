@@ -1130,6 +1130,83 @@ class ComputeMetricsTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload), encoding="utf-8")
 
+    def write_completed_metric_job(
+        self,
+        root,
+        job_id,
+        *,
+        placement,
+        analysis_seconds,
+        cpu_seconds,
+        peak_rss_bytes,
+        finished_at="2026-07-22T01:59:00+00:00",
+        task="can-capture-summary",
+        arguments=None,
+        source_digest=None,
+        input_digest=None,
+        input_value=None,
+        include_source=True,
+        datasets=None,
+        state="done",
+        exit_code=0,
+        telemetry=True,
+        analysis_telemetry=True,
+    ):
+        source_digest = source_digest or "a" * 64
+        input_digest = input_digest or "b" * 64
+        job = root / state / job_id
+        manifest = {
+            "schema_version": 1,
+            "id": job_id,
+            "task": task,
+            "state": state,
+            "worker": "vanpi-local.00" if placement == "pi-local" else "m4mac.00",
+            "placement": placement,
+            "exit_code": exit_code,
+            "submitted_at": "2026-07-22T01:58:00+00:00",
+            "started_at": "2026-07-22T01:58:30+00:00",
+            "finished_at": finished_at,
+            "arguments": list(["--snapshot"] if arguments is None else arguments),
+            "sources": (
+                [
+                    {
+                        "path": "tools/private-analysis.py",
+                        "size": 123,
+                        "sha256": source_digest,
+                    }
+                ]
+                if include_source
+                else []
+            ),
+            "inputs": [
+                {
+                    "index": 0,
+                    "name": "private-capture-name.log",
+                    "size": 456,
+                    "sha256": input_digest,
+                    "value": input_value,
+                }
+            ],
+            "results": [],
+        }
+        if datasets is not None:
+            manifest["execution"] = {"datasets": list(datasets)}
+        self.write_json(job / "manifest.json", manifest)
+        execution = {"placement": placement}
+        if analysis_telemetry:
+            execution.update(
+                {
+                    "timing": {"analysis_seconds": analysis_seconds},
+                    "duration_seconds": analysis_seconds,
+                }
+            )
+        if telemetry:
+            execution["resource_usage"] = {
+                "cpu_seconds": cpu_seconds,
+                "peak_rss_bytes": peak_rss_bytes,
+            }
+        self.write_json(job / "result" / "execution.json", execution)
+
     def test_aggregates_worker_resources_and_current_queue(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "compute"
@@ -1414,6 +1491,175 @@ class ComputeMetricsTests(unittest.TestCase):
         self.assertEqual(summary["mac_packaging_seconds"], 0.25)
         self.assertEqual(summary["mac_result_upload_seconds"], 0.1)
         self.assertEqual(summary["aggregate_cpu_percent"], 120.0)
+
+    def test_exact_content_benchmark_uses_pi_sample_averages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "compute"
+            self.write_completed_metric_job(
+                root,
+                "20260722T015901Z-00000001",
+                placement="pi-local",
+                analysis_seconds=10,
+                cpu_seconds=8,
+                peak_rss_bytes=100,
+            )
+            self.write_completed_metric_job(
+                root,
+                "20260722T015902Z-00000002",
+                placement="pi-local",
+                analysis_seconds=14,
+                cpu_seconds=12,
+                peak_rss_bytes=120,
+            )
+            self.write_completed_metric_job(
+                root,
+                "20260722T015903Z-00000003",
+                placement="remote",
+                analysis_seconds=2,
+                cpu_seconds=3,
+                peak_rss_bytes=80,
+            )
+            self.write_completed_metric_job(
+                root,
+                "20260722T015904Z-00000004",
+                placement="remote",
+                analysis_seconds=3,
+                cpu_seconds=4,
+                peak_rss_bytes=90,
+            )
+
+            report = metrics.ComputeMetricsReader(
+                root, clock=lambda: self.NOW
+            ).report(6)
+
+        benchmark = report["benchmark"]
+        self.assertEqual(benchmark["calibrated_workloads"], 1)
+        self.assertEqual(benchmark["calibrated_remote_jobs"], 2)
+        self.assertEqual(benchmark["pi_samples"], 2)
+        self.assertEqual(
+            benchmark["estimated_pi_analysis_seconds_avoided"], 24
+        )
+        self.assertEqual(benchmark["estimated_pi_cpu_seconds_avoided"], 20)
+        self.assertEqual(benchmark["matched_mac_analysis_seconds"], 5)
+        self.assertEqual(benchmark["matched_mac_cpu_seconds"], 7)
+        self.assertEqual(benchmark["analysis_speedup_ratio"], 4.8)
+        self.assertEqual(benchmark["pi_to_mac_cpu_ratio"], 2.857)
+        self.assertEqual(benchmark["maximum_pi_peak_rss_bytes"], 120)
+        serialized = json.dumps(report)
+        self.assertNotIn("_workload_fingerprint", serialized)
+        self.assertNotIn("private-analysis.py", serialized)
+        self.assertNotIn("private-capture-name.log", serialized)
+        self.assertIn("submission", report["measurement_note"])
+        self.assertIn("SSH streaming overhead", report["measurement_note"])
+
+    def test_benchmark_rejects_nonidentical_unverifiable_and_dataset_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "compute"
+            cases = (
+                ("hash", {"input_digest": "c" * 64}, {}),
+                ("arguments", {"arguments": ["--snapshot"]}, {"arguments": []}),
+                ("malformed", {"input_digest": "not-a-hash"}, {"input_digest": "not-a-hash"}),
+                (
+                    "dataset",
+                    {"datasets": ["oem-service-docs"]},
+                    {"datasets": ["oem-service-docs"]},
+                ),
+                ("failed", {}, {"state": "failed", "exit_code": 1}),
+                ("no-telemetry", {}, {"telemetry": False}),
+                ("no-analysis", {}, {"analysis_telemetry": False}),
+                ("bad-value", {"input_value": [1]}, {"input_value": [1]}),
+            )
+            for index, (label, local_changes, remote_changes) in enumerate(cases):
+                base = index * 2
+                self.write_completed_metric_job(
+                    root,
+                    f"20260722T0159{base:02d}Z-{base:08x}",
+                    placement="pi-local",
+                    analysis_seconds=10,
+                    cpu_seconds=8,
+                    peak_rss_bytes=100,
+                    task=f"benchmark-{label}",
+                    **local_changes,
+                )
+                self.write_completed_metric_job(
+                    root,
+                    f"20260722T0159{base + 1:02d}Z-{base + 1:08x}",
+                    placement="remote",
+                    analysis_seconds=2,
+                    cpu_seconds=3,
+                    peak_rss_bytes=80,
+                    task=f"benchmark-{label}",
+                    **remote_changes,
+                )
+
+            # Even an exact workload cannot calibrate the selected range from a
+            # Pi sample outside that same range.
+            self.write_completed_metric_job(
+                root,
+                "20260601T000000Z-eeeeeeee",
+                placement="pi-local",
+                analysis_seconds=10,
+                cpu_seconds=8,
+                peak_rss_bytes=100,
+                finished_at="2026-06-01T00:00:00+00:00",
+                task="benchmark-old",
+            )
+            self.write_completed_metric_job(
+                root,
+                "20260722T015959Z-ffffffff",
+                placement="remote",
+                analysis_seconds=2,
+                cpu_seconds=3,
+                peak_rss_bytes=80,
+                task="benchmark-old",
+            )
+
+            benchmark = metrics.ComputeMetricsReader(
+                root, clock=lambda: self.NOW
+            ).report(6)["benchmark"]
+
+        self.assertEqual(
+            benchmark,
+            {
+                "calibrated_workloads": 0,
+                "calibrated_remote_jobs": 0,
+                "pi_samples": 0,
+                "estimated_pi_analysis_seconds_avoided": 0.0,
+                "estimated_pi_cpu_seconds_avoided": 0.0,
+                "matched_mac_analysis_seconds": 0.0,
+                "matched_mac_cpu_seconds": 0.0,
+                "analysis_speedup_ratio": None,
+                "pi_to_mac_cpu_ratio": None,
+                "maximum_pi_peak_rss_bytes": 0,
+            },
+        )
+
+    def test_exact_input_benchmark_allows_empty_source_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "compute"
+            for placement, suffix, analysis, cpu in (
+                ("pi-local", "00000001", 9, 7),
+                ("remote", "00000002", 3, 2),
+            ):
+                self.write_completed_metric_job(
+                    root,
+                    f"20260722T015900Z-{suffix}",
+                    placement=placement,
+                    analysis_seconds=analysis,
+                    cpu_seconds=cpu,
+                    peak_rss_bytes=64,
+                    task="sqlite-query",
+                    arguments=["SELECT 1"],
+                    include_source=False,
+                )
+
+            benchmark = metrics.ComputeMetricsReader(
+                root, clock=lambda: self.NOW
+            ).report(6)["benchmark"]
+
+        self.assertEqual(benchmark["calibrated_workloads"], 1)
+        self.assertEqual(benchmark["calibrated_remote_jobs"], 1)
+        self.assertEqual(benchmark["estimated_pi_analysis_seconds_avoided"], 9)
 
     def test_pi_local_fallback_never_counts_as_mac_capacity_or_offload(self):
         with tempfile.TemporaryDirectory() as directory:

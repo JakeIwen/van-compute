@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import heapq
 import json
 import math
 import os
 from pathlib import Path
+import re
 import stat
 import time
 from typing import Callable
@@ -27,6 +29,7 @@ MAX_MISSED_EVENT_BYTES = 64 * 1024
 MAX_SCANNED_MISSED_EVENTS = 2000
 MAX_RECENT_MISSED_EVENTS = 50
 LOCAL_WORKER_PREFIXES = ("vanpi-local", "pi-local")
+SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 
 
 class ComputeMetricsError(RuntimeError):
@@ -150,6 +153,119 @@ def _is_local_worker(worker: str) -> bool:
         worker == prefix or worker.startswith(f"{prefix}.")
         for prefix in LOCAL_WORKER_PREFIXES
     )
+
+
+def _workload_fingerprint(manifest: dict[str, object]) -> str | None:
+    """Identify an exact snapshotted workload without exposing its details."""
+    task = manifest.get("task")
+    arguments = manifest.get("arguments", [])
+    sources = manifest.get("sources")
+    inputs = manifest.get("inputs")
+    execution = manifest.get("execution")
+    if (
+        not isinstance(task, str)
+        or not task
+        or not isinstance(arguments, list)
+        or not all(isinstance(argument, str) for argument in arguments)
+        or not isinstance(sources, list)
+        or not isinstance(inputs, list)
+        or (not sources and not inputs)
+    ):
+        return None
+    if execution is not None:
+        if not isinstance(execution, dict):
+            return None
+        datasets = execution.get("datasets")
+        # A dataset alias does not fingerprint the private corpus content, so a
+        # source/input match cannot prove that the two executions saw the same
+        # workload.
+        if not isinstance(datasets, list) or datasets:
+            return None
+
+    canonical_sources: list[dict[str, object]] = []
+    source_paths: set[str] = set()
+    for record in sources:
+        if not isinstance(record, dict):
+            return None
+        path = record.get("path")
+        size = record.get("size")
+        digest = record.get("sha256")
+        if (
+            not isinstance(path, str)
+            or not path
+            or path in source_paths
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or not isinstance(digest, str)
+            or not SHA256_RE.fullmatch(digest)
+        ):
+            return None
+        source_paths.add(path)
+        canonical_sources.append(
+            {"path": path, "size": size, "sha256": digest.lower()}
+        )
+    canonical_sources.sort(key=lambda record: str(record["path"]))
+
+    canonical_inputs: list[dict[str, object]] = []
+    input_indexes: set[int] = set()
+    for record in inputs:
+        if not isinstance(record, dict):
+            return None
+        index = record.get("index")
+        name = record.get("name")
+        size = record.get("size")
+        digest = record.get("sha256")
+        value = record.get("value")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or index in input_indexes
+            or not isinstance(name, str)
+            or not name
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or not isinstance(digest, str)
+            or not SHA256_RE.fullmatch(digest)
+            or (value is not None and not isinstance(value, str))
+        ):
+            return None
+        input_indexes.add(index)
+        canonical_inputs.append(
+            {
+                "index": index,
+                "name": name,
+                "size": size,
+                "sha256": digest.lower(),
+                "value": value,
+            }
+        )
+    canonical_inputs.sort(key=lambda record: int(record["index"]))
+    if [record["index"] for record in canonical_inputs] != list(
+        range(len(canonical_inputs))
+    ):
+        return None
+
+    payload = {
+        "schema_version": manifest.get("schema_version"),
+        "task": task,
+        "arguments": arguments,
+        "execution": execution,
+        "sources": canonical_sources,
+        "inputs": canonical_inputs,
+    }
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _compatible_worker_protocol(version: object) -> bool:
@@ -399,7 +515,8 @@ class ComputeMetricsReader:
         upload_seconds = _optional_nonnegative_number(
             timing.get("result_upload_seconds_excluding_execution_json")
         )
-        cpu_seconds = _nonnegative_number(usage.get("cpu_seconds"))
+        raw_cpu_seconds = _optional_nonnegative_number(usage.get("cpu_seconds"))
+        cpu_seconds = raw_cpu_seconds if raw_cpu_seconds is not None else 0.0
         average_cpu = usage.get("average_cpu_percent")
         average_cpu = (
             _nonnegative_number(average_cpu)
@@ -448,6 +565,91 @@ class ComputeMetricsReader:
             "result_bytes": _sum_sizes(manifest.get("results")),
             "telemetry": bool(usage),
             "timed_out": bool(execution.get("timed_out", False)),
+            # This opaque key is used only while aggregating the report and is
+            # removed before any job is returned through the dashboard API.
+            "_workload_fingerprint": _workload_fingerprint(manifest),
+            "_benchmark_telemetry": (
+                raw_analysis_seconds is not None and raw_cpu_seconds is not None
+            ),
+        }
+
+    @staticmethod
+    def _benchmark_summary(completed: list[dict[str, object]]) -> dict[str, object]:
+        """Calibrate matched remote work from exact-content Pi-local samples."""
+        local_by_workload: dict[str, list[dict[str, object]]] = {}
+        remote_by_workload: dict[str, list[dict[str, object]]] = {}
+        for job in completed:
+            fingerprint = job.get("_workload_fingerprint")
+            exit_code = job.get("exit_code")
+            if (
+                job.get("state") != "done"
+                or isinstance(exit_code, bool)
+                or exit_code != 0
+                or not job.get("_benchmark_telemetry")
+                or not isinstance(fingerprint, str)
+            ):
+                continue
+            placement = job.get("placement")
+            if placement == "pi-local":
+                local_by_workload.setdefault(fingerprint, []).append(job)
+            elif placement == "remote":
+                remote_by_workload.setdefault(fingerprint, []).append(job)
+
+        calibrated = sorted(set(local_by_workload) & set(remote_by_workload))
+        calibrated_remote_jobs = 0
+        pi_samples = 0
+        estimated_pi_analysis = 0.0
+        estimated_pi_cpu = 0.0
+        measured_mac_analysis = 0.0
+        measured_mac_cpu = 0.0
+        maximum_pi_peak_rss = 0
+        for fingerprint in calibrated:
+            local_samples = local_by_workload[fingerprint]
+            remote_samples = remote_by_workload[fingerprint]
+            sample_count = len(local_samples)
+            remote_count = len(remote_samples)
+            average_pi_analysis = sum(
+                float(job["analysis_seconds"]) for job in local_samples
+            ) / sample_count
+            average_pi_cpu = sum(
+                float(job["cpu_seconds"]) for job in local_samples
+            ) / sample_count
+            calibrated_remote_jobs += remote_count
+            pi_samples += sample_count
+            estimated_pi_analysis += average_pi_analysis * remote_count
+            estimated_pi_cpu += average_pi_cpu * remote_count
+            measured_mac_analysis += sum(
+                float(job["analysis_seconds"]) for job in remote_samples
+            )
+            measured_mac_cpu += sum(
+                float(job["cpu_seconds"]) for job in remote_samples
+            )
+            maximum_pi_peak_rss = max(
+                maximum_pi_peak_rss,
+                *(int(job["peak_rss_bytes"]) for job in local_samples),
+            )
+
+        return {
+            "calibrated_workloads": len(calibrated),
+            "calibrated_remote_jobs": calibrated_remote_jobs,
+            "pi_samples": pi_samples,
+            "estimated_pi_analysis_seconds_avoided": round(
+                estimated_pi_analysis, 6
+            ),
+            "estimated_pi_cpu_seconds_avoided": round(estimated_pi_cpu, 6),
+            "matched_mac_analysis_seconds": round(measured_mac_analysis, 6),
+            "matched_mac_cpu_seconds": round(measured_mac_cpu, 6),
+            "analysis_speedup_ratio": (
+                round(estimated_pi_analysis / measured_mac_analysis, 3)
+                if measured_mac_analysis > 0
+                else None
+            ),
+            "pi_to_mac_cpu_ratio": (
+                round(estimated_pi_cpu / measured_mac_cpu, 3)
+                if measured_mac_cpu > 0
+                else None
+            ),
+            "maximum_pi_peak_rss_bytes": maximum_pi_peak_rss,
         }
 
     def report(self, hours: int = 168) -> dict[str, object]:
@@ -470,6 +672,7 @@ class ComputeMetricsReader:
             and job["finished_at"] >= cutoff
         ]
         remote_completed = [job for job in completed if job["placement"] == "remote"]
+        benchmark = self._benchmark_summary(completed)
         local_events = [
             event for event in self._missed_events() if event["recorded_at"] >= cutoff
         ]
@@ -609,7 +812,15 @@ class ComputeMetricsReader:
             },
             "summary": summary,
             "tasks": task_rows,
-            "jobs": visible[:MAX_RECENT_JOBS],
+            "jobs": [
+                {
+                    key: value
+                    for key, value in job.items()
+                    if not key.startswith("_")
+                }
+                for job in visible[:MAX_RECENT_JOBS]
+            ],
+            "benchmark": benchmark,
             "eligible_local_work": eligible_local_work,
             "measurement_note": (
                 "Mac CPU is child CPU time; Mac active time covers staging through "
@@ -618,6 +829,9 @@ class ComputeMetricsReader:
                 "process-group aggregate sample; brief spikes or detached processes may be "
                 "missed. Pi-local events are recorded broker fallback runs, plus any "
                 "manually recorded eligible local work; those records are not exhaustive. "
-                "Neither placement is calibrated into Pi-equivalent time or memory savings."
+                "Exact-content calibration excludes dataset-backed work and estimates only "
+                "Pi analysis time and CPU for matched jobs. It excludes Pi submission, "
+                "snapshot, and SSH streaming overhead and does not extrapolate to unmatched "
+                "work. Pi and Mac maximum RSS measurements have different sampling scopes."
             ),
         }
