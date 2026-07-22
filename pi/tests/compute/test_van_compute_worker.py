@@ -191,6 +191,46 @@ class PersistentSchedulerTests(unittest.TestCase):
             self.assertGreaterEqual(state.claims, 10)
             self.assertLessEqual(state.claims, 13)
 
+    def test_failed_recovery_probe_does_not_starve_healthy_slots(self):
+        state = FakeQueueState(1)
+        stop = threading.Event()
+        executed = threading.Event()
+
+        class ProbeRemote(FakeRemote):
+            def claim(self):
+                if self.worker == "m4mac.00":
+                    raise RuntimeError("corrupt exact-slot lease")
+                return super().claim()
+
+        def run_job(*_args):
+            executed.set()
+            stop.set()
+            return {"ok": True}
+
+        service = worker.PersistentScheduler(
+            scheduler_args(),
+            stop_event=stop,
+            remote_factory=lambda name: ProbeRemote(name, state),
+            job_runner=run_job,
+        )
+        service._needs_probe = {"m4mac.00"}
+
+        def dispatch():
+            with worker.ThreadPoolExecutor(max_workers=worker.SCHEDULER_SLOTS) as executor:
+                service._dispatch_loop(executor)
+
+        with mock.patch("builtins.print"):
+            scheduler_thread = threading.Thread(target=dispatch)
+            scheduler_thread.start()
+            self.assertTrue(executed.wait(2), "healthy slot was starved by failed probe")
+            stop.set()
+            service._slot_changed.set()
+            scheduler_thread.join(3)
+
+        self.assertFalse(scheduler_thread.is_alive())
+        with state.lock:
+            self.assertEqual(len(state.jobs), 0)
+
     def test_runs_no_more_than_ten_jobs_concurrently(self):
         state = FakeQueueState(20)
         stop = threading.Event()
@@ -421,7 +461,7 @@ class ResourceAdmissionTests(unittest.TestCase):
 
     def test_disk_reservation_covers_staging_and_packaging_peaks(self):
         manifest = {"sources": [{"size": 10}], "inputs": [{"size": 5}]}
-        self.assertEqual(worker.staging_required_bytes(manifest), 25)
+        self.assertEqual(worker.job_disk_reservation_bytes(manifest, 0), 25)
         self.assertEqual(worker.job_disk_reservation_bytes(manifest, 100), 215)
 
 
@@ -533,14 +573,10 @@ class WorkerIsolationTests(unittest.TestCase):
             def __init__(self, payload):
                 self.payload = payload
                 self.bundle_calls = 0
-                self.source_calls = 0
 
             def stream_source_bundle(self, _job, destination, **_kwargs):
                 self.bundle_calls += 1
                 destination.write_bytes(self.payload)
-
-            def stream_source(self, *_args, **_kwargs):
-                self.source_calls += 1
 
         remote = BundleRemote(self.tar_bytes(source_data.items()))
         manifest = {
@@ -557,35 +593,8 @@ class WorkerIsolationTests(unittest.TestCase):
             self.assertEqual(inputs, [])
             self.assertEqual(values, [])
             self.assertEqual(remote.bundle_calls, 1)
-            self.assertEqual(remote.source_calls, 0)
             for path, data in source_data.items():
                 self.assertEqual((source_root / path).read_bytes(), data)
-
-    def test_prepare_job_falls_back_only_for_unsupported_bundle_api(self):
-        data = b"legacy"
-        record = self.source_record("tools/legacy.py", data)
-
-        class LegacyRemote:
-            worker = "m4mac.00"
-
-            def stream_source_bundle(self, *_args, **_kwargs):
-                raise worker.UnsupportedSourceBundle("unsupported source-bundle")
-
-            def stream_source(self, _job, _relative, destination, **_kwargs):
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(data)
-
-        with tempfile.TemporaryDirectory() as directory:
-            source_root, _inputs, _values = worker.prepare_job(
-                LegacyRemote(),
-                {
-                    "id": "20260722T120000Z-00000006",
-                    "sources": [record],
-                    "inputs": [],
-                },
-                Path(directory),
-            )
-            self.assertEqual((source_root / "tools/legacy.py").read_bytes(), data)
 
     def test_claimed_job_reports_phase_timing_and_uploads_telemetry_last(self):
         script = b"""#!/usr/bin/env python3
@@ -788,16 +797,6 @@ Path(args.json).write_text(json.dumps({'bytes': Path(args.capture).stat().st_siz
         self.assertIn("free space", outcome.resource_limit)
         self.assertEqual(outcome.minimum_filesystem_free_bytes, 50)
 
-    def test_staging_capacity_accounts_for_bundle_and_inputs(self):
-        manifest = {
-            "sources": [{"size": 20}],
-            "inputs": [{"size": 30}],
-        }
-        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-            worker, "filesystem_free_bytes", return_value=100
-        ), self.assertRaisesRegex(worker.WorkerError, "insufficient free space"):
-            worker.require_staging_capacity(Path(directory), manifest, 40)
-
     def test_source_bundle_rejects_traversal_links_extra_and_missing_members(self):
         expected_data = b"expected"
         sources = [self.source_record("tools/expected.py", expected_data)]
@@ -884,6 +883,37 @@ Path(args.json).write_text(json.dumps({'bytes': Path(args.capture).stat().st_siz
                     Path(directory),
                     require_all=True,
                 )
+
+    def test_declared_special_file_cannot_satisfy_successful_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory)
+            os.mkfifo(result / "jadx")
+
+            with self.assertRaisesRegex(worker.WorkerError, "special file"):
+                worker.validate_declared_outputs(
+                    {"execution": self.DYNAMIC_EXECUTION},
+                    result,
+                    require_all=True,
+                )
+
+    def test_result_file_limit_allows_all_declared_outputs_plus_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory)
+            declared = {
+                f"result-{index:02d}.json"
+                for index in range(worker.protocol.MAX_OUTPUTS)
+            }
+            expected = declared | {"stdout.txt", "stderr.txt", "execution.json"}
+            for relative in expected:
+                (result / relative).write_text("{}\n", encoding="utf-8")
+
+            files = worker.result_files(
+                result,
+                1024 * 1024,
+                expected=expected,
+            )
+
+        self.assertEqual(len(files), worker.protocol.MAX_OUTPUTS + 3)
 
     def test_execution_telemetry_redacts_and_scopes_private_datasets(self):
         execution_spec = {

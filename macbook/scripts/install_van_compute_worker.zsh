@@ -18,6 +18,7 @@ user_id="$(id -u)"
 install_id="$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
 remote_stage="/home/pi/.cache/van-compute-install.$install_id"
 remote_compute_root="/home/pi/scripts/compute"
+remote_config_root="/home/pi/configs"
 upgrade_public_root=""
 allow_unsandboxed="${VAN_COMPUTE_ALLOW_UNSANDBOXED:-0}"
 dataset_source="${VAN_COMPUTE_DATASET_CONFIG:-}"
@@ -25,6 +26,8 @@ installer_lock="$support_root/installer.lock"
 maintenance_owner_file="$support_root/installer-owner"
 installer_lock_fd=""
 staging=""
+release=""
+release_published=0
 dataset_staging=""
 restore_previous_agent=0
 remote_upgrade_started=0
@@ -69,6 +72,10 @@ cleanup() {
   if [[ -n "$staging" && -d "$staging" && "$staging" == "$release_parent"/.install.* ]]; then
     /bin/rm -rf -- "$staging"
   fi
+  if (( ! release_published )) && \
+     [[ -n "$release" && -d "$release" && ! -L "$release" && "$release" == "$release_parent"/20* ]]; then
+    /bin/rm -rf -- "$release"
+  fi
   if [[ -n "$dataset_staging" && -f "$dataset_staging" && "$dataset_staging" == "$support_root"/.datasets.json.* ]]; then
     /bin/rm -f -- "$dataset_staging"
   fi
@@ -90,7 +97,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Checking and provisioning local worker dependencies..."
+echo "Checking local installer prerequisites..."
 [[ -x /opt/homebrew/bin/brew ]] || {
   echo "Homebrew is required at /opt/homebrew/bin/brew." >&2
   exit 1
@@ -152,6 +159,80 @@ raise SystemExit(not re.fullmatch(
   exit 1
 fi
 
+# Fail before any large local package or virtual-environment work when this
+# known Pi migration cannot proceed. The queue is checked again immediately
+# before fencing, so this is an early cost guard rather than the upgrade lock.
+echo "Checking SSH access and Pi prerequisites..."
+/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 "$pi_host" '
+  set -eu
+  test -x /usr/bin/python3
+  test -x /usr/bin/bwrap || {
+    echo "Missing /usr/bin/bwrap; install the Pi bubblewrap package first." >&2
+    exit 1
+  }
+  test -x /usr/bin/sqlite3 || {
+    echo "Missing /usr/bin/sqlite3; install the Pi sqlite3 package first." >&2
+    exit 1
+  }
+  test -x /usr/bin/flock || {
+    echo "Missing /usr/bin/flock; install the Pi util-linux package first." >&2
+    exit 1
+  }
+  sudo -n true
+  test -d /home/pi/dev/obd-things
+  test ! -L /home/pi/dev/obd-things
+  for state in queued running; do
+    root="/home/pi/dev/obd-things/tmp/compute/$state"
+    test -d "$root"
+    test ! -L "$root"
+    test -z "$(/usr/bin/find "$root" -mindepth 1 -maxdepth 1 -print -quit)" || {
+      echo "The Pi compute queue has pending or running work; rerun after it finishes." >&2
+      exit 1
+    }
+  done
+  /usr/bin/python3 -m venv --help >/dev/null
+'
+
+# Identify the one public CLI that must be fenced before paying the cost of a
+# new worker environment. An interrupted migration keeps its owner record
+# beside the exact target that must be resumed.
+upgrade_public_root="$(
+  /usr/bin/ssh "$pi_host" '
+    set -eu
+    legacy=/home/pi/scripts
+    current=/home/pi/scripts/compute
+    legacy_owner=$legacy/.van-compute-upgrade-owner
+    current_owner=$current/.van-compute-upgrade-owner
+    if { test -e "$legacy_owner" || test -L "$legacy_owner"; } && \
+       { test -e "$current_owner" || test -L "$current_owner"; }; then
+      echo "Both legacy and current compute upgrade owners exist." >&2
+      exit 1
+    elif test -e "$current_owner" || test -L "$current_owner"; then
+      printf "%s\n" "$current"
+    elif test -e "$legacy_owner" || test -L "$legacy_owner"; then
+      printf "%s\n" "$legacy"
+    elif test -L "$current/van_compute.py" || test -L "$legacy/van_compute.py"; then
+      echo "A deployed compute CLI is a symlink; refusing migration." >&2
+      exit 1
+    elif test -f "$current/van_compute.py" && test -f "$legacy/van_compute.py"; then
+      echo "Both legacy and current compute CLIs exist without an upgrade owner; refusing to fence the wrong entry point." >&2
+      exit 1
+    elif test -f "$current/van_compute.py"; then
+      printf "%s\n" "$current"
+    elif test -f "$legacy/van_compute.py"; then
+      printf "%s\n" "$legacy"
+    else
+      echo "No deployed van_compute.py exists to upgrade." >&2
+      exit 1
+    fi
+  '
+)"
+if [[ "$upgrade_public_root" != /home/pi/scripts && "$upgrade_public_root" != "$remote_compute_root" ]]; then
+  echo "Invalid deployed compute root returned by $pi_host: $upgrade_public_root" >&2
+  exit 1
+fi
+
+echo "Checking and provisioning local worker dependencies..."
 formulae=()
 [[ -x /opt/homebrew/bin/rg ]] || formulae+=(ripgrep)
 [[ -x /opt/homebrew/bin/jadx ]] || formulae+=(jadx)
@@ -366,9 +447,6 @@ if [[ -f "$dataset_target" ]]; then
   validate_dataset_config "$dataset_target"
 fi
 
-echo "Checking SSH access to $pi_host..."
-/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 "$pi_host" true
-
 echo "Deploying the Pi queue CLI and shared protocol..."
 /usr/bin/ssh "$pi_host" "install -d -m 700 '$remote_stage'"
 remote_stage_created=1
@@ -402,50 +480,44 @@ echo "Validating the staged Pi broker before stopping the current worker..."
     '$remote_stage/van_compute_protocol.py' \
     '$remote_stage/van_compute_metrics.py'
   rm -rf '$remote_stage/__pycache__'
-  /usr/bin/python3 -c 'import json, pathlib; json.loads(pathlib.Path(\"$remote_stage/van-compute-obd.example.json\").read_text())'
   install -d -m 700 '$remote_stage/python-automation'
   install -m 600 '$remote_stage/van_compute_protocol.py' '$remote_stage/python-automation/van_compute_protocol.py'
+  install -m 600 '$remote_stage/van-compute-obd.example.json' '$remote_stage/.van-compute.json'
+  /usr/bin/python3 '$remote_stage/van_compute.py' tasks --source-root '$remote_stage' >/dev/null
+  rm -f '$remote_stage/.van-compute.json'
   /usr/bin/python3 '$remote_stage/pi_compute.py' --help >/dev/null
   /usr/bin/python3 '$remote_stage/van_compute_broker.py' --help >/dev/null
   rm -rf '$remote_stage/__pycache__' '$remote_stage/python-automation/__pycache__'
   sudo -n /usr/bin/systemd-analyze verify '$remote_stage/van-compute-broker.service' >/dev/null
 "
 
-# The first run after this layout change fences the legacy public CLI; later
-# runs fence the new compute-directory CLI. An interrupted migration keeps its
-# owner record beside the exact target that must be resumed.
-upgrade_public_root="$(
-  /usr/bin/ssh "$pi_host" '
-    set -eu
-    legacy=/home/pi/scripts
-    current=/home/pi/scripts/compute
-    legacy_owner=$legacy/.van-compute-upgrade-owner
-    current_owner=$current/.van-compute-upgrade-owner
-    if { test -e "$legacy_owner" || test -L "$legacy_owner"; } && \
-       { test -e "$current_owner" || test -L "$current_owner"; }; then
-      echo "Both legacy and current compute upgrade owners exist." >&2
-      exit 1
-    elif test -e "$current_owner" || test -L "$current_owner"; then
-      printf "%s\n" "$current"
-    elif test -e "$legacy_owner" || test -L "$legacy_owner"; then
-      printf "%s\n" "$legacy"
-    elif test -L "$current/van_compute.py" || test -L "$legacy/van_compute.py"; then
-      echo "A deployed compute CLI is a symlink; refusing migration." >&2
-      exit 1
-    elif test -f "$current/van_compute.py"; then
-      printf "%s\n" "$current"
-    elif test -f "$legacy/van_compute.py"; then
-      printf "%s\n" "$legacy"
-    else
-      echo "No deployed van_compute.py exists to upgrade." >&2
-      exit 1
-    fi
-  '
-)"
-if [[ "$upgrade_public_root" != /home/pi/scripts && "$upgrade_public_root" != "$remote_compute_root" ]]; then
-  echo "Invalid deployed compute root returned by $pi_host: $upgrade_public_root" >&2
-  exit 1
-fi
+# Provision the fallback runtime before submissions are fenced. On subsequent
+# runs an active broker must already have a valid runtime; never mutate its
+# environment underneath it.
+echo "Checking and provisioning the Pi fallback runtime..."
+/usr/bin/ssh "$pi_host" "
+  set -eu
+  /usr/bin/install -d -m 700 /home/pi/.local/share/van-compute
+  umask 077
+  exec 9>/home/pi/.local/share/van-compute/runtime.lock
+  /usr/bin/chmod 600 /home/pi/.local/share/van-compute/runtime.lock
+  /usr/bin/flock -n 9 || {
+    echo 'Another installer is provisioning the Pi fallback runtime; rerun after it finishes.' >&2
+    exit 1
+  }
+  runtime=/home/pi/.local/share/van-compute/venv/bin/python3
+  if test -x \"\$runtime\" && \"\$runtime\" -c 'import isotp, numpy, pytest' >/dev/null 2>&1; then
+    exit 0
+  fi
+  if /usr/bin/systemctl is-active --quiet van-compute-broker.service; then
+    echo 'The active Pi broker has an invalid fallback runtime; stop and repair it before upgrading.' >&2
+    exit 1
+  fi
+  /usr/bin/python3 -m venv --system-site-packages /home/pi/.local/share/van-compute/venv
+  \"\$runtime\" -m pip install \
+    --disable-pip-version-check --no-input can-isotp numpy pytest
+  \"\$runtime\" -c 'import isotp, numpy, pytest'
+"
 
 active_queue_jobs() {
   /usr/bin/ssh "$pi_host" "/usr/bin/python3 -c '
@@ -611,13 +683,11 @@ remote_upgrade_started=1
   if /usr/bin/systemctl is-active --quiet van-compute-broker.service; then
     sudo -n systemctl stop van-compute-broker.service
   fi
-  install -d -m 700 /home/pi/.local/share/van-compute
-  /usr/bin/python3 -m venv --system-site-packages /home/pi/.local/share/van-compute/venv
-  /home/pi/.local/share/van-compute/venv/bin/python3 -m pip install \
-    --disable-pip-version-check --no-input can-isotp pytest
-  /home/pi/.local/share/van-compute/venv/bin/python3 -c 'import isotp, pytest'
+  test -x /home/pi/.local/share/van-compute/venv/bin/python3
+  /home/pi/.local/share/van-compute/venv/bin/python3 -c 'import isotp, numpy, pytest'
 
   install -d -m 700 \
+    '$remote_config_root' \
     /home/pi/scripts/compute \
     /home/pi/scripts/compute/python-automation \
     /home/pi/scripts/python-automation \
@@ -629,7 +699,7 @@ remote_upgrade_started=1
   install -m 600 '$remote_stage/van_compute_metrics.py' /home/pi/scripts/python-automation/van_compute_metrics.py
   install -m 700 '$remote_stage/van_compute_broker.py' /home/pi/scripts/compute/van_compute_broker.py
   install -m 700 '$remote_stage/van_compute_upgrade_gate.py' /home/pi/scripts/compute/van_compute_upgrade_gate.py
-  install -m 600 '$remote_stage/van-compute-obd.example.json' /home/pi/scripts/compute/van-compute-obd.example.json
+  install -m 600 '$remote_stage/van-compute-obd.example.json' '$remote_config_root/van-compute-obd.example.json'
   install -m 600 '$remote_stage/van_dashboard.html' /home/pi/scripts/python-automation/templates/van_dashboard.html
   install -m 600 '$remote_stage/van_dashboard.js' /home/pi/scripts/python-automation/static/van_dashboard.js
   install -m 600 '$remote_stage/van_dashboard.css' /home/pi/scripts/python-automation/static/van_dashboard.css
@@ -693,6 +763,7 @@ if [[ -f "$dataset_target" ]]; then
 fi
 /usr/bin/plutil -lint "$plist_stage"
 /usr/bin/install -m 600 "$plist_stage" "$target_plist"
+release_published=1
 
 previous_coordinator_seen="$(
   /usr/bin/ssh "$pi_host" /home/pi/scripts/compute/van_compute.py available |
@@ -752,6 +823,7 @@ raise SystemExit(
       /home/pi/scripts/van_compute_broker.py \
       /home/pi/scripts/van_compute_upgrade_gate.py \
       /home/pi/scripts/van-compute-obd.example.json \
+      /home/pi/scripts/compute/van-compute-obd.example.json \
       /home/pi/scripts/.van-compute-upgrade.lock \
       /home/pi/scripts/python-automation/van_compute_protocol.py"
     previous_kept=0

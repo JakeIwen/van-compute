@@ -25,8 +25,9 @@ needed. The queue and broker are intentionally not a general remote shell.
 - While any non-local compute lease is fresh, queued work is left for remote
   workers. This naturally extends to additional compute nodes later.
 - If every remote lease is stale, the broker waits a short grace period and may
-  run one eligible task locally. Memory, load, temperature, throttling, runtime,
-  process count, file size, and cgroup limits guard that fallback.
+  run one eligible task locally. Memory, disk free space, load, temperature,
+  throttling, runtime, process count, file size, and cgroup limits guard that
+  fallback.
 - A remotely claimed job whose exact slot heartbeat has been stale for five
   minutes is conservatively returned to the queue. Attempt tokens reject late
   uploads from the superseded worker.
@@ -92,12 +93,21 @@ From this checkout on the Mac:
 ```
 
 The installer provisions a private Mac Python environment and required offline
-tools, validates the Mac sandbox, deploys the Pi queue/frontend/broker and
-dashboard files, provisions the Pi fallback Python environment, installs the
-systemd unit, and starts the persistent LaunchAgent. Immutable worker releases
-live under `~/Library/Application Support/van-compute/releases`; the current
-and previous release are retained. Rerun the installer after changing
-the worker, protocol, broker, or dashboard.
+tools, validates the Mac sandbox, deploys the Pi queue/frontend/broker plus the
+compute dashboard metrics and assets, provisions the Pi fallback Python
+environment, installs the systemd unit, and starts the persistent LaunchAgent.
+Immutable worker releases live under
+`~/Library/Application Support/van-compute/releases`; the current and previous
+release are retained. Rerun the installer after changing the worker, protocol,
+broker, or compute dashboard.
+
+This installer is the sole deployment path for `pi/scripts/compute/`,
+`van_compute_protocol.py`, and `van-compute-broker.service`. The general
+`pi/sync_scripts.sh` deployment deliberately excludes them so it cannot publish
+half of a Pi/Mac protocol upgrade or start an unprovisioned broker. The current
+installer upgrades an existing legacy or current deployment; it fails closed if
+neither CLI exists or if both layouts exist without an installer ownership
+record.
 
 Upgrades are drain-first. The installer requires the running queue to be empty,
 disables new launches, asks a current persistent scheduler to stop claiming,
@@ -122,7 +132,7 @@ ssh pi@vanpi '
   cd /home/pi/dev/obd-things
   test ! -e .van-compute.json
   test ! -L .van-compute.json
-  install -m 600 /home/pi/scripts/compute/van-compute-obd.example.json .van-compute.json
+  install -m 600 /home/pi/configs/van-compute-obd.example.json .van-compute.json
   /home/pi/scripts/compute/pi_compute.py tasks
 '
 ```

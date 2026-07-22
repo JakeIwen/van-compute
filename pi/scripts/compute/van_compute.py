@@ -52,7 +52,7 @@ LEASE_TOKEN_RE = re.compile(r"[0-9a-f]{32}")
 RESULT_PATH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9][A-Za-z0-9_.-]*)*")
 COPY_CHUNK = 1024 * 1024
 DEFAULT_HEARTBEAT_MAX_AGE = 45.0
-DEFAULT_MAX_RESULT_BYTES = 128 * 1024 * 1024
+DEFAULT_MAX_RESULT_BYTES = protocol.MAX_RESULT_BYTES
 MAINTENANCE_FILE = ".maintenance.json"
 MAX_SNAPSHOT_FILES = 10_000
 MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
@@ -726,11 +726,14 @@ def workers_available(root: Path, max_age: float) -> list[dict[str, object]]:
         except (QueueError, KeyError, ValueError):
             continue
         age = max(0.0, (now - seen).total_seconds())
+        try:
+            require_worker_protocol_version(payload.get("protocol_version"))
+        except QueueError:
+            protocol_compatible = False
+        else:
+            protocol_compatible = True
         payload["age_seconds"] = round(age, 3)
-        payload["available"] = (
-            age <= max_age
-            and payload.get("protocol_version") == protocol.WORKER_PROTOCOL_VERSION
-        )
+        payload["available"] = age <= max_age and protocol_compatible
         workers.append(payload)
     workers.sort(key=lambda item: str(item.get("worker", "")))
     return workers
@@ -879,33 +882,6 @@ def stream_bounded_input(
             raise QueueError(f"input prefix changed after submission: {path}")
 
 
-def stream_source(
-    job_path: Path,
-    manifest: dict[str, object],
-    relative_text: str,
-    output: BinaryIO,
-    lease_token: str | None = None,
-) -> None:
-    require_manifest_lease(manifest, lease_token)
-    sources = manifest.get("sources")
-    allowed = {
-        str(item.get("path")): item
-        for item in sources if isinstance(item, dict)
-    } if isinstance(sources, list) else {}
-    if relative_text not in allowed:
-        raise QueueError(f"source file is not in the job manifest: {relative_text}")
-    relative = Path(relative_text)
-    if relative.is_absolute() or ".." in relative.parts:
-        raise QueueError("invalid source path")
-    path = job_path / "source" / relative
-    if path.is_symlink() or not path.is_file():
-        raise QueueError(f"source snapshot is missing: {relative_text}")
-    if hash_file(path) != allowed[relative_text].get("sha256"):
-        raise QueueError(f"source snapshot hash mismatch: {relative_text}")
-    with path.open("rb") as handle:
-        shutil.copyfileobj(handle, output, COPY_CHUNK)
-
-
 class _HashingSourceReader:
     def __init__(self, handle: BinaryIO, size: int) -> None:
         self.handle = handle
@@ -1025,7 +1001,7 @@ def put_result(
     temporary = Path(temporary_name)
     digest = hashlib.sha256()
     size = 0
-    maximum = int(os.environ.get("VAN_COMPUTE_MAX_RESULT_BYTES", DEFAULT_MAX_RESULT_BYTES))
+    maximum = DEFAULT_MAX_RESULT_BYTES
     try:
         with os.fdopen(descriptor, "wb") as handle:
             while chunk := input_stream.read(COPY_CHUNK):
@@ -1188,9 +1164,8 @@ def build_parser() -> argparse.ArgumentParser:
     stream = worker_subparsers.add_parser("stream")
     stream.add_argument("job_id")
     stream.add_argument("--worker", required=True)
-    stream.add_argument("--kind", required=True, choices=("input", "source", "source-bundle"))
+    stream.add_argument("--kind", required=True, choices=("input", "source-bundle"))
     stream.add_argument("--index", type=int)
-    stream.add_argument("--path")
     stream.add_argument("--lease-token")
     put = worker_subparsers.add_parser("put-result")
     put.add_argument("job_id")
@@ -1341,27 +1316,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.lease_token,
                 )
                 if args.kind == "input":
-                    if args.index is None or args.path is not None:
-                        raise QueueError("input streaming requires --index only")
+                    if args.index is None:
+                        raise QueueError("input streaming requires --index")
                     stream_bounded_input(
                         manifest,
                         args.index,
                         sys.stdout.buffer,
                         args.lease_token,
                     )
-                elif args.kind == "source":
-                    if args.path is None or args.index is not None:
-                        raise QueueError("source streaming requires --path only")
-                    stream_source(
-                        job_path,
-                        manifest,
-                        args.path,
-                        sys.stdout.buffer,
-                        args.lease_token,
-                    )
                 else:
-                    if args.path is not None or args.index is not None:
-                        raise QueueError("source-bundle streaming accepts no --path or --index")
+                    if args.index is not None:
+                        raise QueueError("source-bundle streaming accepts no --index")
                     stream_source_bundle(
                         job_path,
                         manifest,

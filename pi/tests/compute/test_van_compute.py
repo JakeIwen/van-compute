@@ -33,6 +33,10 @@ print(f'summarized {len(data)} bytes')
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_shared_result_limit_matches_queue_and_mac_worker(self):
+        self.assertEqual(queue.DEFAULT_MAX_RESULT_BYTES, protocol.MAX_RESULT_BYTES)
+        self.assertEqual(worker.DEFAULT_MAX_RESULT_BYTES, protocol.MAX_RESULT_BYTES)
+
     def test_signal_correlate_cannot_select_capture_mode(self):
         with self.assertRaisesRegex(protocol.ProtocolError, "not allowed"):
             protocol.validate_task_arguments("signal-correlate-analyze", ["capture"])
@@ -938,16 +942,27 @@ class QueueLifecycleTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
         self.assertFalse((root / "workers" / "legacy-worker.json").exists())
 
-    def test_available_marks_unversioned_legacy_heartbeat_unavailable(self):
+    def test_available_marks_incompatible_heartbeats_unavailable(self):
         root = queue.safe_root(self.queue_root)
-        heartbeat = queue.worker_heartbeat(root, "legacy-worker")
-        heartbeat.pop("protocol_version")
-        queue.atomic_json(root / "workers" / "legacy-worker.json", heartbeat)
+        incompatible_versions = (
+            None,
+            True,
+            str(protocol.WORKER_PROTOCOL_VERSION),
+            protocol.WORKER_PROTOCOL_VERSION + 1,
+        )
+        for index, incompatible in enumerate(incompatible_versions):
+            worker = f"legacy-worker-{index}"
+            heartbeat = queue.worker_heartbeat(root, worker)
+            if incompatible is None:
+                heartbeat.pop("protocol_version")
+            else:
+                heartbeat["protocol_version"] = incompatible
+            queue.atomic_json(root / "workers" / f"{worker}.json", heartbeat)
 
         workers = queue.workers_available(root, 60)
 
-        self.assertEqual(len(workers), 1)
-        self.assertFalse(workers[0]["available"])
+        self.assertEqual(len(workers), len(incompatible_versions))
+        self.assertTrue(all(not worker["available"] for worker in workers))
 
     def test_queue_wait_and_worker_age_reject_nonfinite_floats(self):
         submitted = self.submit()
@@ -1104,6 +1119,12 @@ class WorkerExecutionTests(unittest.TestCase):
 class ComputeMetricsTests(unittest.TestCase):
     NOW = 1_784_681_600.0
 
+    def test_metrics_worker_protocol_version_matches_queue_protocol(self):
+        self.assertEqual(
+            metrics.WORKER_PROTOCOL_VERSION,
+            protocol.WORKER_PROTOCOL_VERSION,
+        )
+
     @staticmethod
     def write_json(path, payload):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1117,6 +1138,7 @@ class ComputeMetricsTests(unittest.TestCase):
                 {
                     "worker": "m4mac",
                     "seen_at": "2026-07-22T01:59:50+00:00",
+                    "protocol_version": protocol.WORKER_PROTOCOL_VERSION,
                     "slots_total": 10,
                     "slots_busy": 3,
                 },
@@ -1204,6 +1226,10 @@ class ComputeMetricsTests(unittest.TestCase):
         self.assertEqual(report["status"]["slots_busy"], 3)
         self.assertEqual(report["status"]["slots_available"], 7)
         self.assertEqual(report["status"]["workers"][0]["slots_total"], 10)
+        self.assertEqual(
+            report["status"]["workers"][0]["protocol_version"],
+            protocol.WORKER_PROTOCOL_VERSION,
+        )
         self.assertEqual(report["summary"]["jobs"], 1)
         self.assertEqual(report["summary"]["telemetry_jobs"], 1)
         self.assertEqual(report["summary"]["mac_cpu_seconds"], 6.0)
@@ -1449,6 +1475,79 @@ class ComputeMetricsTests(unittest.TestCase):
         self.assertIsNone(report["status"]["slots_total"])
         self.assertIsNone(report["status"]["slots_busy"])
         self.assertIsNone(report["status"]["slots_available"])
+
+    def test_metrics_rejects_unversioned_and_incompatible_heartbeats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "compute"
+            self.write_json(
+                root / "workers" / "unversioned.json",
+                {
+                    "worker": "unversioned",
+                    "seen_at": "2026-07-22T00:53:10+00:00",
+                    "slots_total": 10,
+                    "slots_busy": 0,
+                },
+            )
+            self.write_json(
+                root / "workers" / "incompatible.json",
+                {
+                    "worker": "incompatible",
+                    "seen_at": "2026-07-22T00:53:10+00:00",
+                    "protocol_version": protocol.WORKER_PROTOCOL_VERSION + 1,
+                    "slots_total": 10,
+                    "slots_busy": 0,
+                },
+            )
+            self.write_json(
+                root / "workers" / "boolean.json",
+                {
+                    "worker": "boolean",
+                    "seen_at": "2026-07-22T00:53:10+00:00",
+                    "protocol_version": True,
+                },
+            )
+            self.write_json(
+                root / "workers" / "string.json",
+                {
+                    "worker": "string",
+                    "seen_at": "2026-07-22T00:53:10+00:00",
+                    "protocol_version": str(protocol.WORKER_PROTOCOL_VERSION),
+                },
+            )
+
+            report = metrics.ComputeMetricsReader(root, clock=lambda: self.NOW).report(6)
+
+        self.assertFalse(report["status"]["available"])
+        self.assertIsNone(report["status"]["slots_total"])
+        workers = {worker["worker"]: worker for worker in report["status"]["workers"]}
+        self.assertFalse(workers["unversioned"]["available"])
+        self.assertIsNone(workers["unversioned"]["protocol_version"])
+        self.assertFalse(workers["incompatible"]["available"])
+        self.assertEqual(
+            workers["incompatible"]["protocol_version"],
+            protocol.WORKER_PROTOCOL_VERSION + 1,
+        )
+        self.assertFalse(workers["boolean"]["available"])
+        self.assertFalse(workers["string"]["available"])
+
+    def test_similarly_named_worker_is_remote(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "compute"
+            self.write_json(
+                root / "workers" / "vanpi-locality.json",
+                {
+                    "worker": "vanpi-locality",
+                    "seen_at": "2026-07-22T00:53:10+00:00",
+                    "protocol_version": protocol.WORKER_PROTOCOL_VERSION,
+                },
+            )
+
+            report = metrics.ComputeMetricsReader(root, clock=lambda: self.NOW).report(6)
+
+        worker = report["status"]["workers"][0]
+        self.assertEqual(worker["placement"], "remote")
+        self.assertTrue(worker["available"])
+        self.assertTrue(report["status"]["available"])
 
     def test_rejects_unbounded_time_range(self):
         with tempfile.TemporaryDirectory() as directory:

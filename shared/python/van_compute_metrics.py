@@ -15,6 +15,10 @@ from typing import Callable
 
 
 DEFAULT_QUEUE_ROOT = Path("/home/pi/dev/obd-things/tmp/compute")
+# Metrics is deployed with the dashboard as well as by the compute installer,
+# so it cannot import the installer-owned protocol module at runtime. A unit
+# test pins this value to van_compute_protocol.WORKER_PROTOCOL_VERSION.
+WORKER_PROTOCOL_VERSION = 1
 STATE_DIRECTORIES = ("queued", "running", "done", "failed")
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_SCANNED_JOBS = 2000
@@ -136,9 +140,24 @@ def _placement(value: object, worker: object = None, *, default: str = "remote")
     if value in {"remote", "pi-local"}:
         return str(value)
     worker_name = str(worker or "")
-    if worker_name.startswith(LOCAL_WORKER_PREFIXES):
+    if _is_local_worker(worker_name):
         return "pi-local"
     return default
+
+
+def _is_local_worker(worker: str) -> bool:
+    return any(
+        worker == prefix or worker.startswith(f"{prefix}.")
+        for prefix in LOCAL_WORKER_PREFIXES
+    )
+
+
+def _compatible_worker_protocol(version: object) -> bool:
+    return (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version == WORKER_PROTOCOL_VERSION
+    )
 
 
 class ComputeMetricsReader:
@@ -171,6 +190,7 @@ class ComputeMetricsReader:
             slots_busy = _optional_nonnegative_integer(payload.get("slots_busy"))
             if slots_total is not None and slots_busy is not None:
                 slots_busy = min(slots_busy, slots_total)
+            protocol_version = payload.get("protocol_version")
             workers.append(
                 {
                     "worker": str(payload.get("worker") or path.stem)[:64],
@@ -179,7 +199,12 @@ class ComputeMetricsReader:
                     ),
                     "seen_at": seen_at,
                     "age_seconds": round(age, 3) if age is not None else None,
-                    "available": age is not None and age <= self.heartbeat_max_age,
+                    "available": (
+                        age is not None
+                        and age <= self.heartbeat_max_age
+                        and _compatible_worker_protocol(protocol_version)
+                    ),
+                    "protocol_version": protocol_version,
                     "slots_total": slots_total,
                     "slots_busy": slots_busy,
                     "slots_available": (

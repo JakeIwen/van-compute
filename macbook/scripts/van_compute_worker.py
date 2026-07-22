@@ -49,7 +49,7 @@ DEFAULT_PRIVATE_ROOT = Path.home() / "Library" / "Caches" / "van-compute"
 DEFAULT_WORK_ROOT = DEFAULT_PRIVATE_ROOT / "jobs"
 DEFAULT_CONTROL_PATH = DEFAULT_PRIVATE_ROOT / "ssh" / "control.sock"
 DEFAULT_TIMEOUT = 3600
-DEFAULT_MAX_RESULT_BYTES = 128 * 1024 * 1024
+DEFAULT_MAX_RESULT_BYTES = protocol.MAX_RESULT_BYTES
 DEFAULT_MAX_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_MAX_PROCESSES = 256
 DEFAULT_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024
@@ -90,10 +90,6 @@ class WorkerError(RuntimeError):
     pass
 
 
-class UnsupportedSourceBundle(WorkerError):
-    pass
-
-
 class WorkerShutdown(RuntimeError):
     """Leave a claimed lease unfinished so the exact slot can resume it."""
 
@@ -117,14 +113,6 @@ def utc_now() -> str:
 
 def bounded_seconds(started_monotonic: float) -> float:
     return round(min(7 * 24 * 60 * 60, max(0.0, time.monotonic() - started_monotonic)), 6)
-
-
-def hash_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(COPY_CHUNK):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def safe_filename(name: str, index: int) -> str:
@@ -420,10 +408,9 @@ class RemoteQueue:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def stream_source(
+    def stream_source_bundle(
         self,
         job_id: str,
-        relative: str,
         destination: Path,
         *,
         lease_token: str | None = None,
@@ -432,39 +419,12 @@ class RemoteQueue:
             add_lease_argument(
                 [
                     "worker", "stream", job_id, "--worker", self.worker,
-                    "--kind", "source", "--path", relative,
+                    "--kind", "source-bundle",
                 ],
                 lease_token,
             ),
             destination,
         )
-
-    def stream_source_bundle(
-        self,
-        job_id: str,
-        destination: Path,
-        *,
-        lease_token: str | None = None,
-    ) -> None:
-        try:
-            self.stream_to_file(
-                add_lease_argument(
-                    [
-                        "worker", "stream", job_id, "--worker", self.worker,
-                        "--kind", "source-bundle",
-                    ],
-                    lease_token,
-                ),
-                destination,
-            )
-        except WorkerError as exc:
-            detail = str(exc).lower()
-            if (
-                "source-bundle" in detail
-                and ("invalid choice" in detail or "unsupported" in detail)
-            ):
-                raise UnsupportedSourceBundle(str(exc)) from None
-            raise
 
     def stream_input(
         self,
@@ -651,30 +611,11 @@ def prepare_job(remote: RemoteQueue, manifest: dict[str, object], job_root: Path
 
     if sources:
         archive = job_root / ".source-bundle.tar"
+        remote.stream_source_bundle(job_id, archive, lease_token=lease_token)
         try:
-            remote.stream_source_bundle(
-                job_id, archive, lease_token=lease_token
-            )
-        except UnsupportedSourceBundle:
-            for record in sources:
-                if not isinstance(record, dict):
-                    raise WorkerError("job has an invalid source record")
-                relative_text = str(record.get("path", ""))
-                relative = safe_bundle_member_path(relative_text)
-                destination = source_root.joinpath(*relative.parts)
-                remote.stream_source(
-                    job_id, relative_text, destination, lease_token=lease_token
-                )
-                if (
-                    destination.stat().st_size != record.get("size")
-                    or hash_file(destination) != record.get("sha256")
-                ):
-                    raise WorkerError(f"source verification failed: {relative_text}")
-        else:
-            try:
-                extract_source_bundle(archive, source_root, sources)
-            finally:
-                archive.unlink(missing_ok=True)
+            extract_source_bundle(archive, source_root, sources)
+        finally:
+            archive.unlink(missing_ok=True)
 
     input_paths: list[Path] = []
     values: list[object | None] = []
@@ -909,13 +850,6 @@ def manifest_record_bytes(records: object) -> int:
         and not isinstance((value := item.get("size")), bool)
         and isinstance(value, int)
         and value >= 0
-    )
-
-
-def staging_required_bytes(manifest: Mapping[str, object]) -> int:
-    """Peak bytes added while transferring and extracting job inputs."""
-    return 2 * manifest_record_bytes(manifest.get("sources")) + manifest_record_bytes(
-        manifest.get("inputs")
     )
 
 
@@ -1642,11 +1576,11 @@ def execute_job(
     return outcome.exit_code, execution
 
 
-def real_declared_output_directory(
+def real_declared_output(
     result_root: Path,
     relative: Path,
 ) -> Path | None:
-    """Return a declared directory only when no path component is a symlink."""
+    """Return a declared file/directory only when every component is real."""
     try:
         root_info = result_root.lstat()
     except OSError as exc:
@@ -1672,8 +1606,18 @@ def real_declared_output_directory(
         if index < len(relative.parts) - 1 and not stat.S_ISDIR(info.st_mode):
             return None
         if index == len(relative.parts) - 1:
-            return current if stat.S_ISDIR(info.st_mode) else None
+            if stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode):
+                return current
+            raise WorkerError(f"declared output is a special file: {relative}")
     return None
+
+
+def real_declared_output_directory(
+    result_root: Path,
+    relative: Path,
+) -> Path | None:
+    output = real_declared_output(result_root, relative)
+    return output if output is not None and output.is_dir() else None
 
 
 def package_declared_output_directories(
@@ -1766,12 +1710,15 @@ def validate_declared_outputs(
                 raise WorkerError(
                     f"declared result paths overlap: {first} and {second}"
                 )
-    if require_all:
-        missing = [path.as_posix() for path in declared if not (result_root / path).exists()]
-        if missing:
-            raise WorkerError(
-                "successful job omitted declared result(s): " + ", ".join(missing)
-            )
+    missing = [
+        path.as_posix()
+        for path in declared
+        if real_declared_output(result_root, path) is None
+    ]
+    if require_all and missing:
+        raise WorkerError(
+            "successful job omitted declared result(s): " + ", ".join(missing)
+        )
 
 
 def expected_result_paths(
@@ -1810,8 +1757,10 @@ def result_files(
         if total_bytes > maximum_file_size:
             raise WorkerError("job results exceed the total result limit")
         files.append((relative, path))
-    if len(files) > 64:
-        raise WorkerError("job produced more than 64 result files")
+    if len(files) > protocol.MAX_OUTPUTS + 3:
+        raise WorkerError(
+            f"job produced more than {protocol.MAX_OUTPUTS + 3} result files"
+        )
     return files
 
 
@@ -1859,22 +1808,6 @@ def make_remote(
         connect_timeout=args.connect_timeout,
         multiplexer=multiplexer,
     )
-
-
-def require_staging_capacity(
-    path: Path,
-    manifest: Mapping[str, object],
-    minimum_free_bytes: int,
-) -> None:
-    # Source transfer briefly holds both the normalized tar and extracted
-    # files; input files are streamed once into the private job tree.
-    required = staging_required_bytes(manifest)
-    free_bytes = filesystem_free_bytes(path)
-    if free_bytes - required < minimum_free_bytes:
-        raise WorkerError(
-            "insufficient free space to stage job while preserving the "
-            f"{minimum_free_bytes}-byte reserve"
-        )
 
 
 def resource_manager_for_args(
@@ -2175,6 +2108,7 @@ class PersistentScheduler:
             remote.worker: None for remote in self.remotes
         }
         self._needs_probe: set[str] = {remote.worker for remote in self.remotes}
+        self._probe_retry_at: dict[str, float] = {}
         self._dispatch_index = 0
         self._slot_changed = threading.Event()
         self._busy: set[str] = set()
@@ -2212,6 +2146,7 @@ class PersistentScheduler:
                 # An interrupted upload/finish may have left this exact slot's
                 # lease running. Probe it first so only that identity resumes.
                 self._needs_probe.add(remote.worker)
+                self._probe_retry_at.pop(remote.worker, None)
                 print(
                     f"van-compute-worker[{remote.worker}]: {type(exc).__name__}: {exc}",
                     file=sys.stderr,
@@ -2222,11 +2157,13 @@ class PersistentScheduler:
     def _next_free_remote(self) -> RemoteQueue | None:
         # Rotate recovery probes too: one corrupt/stuck exact-slot lease must
         # not starve the other nine identities indefinitely.
+        now = time.monotonic()
         for offset in range(SCHEDULER_SLOTS):
             index = (self._dispatch_index + offset) % SCHEDULER_SLOTS
             remote = self.remotes[index]
             if (
                 remote.worker in self._needs_probe
+                and self._probe_retry_at.get(remote.worker, 0.0) <= now
                 and self._futures[remote.worker] is None
             ):
                 self._dispatch_index = (index + 1) % SCHEDULER_SLOTS
@@ -2234,7 +2171,10 @@ class PersistentScheduler:
         for offset in range(SCHEDULER_SLOTS):
             index = (self._dispatch_index + offset) % SCHEDULER_SLOTS
             remote = self.remotes[index]
-            if self._futures[remote.worker] is None:
+            if (
+                remote.worker not in self._needs_probe
+                and self._futures[remote.worker] is None
+            ):
                 self._dispatch_index = (index + 1) % SCHEDULER_SLOTS
                 return remote
         return None
@@ -2258,21 +2198,25 @@ class PersistentScheduler:
                 manifest = remote.claim()
             except Exception as exc:
                 self._needs_probe.add(remote.worker)
+                self._probe_retry_at[remote.worker] = (
+                    time.monotonic() + max(1.0, self.args.poll_interval)
+                )
                 print(
                     f"van-compute-worker[{remote.worker}] claim: "
                     f"{type(exc).__name__}: {exc}",
                     file=sys.stderr,
                     flush=True,
                 )
-                self.stop_event.wait(self.args.poll_interval)
                 continue
             self._needs_probe.discard(remote.worker)
+            self._probe_retry_at.pop(remote.worker, None)
             if self.drain_event.is_set():
                 # A claim RPC already in flight may complete after drain was
                 # requested. Leave its exact-slot lease untouched; the
                 # installer will detect it and restart this release to resume.
                 if manifest is not None:
                     self._needs_probe.add(remote.worker)
+                    self._probe_retry_at.pop(remote.worker, None)
                 self.stop_event.set()
                 return
             if manifest is None:
@@ -2280,6 +2224,14 @@ class PersistentScheduler:
                 # owned by a later slot cannot be stranded. Otherwise one
                 # empty claim proves the global queued directory is empty.
                 if self._needs_probe:
+                    retry_at = min(
+                        self._probe_retry_at.get(worker_id, 0.0)
+                        for worker_id in self._needs_probe
+                    )
+                    retry_delay = max(0.0, retry_at - time.monotonic())
+                    if retry_delay > 0:
+                        self._slot_changed.clear()
+                        self._slot_changed.wait(min(1.0, retry_delay))
                     continue
                 self._slot_changed.clear()
                 self._slot_changed.wait(self.args.poll_interval)
@@ -2482,8 +2434,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise WorkerError("--timeout must be from 1 second through 24 hours")
         if not 0 <= args.nice <= 19:
             raise WorkerError("--nice must be from 0 through 19")
-        if not 1024 <= args.max_result_bytes <= 1024 * 1024 * 1024:
-            raise WorkerError("--max-result-bytes must be from 1 KiB through 1 GiB")
+        if not 1024 <= args.max_result_bytes <= protocol.MAX_RESULT_BYTES:
+            raise WorkerError("--max-result-bytes must be from 1 KiB through 128 MiB")
         if not 256 * 1024 * 1024 <= args.max_memory_bytes <= 64 * 1024 * 1024 * 1024:
             raise WorkerError("--max-memory-bytes must be from 256 MiB through 64 GiB")
         if not 1 <= args.max_processes <= 4096:

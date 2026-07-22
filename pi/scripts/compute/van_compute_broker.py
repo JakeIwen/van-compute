@@ -79,7 +79,7 @@ DEFAULT_POLL_INTERVAL = 5.0
 DEFAULT_TIMEOUT = 1800
 DEFAULT_CPU_SECONDS = 1200
 DEFAULT_MAX_MEMORY_BYTES = 768 * 1024 * 1024
-DEFAULT_MAX_RESULT_BYTES = 128 * 1024 * 1024
+DEFAULT_MAX_RESULT_BYTES = protocol.MAX_RESULT_BYTES
 DEFAULT_MIN_WORK_FREE_BYTES = 1024 * 1024 * 1024
 DEFAULT_MIN_AVAILABLE_BYTES = 1536 * 1024 * 1024
 DEFAULT_MAX_SWAP_FRACTION = 0.20
@@ -90,6 +90,7 @@ DEFAULT_NOFILE = 256
 DEFAULT_NPROC = 256
 DEFAULT_BWRAP = "/usr/bin/bwrap"
 DEFAULT_LOCAL_PYTHON = "/home/pi/.local/share/van-compute/venv/bin/python3"
+RESOURCE_POLL_INTERVAL = 0.5
 SAFE_INPUT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 MOUNTINFO_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
 MEMORY_BACKED_FILESYSTEMS = frozenset(
@@ -126,6 +127,17 @@ class HealthAssessment:
     ok: bool
     reasons: tuple[str, ...]
     snapshot: HealthSnapshot
+
+
+@dataclass(frozen=True)
+class LocalProcessOutcome:
+    exit_code: int
+    usage: object
+    timed_out: bool
+    interrupted: bool
+    resource_limit: str | None
+    resource_monitor_error: str | None
+    minimum_filesystem_free_bytes: int | None
 
 
 def utc_now() -> str:
@@ -316,8 +328,17 @@ def _is_local_worker(worker: str) -> bool:
     return (
         worker == "pi-local"
         or worker.startswith("pi-local.")
-        or worker == LOCAL_WORKER
+        or worker == LOCAL_WORKER_PREFIX
         or worker.startswith(f"{LOCAL_WORKER_PREFIX}.")
+    )
+
+
+def _compatible_worker_protocol(payload: Mapping[str, object]) -> bool:
+    version = payload.get("protocol_version")
+    return (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version == protocol.WORKER_PROTOCOL_VERSION
     )
 
 
@@ -333,7 +354,11 @@ def _remote_worker_leases(
             seen_at = queue.parse_timestamp(str(payload["seen_at"]))
         except (queue.QueueError, KeyError, ValueError):
             continue
-        if seen_at.tzinfo is None or _is_local_worker(worker):
+        if (
+            seen_at.tzinfo is None
+            or _is_local_worker(worker)
+            or not _compatible_worker_protocol(payload)
+        ):
             continue
         leases.append((dict(payload), seen_at))
     return leases
@@ -516,6 +541,8 @@ def _heartbeat_age(root: Path, worker: str, now: dt.datetime) -> float:
         seen_at = queue.parse_timestamp(str(payload["seen_at"]))
     except (queue.QueueError, KeyError, ValueError):
         return math.inf
+    if not _compatible_worker_protocol(payload):
+        return math.inf
     # Capacity coordinators advertise slots but never execute a job under the
     # base identity. During a one-shot-to-scheduler upgrade, their fresh base
     # heartbeat must not perpetually renew an abandoned legacy base-worker job.
@@ -550,12 +577,7 @@ def recover_stale_remote_jobs(
             if manifest.get("id") != path.name:
                 continue
             worker = str(manifest.get("worker", ""))
-            if (
-                not worker
-                or worker == "pi-local"
-                or worker.startswith("pi-local.")
-                or worker.startswith(LOCAL_WORKER_PREFIX)
-            ):
+            if not worker or _is_local_worker(worker):
                 continue
             try:
                 queue.validate_worker(worker)
@@ -676,7 +698,7 @@ def _running_local_job(root: Path) -> dict[str, object] | None:
             continue
         if manifest.get("id") != path.name:
             continue
-        if str(manifest.get("worker", "")).startswith(LOCAL_WORKER_PREFIX):
+        if _is_local_worker(str(manifest.get("worker", ""))):
             return manifest
     return None
 
@@ -899,21 +921,88 @@ def _wait_for_process(
     *,
     timeout: int,
     should_stop: Callable[[], bool],
-) -> tuple[int, object, bool, bool]:
+    work_path: Path,
+    minimum_free_bytes: int,
+    free_space_reader: Callable[[Path], int] = lambda path: max(
+        0, shutil.disk_usage(path).free
+    ),
+) -> LocalProcessOutcome:
     deadline = time.monotonic() + timeout
+    next_resource_poll = 0.0
     timed_out = False
     interrupted = False
+    resource_limit: str | None = None
+    resource_monitor_error: str | None = None
+    lowest_free_bytes: int | None = None
+
+    def sample_free_space() -> None:
+        nonlocal lowest_free_bytes, resource_limit, resource_monitor_error
+        try:
+            free_bytes = free_space_reader(work_path)
+        except OSError as exc:
+            resource_monitor_error = f"free-space watchdog failed: {exc}"
+            return
+        lowest_free_bytes = (
+            free_bytes
+            if lowest_free_bytes is None
+            else min(lowest_free_bytes, free_bytes)
+        )
+        if free_bytes < minimum_free_bytes:
+            resource_limit = (
+                "filesystem free space fell below execution safety threshold "
+                f"{minimum_free_bytes} bytes"
+            )
+
     while True:
         completed = _wait4_nohang(process)
         if completed is not None:
-            return completed[0], completed[1], timed_out, interrupted
+            # A fast child may finish between polls after creating substantial
+            # output. Sample once more before any packaging or result upload.
+            sample_free_space()
+            return LocalProcessOutcome(
+                137
+                if resource_limit is not None
+                else 125
+                if resource_monitor_error is not None
+                else completed[0],
+                completed[1],
+                timed_out,
+                interrupted,
+                resource_limit,
+                resource_monitor_error,
+                lowest_free_bytes,
+            )
         if should_stop():
             interrupted = True
             break
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if now >= deadline:
             timed_out = True
             break
+        if now >= next_resource_poll:
+            sample_free_space()
+            if resource_limit is not None or resource_monitor_error is not None:
+                break
+            next_resource_poll = now + RESOURCE_POLL_INTERVAL
         time.sleep(0.1)
+    if resource_limit is not None or resource_monitor_error is not None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        waited_pid, status, usage = os.wait4(process.pid, 0)
+        if waited_pid != process.pid:
+            raise BrokerError("lost track of resource-limited local analysis process")
+        process.returncode = os.waitstatus_to_exitcode(status)
+        return LocalProcessOutcome(
+            137 if resource_limit is not None else 125,
+            usage,
+            timed_out,
+            interrupted,
+            resource_limit,
+            resource_monitor_error,
+            lowest_free_bytes,
+        )
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -922,7 +1011,15 @@ def _wait_for_process(
     while time.monotonic() < terminate_deadline:
         completed = _wait4_nohang(process)
         if completed is not None:
-            return (124 if timed_out else 143), completed[1], timed_out, interrupted
+            return LocalProcessOutcome(
+                124 if timed_out else 143,
+                completed[1],
+                timed_out,
+                interrupted,
+                resource_limit,
+                resource_monitor_error,
+                lowest_free_bytes,
+            )
         time.sleep(0.1)
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -932,7 +1029,15 @@ def _wait_for_process(
     if waited_pid != process.pid:
         raise BrokerError("lost track of local analysis process")
     process.returncode = os.waitstatus_to_exitcode(status)
-    return (124 if timed_out else 143), usage, timed_out, interrupted
+    return LocalProcessOutcome(
+        124 if timed_out else 143,
+        usage,
+        timed_out,
+        interrupted,
+        resource_limit,
+        resource_monitor_error,
+        lowest_free_bytes,
+    )
 
 
 def _process_group_exists(process_group: int) -> bool:
@@ -1603,15 +1708,28 @@ def execute_claimed_job(
                     stderr=stderr,
                     start_new_session=True,
                 )
-                exit_code, usage, timed_out, interrupted = _wait_for_process(
+                outcome = _wait_for_process(
                     process,
                     timeout=args.timeout,
                     should_stop=should_stop,
+                    work_path=work,
+                    minimum_free_bytes=(
+                        args.min_work_free_bytes + args.max_result_bytes
+                    ),
                 )
                 background_descendants_terminated = terminate_remaining_process_group(
                     process.pid
                 )
             duration = time.monotonic() - started_monotonic
+            resource_usage = _resource_usage(outcome.usage, duration)
+            resource_usage.update(
+                {
+                    "minimum_filesystem_free_bytes": (
+                        outcome.minimum_filesystem_free_bytes
+                    ),
+                    "free_space_watchdog_interval_seconds": RESOURCE_POLL_INTERVAL,
+                }
+            )
             execution = {
                 "schema_version": protocol.SCHEMA_VERSION,
                 "job_id": job_id,
@@ -1622,15 +1740,17 @@ def execute_claimed_job(
                 "finished_at": utc_now(),
                 "duration_seconds": round(duration, 6),
                 "analysis_seconds": round(duration, 6),
-                "exit_code": exit_code,
-                "timed_out": timed_out,
-                "interrupted": interrupted,
+                "exit_code": outcome.exit_code,
+                "timed_out": outcome.timed_out,
+                "interrupted": outcome.interrupted,
+                "resource_limit": outcome.resource_limit,
+                "resource_monitor_error": outcome.resource_monitor_error,
                 "background_descendants_terminated": background_descendants_terminated,
                 "source_preparation_seconds": round(source_preparation_seconds, 6),
                 "input_preparation_seconds": round(input_preparation_seconds, 6),
                 "command": command,
                 "sandbox": "bubblewrap",
-                "resource_usage": _resource_usage(usage, duration),
+                "resource_usage": resource_usage,
                 "input_bytes": sum(
                     int(item.get("size", 0))
                     for item in manifest.get("inputs", [])
@@ -1646,33 +1766,52 @@ def execute_claimed_job(
                 json.dumps(execution, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-            validate_declared_outputs(
-                manifest,
-                result_root,
-                require_all=exit_code == 0,
-            )
-            packaging_started = time.monotonic()
-            artifacts = _package_output_directories(
-                manifest, result_root, args.max_result_bytes
-            )
-            execution["packaging_seconds"] = round(
-                time.monotonic() - packaging_started, 6
-            )
-            if artifacts:
-                execution["output_artifacts"] = artifacts
+            if outcome.resource_limit is not None or outcome.resource_monitor_error is not None:
+                # Free space is already under the execution headroom. Remove
+                # potentially large task output before publishing only bounded
+                # failure metadata back into the queue on the same filesystem.
+                shutil.rmtree(result_root)
+                result_root.mkdir(mode=0o700)
+                (result_root / "stdout.txt").touch(mode=0o600)
+                failure_reason = outcome.resource_limit or outcome.resource_monitor_error
+                (result_root / "stderr.txt").write_text(
+                    f"van-compute local fallback stopped: {failure_reason}\n",
+                    encoding="utf-8",
+                )
                 (result_root / "execution.json").write_text(
                     json.dumps(execution, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8",
                 )
-            files = _result_files(
-                manifest, result_root, args.max_result_bytes, artifacts
-            )
+                artifacts = {}
+            else:
+                validate_declared_outputs(
+                    manifest,
+                    result_root,
+                    require_all=outcome.exit_code == 0,
+                )
+                packaging_started = time.monotonic()
+                artifacts = _package_output_directories(
+                    manifest, result_root, args.max_result_bytes
+                )
+                execution["packaging_seconds"] = round(
+                    time.monotonic() - packaging_started, 6
+                )
+                if artifacts:
+                    execution["output_artifacts"] = artifacts
+                    (result_root / "execution.json").write_text(
+                        json.dumps(execution, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+            files = _result_files(manifest, result_root, args.max_result_bytes, artifacts)
         except Exception as exc:
             exit_code, execution = _failure_results(result_root, manifest, exc)
             artifacts = {}
             files = _result_files(
                 manifest, result_root, args.max_result_bytes, artifacts
             )
+
+        else:
+            exit_code = outcome.exit_code
 
         uploaded: list[str] = []
         upload_started = time.monotonic()
@@ -1887,8 +2026,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise BrokerError("--cpu-seconds must be from 1 second through 24 hours")
     if not 256 * 1024 * 1024 <= args.max_memory_bytes <= 1024 * 1024 * 1024:
         raise BrokerError("--max-memory-bytes must be from 256 MiB through 1 GiB")
-    if not 1024 <= args.max_result_bytes <= 256 * 1024 * 1024:
-        raise BrokerError("--max-result-bytes must be from 1 KiB through 256 MiB")
+    if not 1024 <= args.max_result_bytes <= protocol.MAX_RESULT_BYTES:
+        raise BrokerError("--max-result-bytes must be from 1 KiB through 128 MiB")
     if not 256 * 1024 * 1024 <= args.min_work_free_bytes <= 1024**4:
         raise BrokerError(
             "--min-work-free-bytes must be from 256 MiB through 1 TiB"

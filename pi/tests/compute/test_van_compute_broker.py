@@ -184,6 +184,12 @@ class BrokerHarness(unittest.TestCase):
 
 
 class PlacementTests(BrokerHarness):
+    def test_default_result_limit_matches_queue_protocol(self):
+        self.assertEqual(
+            broker.DEFAULT_MAX_RESULT_BYTES,
+            protocol.MAX_RESULT_BYTES,
+        )
+
     def test_queue_maintenance_defers_pi_fallback(self):
         submitted = self.submit()
         root = queue.safe_root(self.root)
@@ -274,6 +280,27 @@ class PlacementTests(BrokerHarness):
         self.assertEqual(result["action"], "deferred")
         self.assertIn("remote worker lease", result["reason"])
         self.assertTrue((root / "queued" / submitted["id"]).is_dir())
+
+    def test_incompatible_heartbeats_are_not_remote_leases(self):
+        root = queue.safe_root(self.root)
+        heartbeat = queue.worker_heartbeat(root, "m4mac", slots_total=10, slots_busy=0)
+
+        for version in (
+            None,
+            True,
+            str(protocol.WORKER_PROTOCOL_VERSION),
+            protocol.WORKER_PROTOCOL_VERSION + 1,
+        ):
+            with self.subTest(protocol_version=version):
+                candidate = dict(heartbeat)
+                if version is None:
+                    candidate.pop("protocol_version")
+                else:
+                    candidate["protocol_version"] = version
+                queue.atomic_json(root / "workers" / "m4mac.json", candidate)
+
+                self.assertEqual(broker.fresh_remote_workers(root, 45), [])
+                self.assertIsNone(broker.latest_remote_worker_seen(root))
 
     def test_stale_worker_permits_exactly_one_local_fallback(self):
         self.submit()
@@ -639,6 +666,47 @@ class RecoveryAndIsolationTests(BrokerHarness):
             [],
         )
 
+    def test_incompatible_heartbeat_does_not_renew_stale_remote_attempt(self):
+        submitted = self.submit()
+        root = queue.safe_root(self.root)
+        claimed = queue.worker_claim(root, "m4mac.00")
+        claimed["started_at"] = "2020-01-01T00:00:00+00:00"
+        queue.atomic_json(
+            root / "running" / submitted["id"] / "manifest.json", claimed
+        )
+        heartbeat = queue.load_json(root / "workers" / "m4mac.00.json")
+        heartbeat["protocol_version"] = protocol.WORKER_PROTOCOL_VERSION + 1
+        queue.atomic_json(root / "workers" / "m4mac.00.json", heartbeat)
+
+        recovered = broker.recover_stale_remote_jobs(
+            root,
+            stale_age=300,
+            now=dt.datetime(2026, 7, 22, tzinfo=dt.timezone.utc),
+        )
+
+        self.assertEqual(recovered, [submitted["id"]])
+
+    def test_similarly_named_nonlocal_worker_is_recovered(self):
+        submitted = self.submit()
+        root = queue.safe_root(self.root)
+        claimed = queue.worker_claim(root, "vanpi-locality")
+        claimed["started_at"] = "2020-01-01T00:00:00+00:00"
+        queue.atomic_json(
+            root / "running" / submitted["id"] / "manifest.json", claimed
+        )
+        heartbeat = queue.load_json(root / "workers" / "vanpi-locality.json")
+        heartbeat["seen_at"] = "2020-01-01T00:00:00+00:00"
+        queue.atomic_json(root / "workers" / "vanpi-locality.json", heartbeat)
+
+        recovered = broker.recover_stale_remote_jobs(
+            root,
+            stale_age=300,
+            now=dt.datetime(2026, 7, 22, tzinfo=dt.timezone.utc),
+        )
+
+        self.assertEqual(recovered, [submitted["id"]])
+        self.assertTrue((root / "queued" / submitted["id"]).is_dir())
+
     def test_queue_maintenance_blocks_stale_recovery_inside_queue_lock(self):
         submitted = self.submit()
         root = queue.safe_root(self.root)
@@ -766,6 +834,57 @@ class RecoveryAndIsolationTests(BrokerHarness):
             )
         self.assertEqual(code, 2)
         self.assertIn("already running", error.getvalue())
+
+    def test_process_watchdog_kills_job_when_execution_headroom_is_breached(self):
+        process = mock.Mock(pid=4321, returncode=None)
+        usage = mock.Mock()
+        with mock.patch.object(
+            broker, "_wait4_nohang", return_value=None
+        ), mock.patch.object(broker.os, "killpg") as killpg, mock.patch.object(
+            broker.os, "wait4", return_value=(process.pid, 0, usage)
+        ):
+            outcome = broker._wait_for_process(
+                process,
+                timeout=30,
+                should_stop=lambda: False,
+                work_path=self.work,
+                minimum_free_bytes=100,
+                free_space_reader=lambda _path: 99,
+            )
+
+        self.assertEqual(outcome.exit_code, 137)
+        self.assertIn("execution safety threshold", outcome.resource_limit)
+        self.assertEqual(outcome.minimum_filesystem_free_bytes, 99)
+        killpg.assert_called_once_with(process.pid, signal.SIGKILL)
+
+    def test_disk_limited_execution_discards_partial_task_output(self):
+        submitted = self.submit()
+        high_capacity = mock.Mock(free=1024**4)
+        breached_headroom = mock.Mock(free=0)
+        samples = iter((high_capacity, high_capacity, breached_headroom))
+
+        def disk_usage(_path):
+            return next(samples, breached_headroom)
+
+        with mock.patch.object(broker.shutil, "disk_usage", side_effect=disk_usage):
+            result = self.run_once()
+
+        result_root = self.root / "failed" / submitted["id"] / "result"
+        execution = json.loads(
+            (result_root / "execution.json").read_text(encoding="utf-8")
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(execution["exit_code"], 137)
+        self.assertIn("execution safety threshold", execution["resource_limit"])
+        self.assertEqual((result_root / "stdout.txt").read_text(encoding="utf-8"), "")
+        self.assertIn(
+            "local fallback stopped",
+            (result_root / "stderr.txt").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            sorted(path.name for path in result_root.iterdir()),
+            ["execution.json", "stderr.txt", "stdout.txt"],
+        )
 
     def test_self_test_cli_checks_effective_sandbox_and_runtime(self):
         output = StringIO()
