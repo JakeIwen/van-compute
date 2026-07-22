@@ -307,6 +307,8 @@ sandbox_profile='(version 1)
 (allow file-read-metadata)
 (allow file-read*
     (subpath "/System/Library")
+    ; macOS 26 stores the dyld shared cache used by system executables here.
+    (subpath "/System/Volumes/Preboot/Cryptexes/OS")
     (subpath "/usr")
     (subpath "/bin")
     (subpath "/sbin")

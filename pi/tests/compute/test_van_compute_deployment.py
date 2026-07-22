@@ -147,6 +147,7 @@ class VanComputeDeploymentTests(unittest.TestCase):
         self.assertIn('sandbox_check "ripgrep runtime"', installer)
         self.assertIn('sandbox_check "SQLite runtime"', installer)
         self.assertIn('sandbox_check "JADX runtime"', installer)
+        self.assertIn('(subpath "/System/Volumes/Preboot/Cryptexes/OS")', installer)
         self.assertIn("local exit_code=0", installer)
         self.assertNotIn("local status=", installer)
         self.assertIn('cd "$sandbox_test"', installer)
