@@ -16,10 +16,20 @@ QUEUE_CLI = REPOSITORY_ROOT / "pi" / "scripts" / "compute" / "van_compute.py"
 PROTOCOL = REPOSITORY_ROOT / "shared" / "python" / "van_compute_protocol.py"
 EXAMPLE_TASKS = REPOSITORY_ROOT / "pi" / "configs" / "van-compute-obd.example.json"
 DASHBOARD_SERVICE = REPOSITORY_ROOT / "pi" / "services" / "van-dashboard.service"
+BROKER_SERVICE = REPOSITORY_ROOT / "pi" / "services" / "van-compute-broker.service"
 UPDATE_SERVICES = REPOSITORY_ROOT / "pi" / "scripts" / "update_services.sh"
 
 
 class VanComputeDeploymentTests(unittest.TestCase):
+    def test_broker_unit_keeps_systemd_runtime_visible(self):
+        service = BROKER_SERVICE.read_text(encoding="utf-8")
+
+        inaccessible = next(
+            line for line in service.splitlines() if line.startswith("InaccessiblePaths=")
+        )
+        self.assertNotIn("/run/systemd", inaccessible.split())
+        self.assertIn("RestrictAddressFamilies=AF_UNIX AF_NETLINK", service)
+
     def test_generic_sync_excludes_files_owned_by_compute_installer(self):
         sync = SYNC_SCRIPT.read_text(encoding="utf-8")
 

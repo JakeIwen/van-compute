@@ -971,6 +971,8 @@ class RecoveryAndIsolationTests(BrokerHarness):
             job_id="probe",
         )
         self.assertIn("--unshare-net", command)
+        self.assertNotIn("--hostname", command)
+        self.assertNotIn("--disable-userns", command)
         self.assertIn("--clearenv", command)
         self.assertNotIn("/home/pi", command)
 

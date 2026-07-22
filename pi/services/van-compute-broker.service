@@ -48,9 +48,13 @@ RestrictNamespaces=user mnt pid net ipc uts
 LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
-RestrictAddressFamilies=AF_UNIX
+# Bubblewrap uses NETLINK_ROUTE while creating each job's private network
+# namespace; the broker itself still has all IP traffic denied below.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 IPAddressDeny=any
-InaccessiblePaths=-/run/dbus -/run/systemd -/run/user -/var/run/dbus
+# Hiding /run/systemd causes status 226/NAMESPACE on Raspberry Pi OS systemd
+# 252 before the broker can execute. Other runtime/control sockets stay hidden.
+InaccessiblePaths=-/run/dbus -/run/user -/var/run/dbus
 KeyringMode=private
 RemoveIPC=true
 SystemCallArchitectures=native
