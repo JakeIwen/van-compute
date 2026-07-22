@@ -13,6 +13,9 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 SYNC_SCRIPT = REPOSITORY_ROOT / "pi" / "sync_scripts.sh"
 INSTALLER = REPOSITORY_ROOT / "macbook" / "scripts" / "install_van_compute_worker.zsh"
 QUEUE_CLI = REPOSITORY_ROOT / "pi" / "scripts" / "compute" / "van_compute.py"
+UPGRADE_GATE = (
+    REPOSITORY_ROOT / "pi" / "scripts" / "compute" / "van_compute_upgrade_gate.py"
+)
 PROTOCOL = REPOSITORY_ROOT / "shared" / "python" / "van_compute_protocol.py"
 EXAMPLE_TASKS = REPOSITORY_ROOT / "pi" / "configs" / "van-compute-obd.example.json"
 DASHBOARD_SERVICE = REPOSITORY_ROOT / "pi" / "services" / "van-dashboard.service"
@@ -81,6 +84,10 @@ class VanComputeDeploymentTests(unittest.TestCase):
             ),
             "example tasks are not installed under /home/pi/configs",
         )
+        self.assertNotIn(
+            "/home/pi/scripts/compute/van-compute-obd.example.json",
+            installer,
+        )
 
     def test_deployed_queue_cli_finds_sibling_protocol_without_repo_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -130,6 +137,7 @@ class VanComputeDeploymentTests(unittest.TestCase):
 
     def test_installer_preflights_before_heavy_or_fenced_work(self):
         installer = INSTALLER.read_text(encoding="utf-8")
+        upgrade_gate = UPGRADE_GATE.read_text(encoding="utf-8")
 
         self.assertLess(
             installer.index("Checking macOS sandbox capability"),
@@ -140,9 +148,21 @@ class VanComputeDeploymentTests(unittest.TestCase):
             installer.index("Building an isolated Python environment"),
         )
         self.assertLess(
-            installer.index('upgrade_public_root="$('),
+            installer.index("An unsupported flat-layout compute artifact remains"),
             installer.index("Checking and provisioning local worker dependencies"),
         )
+        self.assertIn('upgrade_public_root="$remote_compute_root"', installer)
+        self.assertNotIn('upgrade_public_root="$(', installer)
+        for retired_option in ("--queue-cli", "--retire-target"):
+            self.assertNotIn(retired_option, installer)
+            self.assertNotIn(retired_option, upgrade_gate)
+        self.assertLess(
+            installer.index(
+                "The loaded worker is not the supported persistent --serve LaunchAgent"
+            ),
+            installer.index('/bin/launchctl disable "gui/$user_id/$label"'),
+        )
+        self.assertIn('! print -r -- "$loaded_agent" |', installer)
         self.assertLess(
             installer.index("Checking and provisioning the Pi fallback runtime"),
             installer.index('activate_submission_gate "$remote_upgrade_started"'),

@@ -19,7 +19,7 @@ install_id="$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
 remote_stage="/home/pi/.cache/van-compute-install.$install_id"
 remote_compute_root="/home/pi/scripts/compute"
 remote_config_root="/home/pi/configs"
-upgrade_public_root=""
+upgrade_public_root="$remote_compute_root"
 allow_unsandboxed="${VAN_COMPUTE_ALLOW_UNSANDBOXED:-0}"
 dataset_source="${VAN_COMPUTE_DATASET_CONFIG:-}"
 installer_lock="$support_root/installer.lock"
@@ -54,9 +54,8 @@ restore_submission_cli() {
 
 cleanup() {
   # Keep the all-submission gate in place until the maintenance marker has
-  # definitely been released.  The legacy CLI does not understand that marker,
-  # so restoring it first could reopen submissions into a half-rolled-back
-  # queue.
+  # definitely been released. Restoring the previous CLI first could reopen
+  # submissions into a half-rolled-back queue.
   if (( maintenance_active && ! remote_upgrade_started )); then
     if /usr/bin/ssh "$pi_host" "/usr/bin/env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 '$remote_stage/van_compute.py' --root /home/pi/dev/obd-things/tmp/compute maintenance exit --owner '$maintenance_owner'" >/dev/null 2>&1; then
       maintenance_active=0
@@ -189,8 +188,8 @@ raise SystemExit(not re.fullmatch(
 fi
 
 # Fail before any large local package or virtual-environment work when this
-# known Pi migration cannot proceed. The queue is checked again immediately
-# before fencing, so this is an early cost guard rather than the upgrade lock.
+# Pi upgrade cannot proceed. The queue is checked again immediately before
+# fencing, so this is an early cost guard rather than the upgrade lock.
 echo "Checking SSH access and Pi prerequisites..."
 /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 "$pi_host" '
   set -eu
@@ -210,6 +209,34 @@ echo "Checking SSH access and Pi prerequisites..."
   sudo -n true
   test -d /home/pi/dev/obd-things
   test ! -L /home/pi/dev/obd-things
+  current=/home/pi/scripts/compute
+  test -d "$current" && test ! -L "$current" || {
+    echo "The current compute script directory is missing or unsafe: $current" >&2
+    exit 1
+  }
+  test -f "$current/van_compute.py" && test ! -L "$current/van_compute.py" || {
+    echo "The current compute CLI is missing or unsafe: $current/van_compute.py" >&2
+    exit 1
+  }
+  for current_artifact in \
+    "$current/.van-compute-upgrade-owner" \
+    "$current/.van_compute.py.pre-upgrade"; do
+    if test -e "$current_artifact" || test -L "$current_artifact"; then
+      test -f "$current_artifact" && test ! -L "$current_artifact" || {
+        echo "A current-layout upgrade artifact is unsafe: $current_artifact" >&2
+        exit 1
+      }
+    fi
+  done
+  for legacy_artifact in \
+    /home/pi/scripts/van_compute.py \
+    /home/pi/scripts/.van-compute-upgrade-owner \
+    /home/pi/scripts/.van_compute.py.pre-upgrade; do
+    if test -e "$legacy_artifact" || test -L "$legacy_artifact"; then
+      echo "An unsupported flat-layout compute artifact remains: $legacy_artifact" >&2
+      exit 1
+    fi
+  done
   for state in queued running; do
     root="/home/pi/dev/obd-things/tmp/compute/$state"
     test -d "$root"
@@ -221,45 +248,6 @@ echo "Checking SSH access and Pi prerequisites..."
   done
   /usr/bin/python3 -m venv --help >/dev/null
 '
-
-# Identify the one public CLI that must be fenced before paying the cost of a
-# new worker environment. An interrupted migration keeps its owner record
-# beside the exact target that must be resumed.
-upgrade_public_root="$(
-  /usr/bin/ssh "$pi_host" '
-    set -eu
-    legacy=/home/pi/scripts
-    current=/home/pi/scripts/compute
-    legacy_owner=$legacy/.van-compute-upgrade-owner
-    current_owner=$current/.van-compute-upgrade-owner
-    if { test -e "$legacy_owner" || test -L "$legacy_owner"; } && \
-       { test -e "$current_owner" || test -L "$current_owner"; }; then
-      echo "Both legacy and current compute upgrade owners exist." >&2
-      exit 1
-    elif test -e "$current_owner" || test -L "$current_owner"; then
-      printf "%s\n" "$current"
-    elif test -e "$legacy_owner" || test -L "$legacy_owner"; then
-      printf "%s\n" "$legacy"
-    elif test -L "$current/van_compute.py" || test -L "$legacy/van_compute.py"; then
-      echo "A deployed compute CLI is a symlink; refusing migration." >&2
-      exit 1
-    elif test -f "$current/van_compute.py" && test -f "$legacy/van_compute.py"; then
-      echo "Both legacy and current compute CLIs exist without an upgrade owner; refusing to fence the wrong entry point." >&2
-      exit 1
-    elif test -f "$current/van_compute.py"; then
-      printf "%s\n" "$current"
-    elif test -f "$legacy/van_compute.py"; then
-      printf "%s\n" "$legacy"
-    else
-      echo "No deployed van_compute.py exists to upgrade." >&2
-      exit 1
-    fi
-  '
-)"
-if [[ "$upgrade_public_root" != /home/pi/scripts && "$upgrade_public_root" != "$remote_compute_root" ]]; then
-  echo "Invalid deployed compute root returned by $pi_host: $upgrade_public_root" >&2
-  exit 1
-fi
 
 echo "Checking and provisioning local worker dependencies..."
 formulae=()
@@ -607,7 +595,7 @@ print(sum(1 for root in roots for _entry in root.iterdir()))
 '"
 }
 
-active_legacy_submitters() {
+active_submitters() {
   /usr/bin/ssh "$pi_host" \
     "/usr/bin/python3 '$remote_stage/van_compute_upgrade_gate.py' --active-submitter-count"
 }
@@ -652,8 +640,8 @@ elif [[ "$maintenance_relation" == ours ]]; then
   echo "Resuming this Mac's interrupted protocol upgrade."
 fi
 
-legacy_running="$(active_queue_jobs)"
-if [[ "$legacy_running" != 0 ]]; then
+active_jobs="$(active_queue_jobs)"
+if [[ "$active_jobs" != 0 ]]; then
   echo "The Pi compute queue has pending or running work; no deployed Pi files were changed." >&2
   echo "Let it finish (or inspect it) and rerun the installer." >&2
   exit 1
@@ -664,20 +652,25 @@ agent_has_pid() {
     /usr/bin/grep -Eq '^[[:space:]]*pid = [0-9]+'
 }
 
-if /bin/launchctl print "gui/$user_id/$label" >/dev/null 2>&1; then
+loaded_agent=""
+if loaded_agent="$(/bin/launchctl print "gui/$user_id/$label" 2>/dev/null)"; then
+  if [[ ! -f "$target_plist" || -L "$target_plist" ]] || \
+     ! print -r -- "$loaded_agent" |
+       /usr/bin/grep -Eq '^[[:space:]]*--serve[[:space:]]*$' || \
+     ! /usr/libexec/PlistBuddy -c "Print :ProgramArguments" "$target_plist" 2>/dev/null |
+       /usr/bin/grep -Eq '^[[:space:]]*--serve[[:space:]]*$'; then
+    echo "The loaded worker is not the supported persistent --serve LaunchAgent." >&2
+    echo "Refusing to stop or replace an unknown worker configuration." >&2
+    exit 1
+  fi
   previous_agent_disabled=1
   /bin/launchctl disable "gui/$user_id/$label"
-  persistent_agent=0
-  if [[ -f "$target_plist" ]] && /usr/libexec/PlistBuddy -c "Print :ProgramArguments" "$target_plist" 2>/dev/null |
-    /usr/bin/grep -q -- '--serve'; then
-    persistent_agent=1
-    /bin/launchctl kill SIGUSR1 "gui/$user_id/$label" 2>/dev/null || true
-  fi
+  /bin/launchctl kill SIGUSR1 "gui/$user_id/$label" 2>/dev/null || true
 
   agent_stopped=0
   for attempt in {1..240}; do
-    legacy_running="$(active_queue_jobs)"
-    if [[ "$legacy_running" != 0 ]]; then
+    active_jobs="$(active_queue_jobs)"
+    if [[ "$active_jobs" != 0 ]]; then
       break
     fi
     if ! agent_has_pid; then
@@ -686,16 +679,12 @@ if /bin/launchctl print "gui/$user_id/$label" >/dev/null 2>&1; then
     fi
     /bin/sleep 0.5
   done
-  if [[ "$legacy_running" != 0 ]]; then
+  if [[ "$active_jobs" != 0 ]]; then
     echo "Queue work appeared while draining; the current release will be retained." >&2
     exit 1
   fi
   if (( ! agent_stopped )); then
-    if (( persistent_agent )); then
-      echo "The persistent worker did not finish draining within 120 seconds." >&2
-    else
-      echo "The legacy worker is still active; wait for it to exit and rerun." >&2
-    fi
+    echo "The persistent worker did not finish draining within 120 seconds." >&2
     exit 1
   fi
   restore_previous_agent=1
@@ -704,23 +693,22 @@ if /bin/launchctl print "gui/$user_id/$label" >/dev/null 2>&1; then
   previous_agent_disabled=0
 fi
 
-# Fence the public CLI before relying on a marker the legacy CLI does not know
-# about. Any process that already loaded the old submit code must disappear,
-# and all queue entries (including hidden .staging-* directories) must remain
-# absent before the protocol boundary can move.
+# Fence the public CLI before crossing the protocol boundary. Any process that
+# already loaded the previous submit code must disappear, and all queue entries
+# (including hidden .staging-* directories) must remain absent.
 activate_submission_gate "$remote_upgrade_started"
 submission_gate_active=1
-legacy_submitters=1
+active_submitter_count=1
 for attempt in {1..240}; do
-  legacy_submitters="$(active_legacy_submitters)"
-  legacy_running="$(active_queue_jobs)"
-  if [[ "$legacy_running" != 0 || "$legacy_submitters" == 0 ]]; then
+  active_submitter_count="$(active_submitters)"
+  active_jobs="$(active_queue_jobs)"
+  if [[ "$active_jobs" != 0 || "$active_submitter_count" == 0 ]]; then
     break
   fi
   /bin/sleep 0.5
 done
-if [[ "$legacy_running" != 0 ]]; then
-  echo "A legacy submission reached the queue while the installer was fencing it." >&2
+if [[ "$active_jobs" != 0 ]]; then
+  echo "A submission reached the queue while the installer was fencing it." >&2
   if (( remote_upgrade_started )); then
     echo "The interrupted upgrade remains fenced; inspect the job and rerun this installer." >&2
   else
@@ -728,8 +716,8 @@ if [[ "$legacy_running" != 0 ]]; then
   fi
   exit 1
 fi
-if [[ "$legacy_submitters" != 0 ]]; then
-  echo "A legacy Pi submission did not drain within 120 seconds." >&2
+if [[ "$active_submitter_count" != 0 ]]; then
+  echo "A Pi submission did not drain within 120 seconds." >&2
   if (( remote_upgrade_started )); then
     echo "The interrupted upgrade remains fenced; let it finish and rerun this installer." >&2
   else
@@ -738,13 +726,13 @@ if [[ "$legacy_submitters" != 0 ]]; then
   exit 1
 fi
 
-# New-format workers and the Pi broker honor this marker before claiming. It
-# remains active through protocol replacement and the first new heartbeat.
+# The worker and Pi broker honor this marker before claiming. It remains active
+# through protocol replacement and the first new heartbeat.
 /usr/bin/ssh "$pi_host" "/usr/bin/env PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 '$remote_stage/van_compute.py' --root /home/pi/dev/obd-things/tmp/compute maintenance enter --owner '$maintenance_owner'" >/dev/null
 maintenance_active=1
-legacy_submitters="$(active_legacy_submitters)"
-legacy_running="$(active_queue_jobs)"
-if [[ "$legacy_running" != 0 || "$legacy_submitters" != 0 ]]; then
+active_submitter_count="$(active_submitters)"
+active_jobs="$(active_queue_jobs)"
+if [[ "$active_jobs" != 0 || "$active_submitter_count" != 0 ]]; then
   echo "Submission activity appeared across the maintenance boundary; upgrade is stopping safely." >&2
   exit 1
 fi
@@ -881,26 +869,9 @@ raise SystemExit(
       --finalize --owner "$maintenance_owner"
       --script-root "$upgrade_public_root"
     )
-    if [[ "$upgrade_public_root" == /home/pi/scripts ]]; then
-      finalize_arguments+=(
-        --queue-cli /home/pi/scripts/compute/van_compute.py
-        --retire-target
-      )
-    fi
     /usr/bin/ssh "$pi_host" "${(q)finalize_arguments[@]}" >/dev/null
     maintenance_active=0
     submission_gate_active=0
-    # The new CLI has released maintenance; remove only the retired flat-layout
-    # compute files now that every installed reference points at compute/.
-    /usr/bin/ssh "$pi_host" "/bin/rm -f -- \
-      /home/pi/scripts/van_compute.py \
-      /home/pi/scripts/pi_compute.py \
-      /home/pi/scripts/van_compute_broker.py \
-      /home/pi/scripts/van_compute_upgrade_gate.py \
-      /home/pi/scripts/van-compute-obd.example.json \
-      /home/pi/scripts/compute/van-compute-obd.example.json \
-      /home/pi/scripts/.van-compute-upgrade.lock \
-      /home/pi/scripts/python-automation/van_compute_protocol.py"
     previous_kept=0
     for candidate in "$release_parent"/*(N/om); do
       [[ "$candidate" == "$release" ]] && continue

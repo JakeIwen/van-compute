@@ -2,7 +2,7 @@
 """Fail-closed public CLI fence used while van-compute is being upgraded.
 
 The installer places this script at the public ``van_compute.py`` path only
-after the old Mac worker has drained.  Existing submit processes keep their
+after the current Mac worker has drained. Existing submit processes keep their
 already-loaded code, so the installer also uses ``--active-submitter-count``
 from its private staging path before crossing the protocol boundary.
 """
@@ -59,7 +59,7 @@ def active_submitter_count(
 ) -> int:
     """Count same-user supported CLI submissions that loaded before the fence."""
     if not proc.is_dir():
-        raise RuntimeError("/proc is unavailable; cannot drain legacy submissions")
+        raise RuntimeError("/proc is unavailable; cannot drain active submissions")
     current_pid = os.getpid() if current_pid is None else current_pid
     current_uid = os.getuid() if current_uid is None else current_uid
     count = 0
@@ -263,8 +263,6 @@ def finalize_upgrade(
     *,
     script_root: Path = DEFAULT_SCRIPT_ROOT,
     queue_root: Path = DEFAULT_QUEUE_ROOT,
-    queue_cli: Path | None = None,
-    retire_target: bool = False,
 ) -> None:
     """Remove rollback artifacts, then release maintenance as one locked transition."""
     owner = _validate_owner(owner)
@@ -272,15 +270,8 @@ def finalize_upgrade(
         target, backup, owner_record = _paths(script_root)
         _require_owner(owner_record, owner)
         _regular_file(target, "public queue CLI")
-        if queue_cli is None:
-            queue_cli = target
-        _regular_file(queue_cli, "replacement queue CLI")
-        if _is_gate(queue_cli):
-            raise RuntimeError("replacement queue CLI is still the upgrade gate")
-        if not retire_target and _is_gate(target):
+        if _is_gate(target):
             raise RuntimeError("public queue CLI is still the upgrade gate")
-        if retire_target and queue_cli == target:
-            raise RuntimeError("cannot retire the queue CLI used to release maintenance")
         # Keep maintenance active while stale rollback artifacts are removed.
         # If release then fails, the persistent maintenance owner identifies the
         # installer that may safely reacquire the gate and resume.  Releasing
@@ -289,13 +280,11 @@ def finalize_upgrade(
         if _optional_regular_file(backup, "pre-upgrade queue CLI backup"):
             backup.unlink()
         owner_record.unlink()
-        if retire_target:
-            target.unlink()
         _sync_directory(script_root)
         try:
             subprocess.run(
                 [
-                    str(queue_cli),
+                    str(target),
                     "--root",
                     str(queue_root),
                     "maintenance",
@@ -335,8 +324,6 @@ def main() -> int:
     parser.add_argument("--owner", required=True)
     parser.add_argument("--gate", type=Path)
     parser.add_argument("--script-root", type=Path, default=DEFAULT_SCRIPT_ROOT)
-    parser.add_argument("--queue-cli", type=Path)
-    parser.add_argument("--retire-target", action="store_true")
     parser.add_argument("--allow-existing-backup", action="store_true")
     arguments = parser.parse_args()
     try:
@@ -350,12 +337,7 @@ def main() -> int:
                 script_root=arguments.script_root,
             )
         elif arguments.restore:
-            if (
-                arguments.gate is not None
-                or arguments.queue_cli is not None
-                or arguments.retire_target
-                or arguments.allow_existing_backup
-            ):
+            if arguments.gate is not None or arguments.allow_existing_backup:
                 parser.error("--restore does not accept acquire/finalize options")
             restore_submission_cli(
                 arguments.owner,
@@ -367,8 +349,6 @@ def main() -> int:
             finalize_upgrade(
                 arguments.owner,
                 script_root=arguments.script_root,
-                queue_cli=arguments.queue_cli,
-                retire_target=arguments.retire_target,
             )
     except RuntimeError as exc:
         print(f"van-compute upgrade gate: {exc}", file=sys.stderr)

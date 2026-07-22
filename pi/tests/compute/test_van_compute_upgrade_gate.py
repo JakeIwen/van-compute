@@ -156,6 +156,31 @@ class VanComputeUpgradeGateTests(unittest.TestCase):
             }
             self.assertEqual(after, before)
 
+    def test_owned_resume_preserves_the_original_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script_root = root / "scripts"
+            script_root.mkdir()
+            target = script_root / "van_compute.py"
+            backup = script_root / ".van_compute.py.pre-upgrade"
+            owner_record = script_root / ".van-compute-upgrade-owner"
+            staged_gate = root / "staged-upgrade-gate.py"
+            target.write_bytes(b"partially upgraded CLI\n")
+            backup.write_bytes(b"original CLI\n")
+            owner_record.write_text(f"{self.OWNER}\n")
+            staged_gate.write_bytes(b"UPGRADE_GATE = True\n")
+
+            gate.acquire_submission_gate(
+                staged_gate,
+                self.OWNER,
+                allow_existing_backup=True,
+                script_root=script_root,
+            )
+
+            self.assertEqual(target.read_bytes(), b"UPGRADE_GATE = True\n")
+            self.assertEqual(backup.read_bytes(), b"original CLI\n")
+            self.assertEqual(owner_record.read_text(), f"{self.OWNER}\n")
+
     def test_finalize_removes_artifacts_before_releasing_maintenance(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -205,6 +230,34 @@ class VanComputeUpgradeGateTests(unittest.TestCase):
             self.assertFalse(owner_record.exists())
             self.assertEqual(target.read_bytes(), b"new queue CLI\n")
 
+    def test_finalize_refuses_to_release_while_public_cli_is_the_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script_root = root / "scripts"
+            queue_root = root / "queue"
+            script_root.mkdir()
+            queue_root.mkdir()
+            target = script_root / "van_compute.py"
+            backup = script_root / ".van_compute.py.pre-upgrade"
+            owner_record = script_root / ".van-compute-upgrade-owner"
+            target.write_bytes(b"UPGRADE_GATE = True\n")
+            backup.write_bytes(b"old queue CLI\n")
+            owner_record.write_text(f"{self.OWNER}\n")
+
+            with (
+                mock.patch.object(gate.subprocess, "run") as release,
+                self.assertRaisesRegex(RuntimeError, "still the upgrade gate"),
+            ):
+                gate.finalize_upgrade(
+                    self.OWNER,
+                    script_root=script_root,
+                    queue_root=queue_root,
+                )
+
+            release.assert_not_called()
+            self.assertTrue(backup.exists())
+            self.assertTrue(owner_record.exists())
+
     def test_finalize_release_failure_leaves_maintenance_for_owned_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -236,43 +289,6 @@ class VanComputeUpgradeGateTests(unittest.TestCase):
             self.assertFalse(backup.exists())
             self.assertFalse(owner_record.exists())
             self.assertEqual(target.read_bytes(), b"new queue CLI\n")
-
-    def test_finalize_can_retire_a_legacy_gated_cli(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            script_root = root / "legacy-scripts"
-            current_root = root / "compute"
-            queue_root = root / "queue"
-            script_root.mkdir()
-            current_root.mkdir()
-            queue_root.mkdir()
-            target = script_root / "van_compute.py"
-            replacement = current_root / "van_compute.py"
-            backup = script_root / ".van_compute.py.pre-upgrade"
-            owner_record = script_root / ".van-compute-upgrade-owner"
-            target.write_bytes(b"UPGRADE_GATE = True\n")
-            replacement.write_bytes(b"new queue CLI\n")
-            backup.write_bytes(b"old queue CLI\n")
-            owner_record.write_text(f"{self.OWNER}\n")
-
-            def release(command, **_kwargs):
-                self.assertEqual(command[0], str(replacement))
-                self.assertFalse(target.exists())
-                self.assertFalse(backup.exists())
-                self.assertFalse(owner_record.exists())
-                return gate.subprocess.CompletedProcess(command, 0)
-
-            with mock.patch.object(gate.subprocess, "run", side_effect=release):
-                gate.finalize_upgrade(
-                    self.OWNER,
-                    script_root=script_root,
-                    queue_root=queue_root,
-                    queue_cli=replacement,
-                    retire_target=True,
-                )
-
-            self.assertTrue(replacement.exists())
-
 
 if __name__ == "__main__":
     unittest.main()
