@@ -40,11 +40,11 @@ from typing import BinaryIO, Callable, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
-from shared.python import van_compute_protocol as protocol
+from pi.van_compute.scripts import van_compute_protocol as protocol
 
 
 DEFAULT_HOST = "pi@vanpi"
-DEFAULT_REMOTE_CLI = "/home/pi/scripts/compute/van_compute.py"
+DEFAULT_REMOTE_CLI = "/home/pi/van_compute/scripts/van_compute.py"
 DEFAULT_PRIVATE_ROOT = Path.home() / "Library" / "Caches" / "van-compute"
 DEFAULT_WORK_ROOT = DEFAULT_PRIVATE_ROOT / "jobs"
 DEFAULT_CONTROL_PATH = DEFAULT_PRIVATE_ROOT / "ssh" / "control.sock"

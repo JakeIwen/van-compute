@@ -29,16 +29,12 @@ from typing import BinaryIO, Iterator, Sequence
 
 
 def _import_protocol():
-    try:
-        from shared.python import van_compute_protocol as protocol
-
-        return protocol
-    except ModuleNotFoundError:
-        deployed = Path(__file__).resolve().parent / "python-automation"
-        sys.path.insert(0, str(deployed))
+    if __package__:
+        from pi.van_compute.scripts import van_compute_protocol as protocol
+    else:
         import van_compute_protocol as protocol
 
-        return protocol
+    return protocol
 
 
 protocol = _import_protocol()

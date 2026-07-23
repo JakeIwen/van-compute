@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared, shell-free protocol for opportunistic offline compute jobs.
+"""Shell-free protocol shared by the van-compute queue and workers.
 
 Four original CAN-analysis tasks remain built in for compatibility.  A source
 repository may additionally declare offline jobs in ``.van-compute.json``.

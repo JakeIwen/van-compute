@@ -27,7 +27,7 @@ UPGRADE_GATE = True
 UPGRADE_OWNER_RE = re.compile(
     r"installer-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
-DEFAULT_SCRIPT_ROOT = Path("/home/pi/scripts/compute")
+DEFAULT_SCRIPT_ROOT = Path("/home/pi/van_compute/scripts")
 DEFAULT_QUEUE_ROOT = Path("/home/pi/dev/obd-things/tmp/compute")
 
 # ``pi_compute.py`` imports the public queue module before it parses a command.
@@ -263,28 +263,46 @@ def finalize_upgrade(
     *,
     script_root: Path = DEFAULT_SCRIPT_ROOT,
     queue_root: Path = DEFAULT_QUEUE_ROOT,
+    queue_cli: Path | None = None,
+    retire_target: bool = False,
 ) -> None:
-    """Remove rollback artifacts, then release maintenance as one locked transition."""
+    """Finalize an owned CLI transition and release queue maintenance."""
     owner = _validate_owner(owner)
     with upgrade_lock(script_root):
         target, backup, owner_record = _paths(script_root)
         _require_owner(owner_record, owner)
         _regular_file(target, "public queue CLI")
-        if _is_gate(target):
+        if queue_cli is None:
+            queue_cli = target
+        _regular_file(queue_cli, "replacement queue CLI")
+        if _is_gate(queue_cli):
+            raise RuntimeError("replacement queue CLI is still the upgrade gate")
+        target_is_gate = _is_gate(target)
+        if not retire_target and target_is_gate:
             raise RuntimeError("public queue CLI is still the upgrade gate")
-        # Keep maintenance active while stale rollback artifacts are removed.
-        # If release then fails, the persistent maintenance owner identifies the
-        # installer that may safely reacquire the gate and resume.  Releasing
-        # first would let an interruption strand an old, mismatched backup next
-        # to an unfenced new CLI.
-        if _optional_regular_file(backup, "pre-upgrade queue CLI backup"):
-            backup.unlink()
-        owner_record.unlink()
+        if retire_target and queue_cli == target:
+            raise RuntimeError("cannot retire the queue CLI used to release maintenance")
+        if retire_target and not target_is_gate:
+            raise RuntimeError("retired queue CLI is not the upgrade gate")
+        if retire_target:
+            # Remove the obsolete public entry point first, but retain its
+            # owner and rollback record until the installer deletes the whole
+            # old root. An interruption at any later point is then resumable:
+            # the new CLI is authoritative, maintenance still names this owner
+            # if release failed, and the retired root remains attributable.
+            _regular_file(backup, "pre-upgrade queue CLI backup")
+            target.unlink()
+        else:
+            # A same-root upgrade keeps its replacement CLI, so stale rollback
+            # artifacts must disappear before maintenance is released.
+            if _optional_regular_file(backup, "pre-upgrade queue CLI backup"):
+                backup.unlink()
+            owner_record.unlink()
         _sync_directory(script_root)
         try:
             subprocess.run(
                 [
-                    str(target),
+                    str(queue_cli),
                     "--root",
                     str(queue_root),
                     "maintenance",
@@ -295,8 +313,13 @@ def finalize_upgrade(
                 check=True,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
+                timeout=30,
             )
-        except (OSError, subprocess.CalledProcessError) as exc:
+        except (
+            OSError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as exc:
             raise RuntimeError(f"cannot release queue maintenance: {exc}") from None
 
 
@@ -324,6 +347,8 @@ def main() -> int:
     parser.add_argument("--owner", required=True)
     parser.add_argument("--gate", type=Path)
     parser.add_argument("--script-root", type=Path, default=DEFAULT_SCRIPT_ROOT)
+    parser.add_argument("--queue-cli", type=Path)
+    parser.add_argument("--retire-target", action="store_true")
     parser.add_argument("--allow-existing-backup", action="store_true")
     arguments = parser.parse_args()
     try:
@@ -337,7 +362,12 @@ def main() -> int:
                 script_root=arguments.script_root,
             )
         elif arguments.restore:
-            if arguments.gate is not None or arguments.allow_existing_backup:
+            if (
+                arguments.gate is not None
+                or arguments.queue_cli is not None
+                or arguments.retire_target
+                or arguments.allow_existing_backup
+            ):
                 parser.error("--restore does not accept acquire/finalize options")
             restore_submission_cli(
                 arguments.owner,
@@ -349,6 +379,8 @@ def main() -> int:
             finalize_upgrade(
                 arguments.owner,
                 script_root=arguments.script_root,
+                queue_cli=arguments.queue_cli,
+                retire_target=arguments.retire_target,
             )
     except RuntimeError as exc:
         print(f"van-compute upgrade gate: {exc}", file=sys.stderr)

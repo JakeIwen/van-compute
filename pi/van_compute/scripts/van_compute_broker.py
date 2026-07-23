@@ -39,20 +39,13 @@ import time
 from typing import Callable, Mapping, Sequence
 
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
-if (REPOSITORY_ROOT / "shared" / "python").is_dir():
-    sys.path.insert(0, str(REPOSITORY_ROOT))
-
-
 def _import_queue():
-    try:
-        from pi.scripts.compute import van_compute as queue_module
-
-        return queue_module
-    except ModuleNotFoundError:
+    if __package__:
+        from pi.van_compute.scripts import van_compute as queue_module
+    else:
         import van_compute as queue_module
 
-        return queue_module
+    return queue_module
 
 
 queue = _import_queue()
@@ -89,7 +82,7 @@ DEFAULT_MAX_TEMPERATURE_C = 75.0
 DEFAULT_NOFILE = 256
 DEFAULT_NPROC = 256
 DEFAULT_BWRAP = "/usr/bin/bwrap"
-DEFAULT_LOCAL_PYTHON = "/home/pi/.local/share/van-compute/venv/bin/python3"
+DEFAULT_LOCAL_PYTHON = "/home/pi/van_compute/venv/bin/python3"
 RESOURCE_POLL_INTERVAL = 0.5
 SAFE_INPUT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 MOUNTINFO_ESCAPE_RE = re.compile(r"\\([0-7]{3})")

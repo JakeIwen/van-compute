@@ -17,8 +17,7 @@ from typing import Callable
 
 
 DEFAULT_QUEUE_ROOT = Path("/home/pi/dev/obd-things/tmp/compute")
-# Metrics is deployed with the dashboard as well as by the compute installer,
-# so it cannot import the installer-owned protocol module at runtime. A unit
+# Keep telemetry readable if a queue protocol rollout is interrupted. A unit
 # test pins this value to van_compute_protocol.WORKER_PROTOCOL_VERSION.
 WORKER_PROTOCOL_VERSION = 1
 STATE_DIRECTORIES = ("queued", "running", "done", "failed")

@@ -47,9 +47,15 @@ class FakeRemote:
 
 
 class RemoteQueueProtocolTests(unittest.TestCase):
+    def test_default_remote_cli_uses_compute_owned_root(self):
+        self.assertEqual(
+            worker.DEFAULT_REMOTE_CLI,
+            "/home/pi/van_compute/scripts/van_compute.py",
+        )
+
     def test_heartbeat_and_claim_send_current_protocol_version(self):
         remote = worker.RemoteQueue(
-            "pi@vanpi", "/home/pi/scripts/compute/van_compute.py", "m4mac.00"
+            "pi@vanpi", "/home/pi/van_compute/scripts/van_compute.py", "m4mac.00"
         )
         version = str(worker.protocol.WORKER_PROTOCOL_VERSION)
         with mock.patch.object(

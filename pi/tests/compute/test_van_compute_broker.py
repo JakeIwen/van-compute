@@ -12,10 +12,10 @@ import time
 import unittest
 from unittest import mock
 
-from pi.scripts.compute import pi_compute
-from pi.scripts.compute import van_compute as queue
-from pi.scripts.compute import van_compute_broker as broker
-from shared.python import van_compute_protocol as protocol
+from pi.van_compute.scripts import pi_compute
+from pi.van_compute.scripts import van_compute as queue
+from pi.van_compute.scripts import van_compute_broker as broker
+from pi.van_compute.scripts import van_compute_protocol as protocol
 
 
 LOCAL_SCRIPT = """#!/usr/bin/env python3
@@ -184,6 +184,12 @@ class BrokerHarness(unittest.TestCase):
 
 
 class PlacementTests(BrokerHarness):
+    def test_default_fallback_python_lives_under_compute_root(self):
+        self.assertEqual(
+            broker.DEFAULT_LOCAL_PYTHON,
+            "/home/pi/van_compute/venv/bin/python3",
+        )
+
     def test_default_result_limit_matches_queue_protocol(self):
         self.assertEqual(
             broker.DEFAULT_MAX_RESULT_BYTES,

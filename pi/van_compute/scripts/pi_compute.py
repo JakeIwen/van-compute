@@ -19,14 +19,12 @@ from typing import Sequence
 
 
 def _import_queue():
-    try:
-        from pi.scripts.compute import van_compute as queue_module
-
-        return queue_module
-    except ModuleNotFoundError:
+    if __package__:
+        from pi.van_compute.scripts import van_compute as queue_module
+    else:
         import van_compute as queue_module
 
-        return queue_module
+    return queue_module
 
 
 queue = _import_queue()
@@ -72,7 +70,7 @@ def _present_manifest(
         payload["result_paths"] = paths
         job_id = str(manifest.get("id", "JOB_ID"))
         payload["retrieve"] = {
-            path: f"/home/pi/scripts/compute/pi_compute.py result {job_id} {path}"
+            path: f"/home/pi/van_compute/scripts/pi_compute.py result {job_id} {path}"
             for path in paths
         }
     if include_output:

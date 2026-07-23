@@ -98,23 +98,66 @@ The installer checks that capability before downloading or building anything
 and fails closed if profiles cannot be nested in its current environment.
 
 The installer provisions a private Mac Python environment and required offline
-tools, validates the Mac sandbox, deploys the Pi queue/frontend/broker plus the
-compute dashboard metrics and assets, provisions the Pi fallback Python
-environment, installs the systemd unit, and starts the persistent LaunchAgent.
+tools, validates the Mac sandbox, deploys the Pi queue/frontend/broker and
+read-only dashboard metrics module, provisions the Pi fallback Python
+environment, registers the systemd unit, and starts the persistent LaunchAgent.
 Immutable worker releases live under
 `~/Library/Application Support/van-compute/releases`; the current and previous
 release are retained. Rerun the installer after changing the worker, protocol,
-broker, or compute dashboard.
+broker, or metrics module. Dashboard application, template, static, and service
+changes still deploy through `pi/sync_scripts.sh`.
 
-This installer is the sole deployment path for `pi/scripts/compute/`,
-`van_compute_protocol.py`, and `van-compute-broker.service`. The general
-`pi/sync_scripts.sh` deployment deliberately excludes them so it cannot publish
-half of a Pi/Mac protocol upgrade or start an unprovisioned broker. The current
-installer requires the deployed CLI under `/home/pi/scripts/compute/`. The
-one-time flat-layout migration has completed and its compatibility branch was
-retired; any flat CLI, owner record, or rollback backup now makes installation
-fail closed for deliberate cleanup instead of guessing which entry point owns
-the queue.
+The compute installer is the sole deployment path for `pi/van_compute/`. Its Pi
+files have one self-contained destination:
+
+- `/home/pi/van_compute/scripts/` contains the queue CLI, agent frontend,
+  broker, upgrade gate, protocol, and metrics modules.
+- `/home/pi/van_compute/configs/` contains the example task policy and the
+  auditable source copy of the systemd unit.
+- `/home/pi/van_compute/venv/` is the private Pi fallback runtime.
+- `/home/pi/van_compute/runtime.lock` serializes fallback-runtime provisioning.
+
+The operational unit is also installed as a root-owned regular file at
+`/etc/systemd/system/van-compute-broker.service`; systemd requires that
+registration outside the application tree. It is intentionally not a symlink
+into pi-owned `/home`, which would let the service account replace
+root-interpreted configuration. This is the sole deployed-file exception.
+
+Queue jobs and results remain runtime data under the configured `obd-things`
+compute directory; they are not deployed files. The general
+`pi/sync_scripts.sh` process neither copies nor excludes compute files, so it
+cannot publish half of a Pi/Mac protocol upgrade. During the one-time layout
+migration, the installer retires the legacy `/home/pi/scripts/compute/` tree
+only after the replacement broker and worker have been validated.
+
+For that migration, run the compute installer first so the metrics module is at
+its canonical path, then run `pi/sync_scripts.sh` to publish the dashboard app,
+assets, and updated service definition. Once the dashboard is active with that
+definition, remove its retired module copy:
+
+```bash
+ssh pi@vanpi '
+  set -eu
+  systemctl is-active --quiet van-dashboard.service
+  systemctl cat van-dashboard.service |
+    grep -Fq /home/pi/van_compute/scripts/van_compute_metrics.py
+  for old in \
+    /home/pi/scripts/python-automation/van_compute_metrics.py \
+    /home/pi/scripts/python-automation/van_compute_protocol.py; do
+    if test -e "$old" || test -L "$old"; then
+      test -f "$old" && test ! -L "$old"
+      rm -f -- "$old"
+    fi
+  done
+  cache=/home/pi/scripts/python-automation/__pycache__
+  if test -e "$cache" || test -L "$cache"; then
+    test -d "$cache" && test ! -L "$cache"
+    find "$cache" -mindepth 1 -maxdepth 1 -type f \
+      \( -name "van_compute_metrics.*.pyc" \
+         -o -name "van_compute_protocol.*.pyc" \) -delete
+  fi
+'
+```
 
 Upgrades are drain-first. The installer requires the running queue to be empty,
 disables new launches, asks a current persistent scheduler to stop claiming,
@@ -139,8 +182,8 @@ ssh pi@vanpi '
   cd /home/pi/dev/obd-things
   test ! -e .van-compute.json
   test ! -L .van-compute.json
-  install -m 600 /home/pi/configs/van-compute-obd.example.json .van-compute.json
-  /home/pi/scripts/compute/pi_compute.py tasks
+  install -m 600 /home/pi/van_compute/configs/van-compute-obd.example.json .van-compute.json
+  /home/pi/van_compute/scripts/pi_compute.py tasks
 '
 ```
 
@@ -166,8 +209,8 @@ VAN_COMPUTE_DATASET_CONFIG=/absolute/path/to/datasets.json \
   ./macbook/scripts/install_van_compute_worker.zsh
 ```
 
-This checkout's active private source is the ignored, mode-0600 file
-`pi/secrets/van-compute-datasets.json`; keep the physical corpus path there and
+This checkout's active private source is the ignored, mode-0600 Mac-only file
+`macbook/secrets/van-compute-datasets.json`; keep the physical corpus path there and
 pass that file through `VAN_COMPUTE_DATASET_CONFIG` on future installs.
 
 The example `oem-corpus-search` task is listed even without this private
@@ -179,44 +222,44 @@ configured on the Mac.
 List the named tasks:
 
 ```bash
-/home/pi/scripts/compute/pi_compute.py tasks
+/home/pi/van_compute/scripts/pi_compute.py tasks
 ```
 
 Submit work and wait for a bounded time:
 
 ```bash
 # Portable AlfaOBD DAT smoke tests; pass another -k expression to select a subset.
-/home/pi/scripts/compute/pi_compute.py run repo-tests --wait 1800
+/home/pi/van_compute/scripts/pi_compute.py run repo-tests --wait 1800
 
 # Existing fixed offline capture summary.
-/home/pi/scripts/compute/pi_compute.py run can-capture-summary \
+/home/pi/van_compute/scripts/pi_compute.py run can-capture-summary \
   --input /home/pi/dev/obd-things/tmp/captures/ccan/drive.log \
   --arg=--snapshot --wait 600
 
 # Exactly one read-only SQL query.
-/home/pi/scripts/compute/pi_compute.py run sqlite-query \
+/home/pi/van_compute/scripts/pi_compute.py run sqlite-query \
   --input /home/pi/dev/obd-things/tmp/example.sqlite3 \
   --arg='SELECT name FROM sqlite_master ORDER BY name' --wait 600
 
 # Remote-only corpus search through a configured dataset alias.
-/home/pi/scripts/compute/pi_compute.py run oem-corpus-search \
+/home/pi/van_compute/scripts/pi_compute.py run oem-corpus-search \
   --arg='diagnostic trouble code' --wait 600
 
 # Remote-only decompilation; the declared directory returns as jadx.tar.gz.
-/home/pi/scripts/compute/pi_compute.py run apk-decompile \
+/home/pi/van_compute/scripts/pi_compute.py run apk-decompile \
   --input /home/pi/dev/obd-things/tmp/android/base.apk --wait 3600
 ```
 
 Inspect and retrieve results without knowing the queue layout:
 
 ```bash
-/home/pi/scripts/compute/pi_compute.py list
-/home/pi/scripts/compute/pi_compute.py status JOB_ID
-/home/pi/scripts/compute/pi_compute.py wait JOB_ID --timeout 3600
-/home/pi/scripts/compute/pi_compute.py result JOB_ID stdout.txt
-/home/pi/scripts/compute/pi_compute.py result JOB_ID stderr.txt >&2
-/home/pi/scripts/compute/pi_compute.py result JOB_ID summary.json > tmp/summary.json
-/home/pi/scripts/compute/pi_compute.py result JOB_ID jadx.tar.gz > tmp/jadx.tar.gz
+/home/pi/van_compute/scripts/pi_compute.py list
+/home/pi/van_compute/scripts/pi_compute.py status JOB_ID
+/home/pi/van_compute/scripts/pi_compute.py wait JOB_ID --timeout 3600
+/home/pi/van_compute/scripts/pi_compute.py result JOB_ID stdout.txt
+/home/pi/van_compute/scripts/pi_compute.py result JOB_ID stderr.txt >&2
+/home/pi/van_compute/scripts/pi_compute.py result JOB_ID summary.json > tmp/summary.json
+/home/pi/van_compute/scripts/pi_compute.py result JOB_ID jadx.tar.gz > tmp/jadx.tar.gz
 ```
 
 Inputs must be regular, non-symlink files inside the selected source root. The
@@ -271,7 +314,7 @@ tail -n 100 "$HOME/Library/Caches/van-compute/logs/worker.stderr.log"
 ```
 
 ```bash
-ssh pi@vanpi '/home/pi/scripts/compute/van_compute.py available'
+ssh pi@vanpi '/home/pi/van_compute/scripts/van_compute.py available'
 ssh pi@vanpi 'systemctl status van-compute-broker --no-pager'
 ssh pi@vanpi 'journalctl -u van-compute-broker -n 100 --no-pager'
 ```
@@ -279,7 +322,7 @@ ssh pi@vanpi 'journalctl -u van-compute-broker -n 100 --no-pager'
 ## Drop-in agent instructions
 
 ```markdown
-Always send CPU- or memory-intensive offline commands—including repository tests, APK/decompilation, SQLite queries, large corpus searches, Python analysis, and saved CAN or AlfaOBD log analysis—to `/home/pi/scripts/compute/pi_compute.py` as named tasks; never run those commands directly on vanpi. The compute service decides availability, Mac-versus-Pi placement, fallback, resource limits, and scheduling. Use `/home/pi/scripts/compute/pi_compute.py tasks` to discover task names. If no suitable task exists, add or review a `.van-compute.json` task instead of bypassing the service. Submit independent jobs before waiting when work can run in parallel.
+Always send CPU- or memory-intensive offline commands—including repository tests, APK/decompilation, SQLite queries, large corpus searches, Python analysis, and saved CAN or AlfaOBD log analysis—to `/home/pi/van_compute/scripts/pi_compute.py` as named tasks; never run those commands directly on vanpi. The compute service decides availability, Mac-versus-Pi placement, fallback, resource limits, and scheduling. Use `/home/pi/van_compute/scripts/pi_compute.py tasks` to discover task names. If no suitable task exists, add or review a `.van-compute.json` task instead of bypassing the service. Submit independent jobs before waiting when work can run in parallel.
 
 Never send live CAN/SocketCAN access, interface setup, bus wake or UDS transmission, ADB/device access, network changes, mounts/storage operations, or service control through `pi_compute`; those remain local under their existing safety and authorization rules.
 ```
