@@ -718,7 +718,7 @@ echo "Checking and provisioning the Pi fallback runtime..."
 "
 
 active_queue_jobs() {
-  /usr/bin/ssh "$pi_host" "/usr/bin/python3 -c '
+  /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 "$pi_host" "/usr/bin/python3 -c '
 from pathlib import Path
 roots = [
     Path(\"/home/pi/dev/obd-things/tmp/compute/queued\"),
@@ -731,7 +731,7 @@ print(sum(1 for root in roots for _entry in root.iterdir()))
 }
 
 active_submitters() {
-  /usr/bin/ssh "$pi_host" \
+  /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 "$pi_host" \
     "/usr/bin/python3 '$remote_stage/van_compute_upgrade_gate.py' --active-submitter-count"
 }
 

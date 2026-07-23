@@ -290,6 +290,16 @@ class VanComputeDeploymentTests(unittest.TestCase):
         self.assertLess(rollback_armed, unload)
         self.assertLess(unload, post_unload_queue_check)
         self.assertIn("after a 15-second drain window", installer)
+        queue_helper = installer[
+            installer.index("active_queue_jobs() {") :
+            installer.index("active_submitters() {")
+        ]
+        submitter_helper = installer[
+            installer.index("active_submitters() {") :
+            installer.index("activate_submission_gate() {")
+        ]
+        for helper in (queue_helper, submitter_helper):
+            self.assertIn("-o BatchMode=yes -o ConnectTimeout=5", helper)
         self.assertLess(
             installer.index("Checking and provisioning the Pi fallback runtime"),
             installer.index('activate_submission_gate "$remote_upgrade_started"'),
