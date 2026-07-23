@@ -782,9 +782,13 @@ if [[ "$active_jobs" != 0 ]]; then
   exit 1
 fi
 
-agent_has_pid() {
-  /bin/launchctl print "gui/$user_id/$label" 2>/dev/null |
-    /usr/bin/grep -Eq '^[[:space:]]*pid = [0-9]+'
+agent_pid() {
+  local agent_state=""
+  if ! agent_state="$(/bin/launchctl print "gui/$user_id/$label" 2>/dev/null)"; then
+    return 0
+  fi
+  print -r -- "$agent_state" |
+    /usr/bin/awk '/^[[:space:]]*pid = [0-9]+/{print $3; exit}'
 }
 
 loaded_agent=""
@@ -798,18 +802,28 @@ if loaded_agent="$(/bin/launchctl print "gui/$user_id/$label" 2>/dev/null)"; the
     echo "Refusing to stop or replace an unknown worker configuration." >&2
     exit 1
   fi
+  original_agent_pid="$(
+    print -r -- "$loaded_agent" |
+      /usr/bin/awk '/^[[:space:]]*pid = [0-9]+/{print $3; exit}'
+  )"
   previous_agent_disabled=1
   /bin/launchctl disable "gui/$user_id/$label"
   /bin/launchctl kill SIGUSR1 "gui/$user_id/$label" 2>/dev/null || true
 
-  agent_stopped=0
-  for attempt in {1..240}; do
+  # KeepAlive may immediately replace a scheduler that drained successfully,
+  # and an idle claim RPC can remain blocked while the Pi is reconnecting.
+  # Watch the original PID for a short graceful window, then boot out the
+  # disabled job while the queue is still proven empty.
+  original_agent_departed=0
+  for attempt in {1..30}; do
     active_jobs="$(active_queue_jobs)"
     if [[ "$active_jobs" != 0 ]]; then
       break
     fi
-    if ! agent_has_pid; then
-      agent_stopped=1
+    current_agent_pid="$(agent_pid)"
+    if [[ -z "$original_agent_pid" || -z "$current_agent_pid" || \
+          "$current_agent_pid" != "$original_agent_pid" ]]; then
+      original_agent_departed=1
       break
     fi
     /bin/sleep 0.5
@@ -818,12 +832,20 @@ if loaded_agent="$(/bin/launchctl print "gui/$user_id/$label" 2>/dev/null)"; the
     echo "Queue work appeared while draining; the current release will be retained." >&2
     exit 1
   fi
-  if (( ! agent_stopped )); then
-    echo "The persistent worker did not finish draining within 120 seconds." >&2
-    exit 1
+  if (( ! original_agent_departed )); then
+    echo "The idle worker is blocked in an RPC; unloading it after a 15-second drain window."
   fi
   restore_previous_agent=1
-  /bin/launchctl bootout "gui/$user_id/$label"
+  if ! /bin/launchctl bootout "gui/$user_id/$label" 2>/dev/null && \
+     /bin/launchctl print "gui/$user_id/$label" >/dev/null 2>&1; then
+    echo "The previous worker could not be unloaded safely." >&2
+    exit 1
+  fi
+  active_jobs="$(active_queue_jobs)"
+  if [[ "$active_jobs" != 0 ]]; then
+    echo "Queue work appeared while unloading; the previous worker will be restored." >&2
+    exit 1
+  fi
   /bin/launchctl enable "gui/$user_id/$label"
   previous_agent_disabled=0
 fi

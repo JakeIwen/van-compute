@@ -270,6 +270,26 @@ class VanComputeDeploymentTests(unittest.TestCase):
             installer.index('/bin/launchctl disable "gui/$user_id/$label"'),
         )
         self.assertIn('! print -r -- "$loaded_agent" |', installer)
+        drain_disable = installer.index(
+            '/bin/launchctl disable "gui/$user_id/$label"'
+        )
+        drain_signal = installer.index(
+            '/bin/launchctl kill SIGUSR1 "gui/$user_id/$label"'
+        )
+        drain_window = installer.index("for attempt in {1..30}", drain_signal)
+        rollback_armed = installer.index("restore_previous_agent=1", drain_window)
+        unload = installer.index(
+            '/bin/launchctl bootout "gui/$user_id/$label"', drain_window
+        )
+        post_unload_queue_check = installer.index(
+            'active_jobs="$(active_queue_jobs)"', unload
+        )
+        self.assertLess(drain_disable, drain_signal)
+        self.assertLess(drain_signal, drain_window)
+        self.assertLess(drain_window, rollback_armed)
+        self.assertLess(rollback_armed, unload)
+        self.assertLess(unload, post_unload_queue_check)
+        self.assertIn("after a 15-second drain window", installer)
         self.assertLess(
             installer.index("Checking and provisioning the Pi fallback runtime"),
             installer.index('activate_submission_gate "$remote_upgrade_started"'),
