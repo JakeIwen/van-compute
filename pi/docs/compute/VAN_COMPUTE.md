@@ -1,5 +1,7 @@
 # Van compute broker
 
+[Pi documentation index](../../README.md)
+
 `pi_compute.py` is the single agent-facing entry point for CPU- or memory-heavy
 offline work. Agents enqueue a named task and never decide whether the Mac is
 reachable or whether the Pi should fall back locally.

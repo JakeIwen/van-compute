@@ -1339,6 +1339,185 @@ class ComputeMetricsTests(unittest.TestCase):
         self.assertIn("process-group aggregate", report["measurement_note"])
         self.assertIn("not exhaustive", report["measurement_note"])
 
+    def test_classifies_compute_failures_from_structured_markers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "compute"
+            cases = (
+                ("task", 1, {}),
+                ("task-code-70", 70, {}),
+                ("timeout", 124, {"timed_out": True}),
+                (
+                    "resource",
+                    137,
+                    {"resource_limit": "process-group RSS exceeded the limit"},
+                ),
+                (
+                    "worker",
+                    70,
+                    {"worker_error": "dataset alias is unavailable"},
+                ),
+                (
+                    "monitor",
+                    125,
+                    {"resource_monitor_error": "process inspection failed"},
+                ),
+                ("interrupted", 143, {"interrupted": True}),
+                ("malformed-timeout", 1, {"timed_out": "false"}),
+            )
+            job_ids = {}
+            for index, (label, exit_code, execution_changes) in enumerate(cases):
+                job_id = f"20260722T0159{index:02d}Z-{index:08x}"
+                job_ids[label] = job_id
+                self.write_completed_metric_job(
+                    root,
+                    job_id,
+                    placement="remote",
+                    analysis_seconds=2,
+                    cpu_seconds=1,
+                    peak_rss_bytes=1024,
+                    state="failed",
+                    exit_code=exit_code,
+                )
+                execution_path = root / "failed" / job_id / "result" / "execution.json"
+                execution = json.loads(execution_path.read_text(encoding="utf-8"))
+                execution.update(execution_changes)
+                self.write_json(execution_path, execution)
+
+            unknown_id = "20260722T015908Z-00000008"
+            self.write_completed_metric_job(
+                root,
+                unknown_id,
+                placement="remote",
+                analysis_seconds=2,
+                cpu_seconds=1,
+                peak_rss_bytes=1024,
+                state="failed",
+                exit_code=1,
+            )
+            (root / "failed" / unknown_id / "result" / "execution.json").unlink()
+
+            report = metrics.ComputeMetricsReader(
+                root, clock=lambda: self.NOW
+            ).report(168)
+
+        jobs = {job["id"]: job for job in report["jobs"]}
+        self.assertEqual(jobs[job_ids["task"]]["failure_classification"], "task")
+        self.assertEqual(
+            jobs[job_ids["task-code-70"]]["failure_classification"], "task"
+        )
+        self.assertEqual(
+            jobs[job_ids["timeout"]]["failure_classification"], "timeout"
+        )
+        self.assertEqual(
+            jobs[job_ids["resource"]]["failure_classification"], "resource"
+        )
+        for label in ("worker", "monitor", "interrupted"):
+            self.assertEqual(
+                jobs[job_ids[label]]["failure_classification"],
+                "infrastructure",
+            )
+        self.assertEqual(
+            jobs[job_ids["malformed-timeout"]]["failure_classification"],
+            "task",
+        )
+        self.assertFalse(jobs[job_ids["malformed-timeout"]]["timed_out"])
+        self.assertEqual(jobs[unknown_id]["failure_classification"], "unknown")
+        self.assertEqual(
+            jobs[job_ids["task"]]["failure_summary"],
+            "Task exited with status 1",
+        )
+
+    def test_job_details_bounds_outputs_and_rejects_unsafe_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "compute"
+            job_id = "20260722T015900Z-deadbeef"
+            self.write_completed_metric_job(
+                root,
+                job_id,
+                placement="remote",
+                analysis_seconds=2,
+                cpu_seconds=1,
+                peak_rss_bytes=1024,
+                state="failed",
+                exit_code=70,
+                arguments=["private query"],
+            )
+            result = root / "failed" / job_id / "result"
+            execution_path = result / "execution.json"
+            execution = json.loads(execution_path.read_text(encoding="utf-8"))
+            execution["worker_error"] = "sandbox validation failed"
+            self.write_json(execution_path, execution)
+            manifest_path = root / "failed" / job_id / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["id"] = "20260722T015901Z-feedface"
+            manifest["state"] = "done"
+            self.write_json(manifest_path, manifest)
+            (result / "stderr.txt").write_text(
+                "worker failed safely\n", encoding="utf-8"
+            )
+            stdout_prefix = "not returned\n"
+            stdout_tail = "x" * metrics.MAX_JOB_DETAIL_TEXT_BYTES
+            (result / "stdout.txt").write_text(
+                stdout_prefix + stdout_tail, encoding="utf-8"
+            )
+            reader = metrics.ComputeMetricsReader(root, clock=lambda: self.NOW)
+
+            details = reader.job_details(job_id)
+
+            self.assertEqual(
+                details["job"]["failure_classification"], "infrastructure"
+            )
+            self.assertEqual(details["job"]["id"], job_id)
+            self.assertEqual(details["job"]["state"], "failed")
+            self.assertEqual(
+                details["diagnostics"]["worker_error"],
+                "sandbox validation failed",
+            )
+            self.assertEqual(details["stderr"]["excerpt"], "worker failed safely\n")
+            self.assertFalse(details["stderr"]["truncated"])
+            self.assertTrue(details["stdout"]["truncated"])
+            self.assertEqual(
+                details["stdout"]["bytes"],
+                len((stdout_prefix + stdout_tail).encode()),
+            )
+            self.assertEqual(details["stdout"]["excerpt"], stdout_tail)
+            serialized = json.dumps(details)
+            self.assertNotIn("private query", serialized)
+            self.assertNotIn("tools/private-analysis.py", serialized)
+
+            external = Path(directory) / "outside.txt"
+            external.write_text("must not be exposed", encoding="utf-8")
+            (result / "stderr.txt").unlink()
+            (result / "stderr.txt").symlink_to(external)
+            unsafe = reader.job_details(job_id)
+            self.assertFalse(unsafe["stderr"]["available"])
+            self.assertNotIn("must not be exposed", json.dumps(unsafe))
+
+            execution["resource_monitor_error"] = (
+                "m" * (metrics.MAX_DIAGNOSTIC_TEXT + 1)
+            )
+            self.write_json(execution_path, execution)
+            truncated = reader.job_details(job_id)
+            self.assertEqual(
+                len(truncated["diagnostics"]["resource_monitor_error"]),
+                metrics.MAX_DIAGNOSTIC_TEXT,
+            )
+            self.assertTrue(
+                truncated["diagnostics"]["truncated"]["resource_monitor_error"]
+            )
+
+            external_result = Path(directory) / "outside-result"
+            (result / "stderr.txt").unlink()
+            result.rename(external_result)
+            result.symlink_to(external_result, target_is_directory=True)
+            with self.assertRaises(metrics.ComputeMetricsError):
+                reader.job_details(job_id)
+
+            with self.assertRaises(ValueError):
+                reader.job_details("../not-a-job")
+            with self.assertRaises(FileNotFoundError):
+                reader.job_details("20260722T015901Z-feedface")
+
     def test_current_jobs_are_not_displaced_by_newer_completion_history(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "compute"

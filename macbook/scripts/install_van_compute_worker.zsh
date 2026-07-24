@@ -1178,7 +1178,7 @@ raise SystemExit(
     echo "A dedicated worker account, container, or VM would provide stronger isolation but requires separate admin setup."
     echo "Installed release: $release"
     echo "Next: run pi/sync_scripts.sh once to publish the dashboard's new metrics import."
-    echo "Then run the retired dashboard-metrics cleanup documented in pi/VAN_COMPUTE.md."
+    echo "Then run the retired dashboard-metrics cleanup documented in pi/docs/compute/VAN_COMPUTE.md."
     exit 0
   fi
   /bin/sleep 1

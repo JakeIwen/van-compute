@@ -21,9 +21,12 @@ DEFAULT_QUEUE_ROOT = Path("/home/pi/dev/obd-things/tmp/compute")
 # test pins this value to van_compute_protocol.WORKER_PROTOCOL_VERSION.
 WORKER_PROTOCOL_VERSION = 1
 STATE_DIRECTORIES = ("queued", "running", "done", "failed")
+JOB_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{8}")
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_SCANNED_JOBS = 2000
 MAX_RECENT_JOBS = 50
+MAX_JOB_DETAIL_TEXT_BYTES = 32 * 1024
+MAX_DIAGNOSTIC_TEXT = 4096
 MAX_MISSED_EVENT_BYTES = 64 * 1024
 MAX_SCANNED_MISSED_EVENTS = 2000
 MAX_RECENT_MISSED_EVENTS = 50
@@ -88,6 +91,91 @@ def _read_json(path: Path, *, max_bytes: int = MAX_JSON_BYTES) -> dict[str, obje
     return payload
 
 
+def _open_regular_at(directory: Path, name: str) -> tuple[int, int, os.stat_result]:
+    """Open one real file relative to a real directory and bind both inodes."""
+    directory_flags = os.O_RDONLY
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_descriptor = os.open(directory, directory_flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ComputeMetricsError(f"cannot inspect {directory}: {exc}") from None
+    descriptor: int | None = None
+    try:
+        directory_info = os.fstat(directory_descriptor)
+        if not stat.S_ISDIR(directory_info.st_mode):
+            raise ComputeMetricsError(f"refusing non-directory path: {directory}")
+        file_flags = os.O_RDONLY
+        file_flags |= getattr(os, "O_CLOEXEC", 0)
+        file_flags |= getattr(os, "O_NOFOLLOW", 0)
+        file_flags |= getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(name, file_flags, dir_fd=directory_descriptor)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ComputeMetricsError(
+                f"refusing non-regular result file: {directory / name}"
+            )
+    except FileNotFoundError:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_descriptor)
+        raise
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_descriptor)
+        raise ComputeMetricsError(
+            f"cannot inspect {directory / name}: {exc}"
+        ) from None
+    except ComputeMetricsError:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_descriptor)
+        raise
+    assert descriptor is not None
+    return directory_descriptor, descriptor, info
+
+
+def _read_json_at(
+    directory: Path, name: str, *, max_bytes: int = MAX_JSON_BYTES
+) -> dict[str, object]:
+    directory_descriptor, descriptor, info = _open_regular_at(directory, name)
+    try:
+        if info.st_size > max_bytes:
+            raise ComputeMetricsError(
+                f"JSON file is unexpectedly large: {directory / name}"
+            )
+        chunks: list[bytes] = []
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        try:
+            payload = json.loads(b"".join(chunks).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ComputeMetricsError(
+                f"cannot read {directory / name}: {exc}"
+            ) from None
+    except OSError as exc:
+        raise ComputeMetricsError(
+            f"cannot read {directory / name}: {exc}"
+        ) from None
+    finally:
+        os.close(descriptor)
+        os.close(directory_descriptor)
+    if not isinstance(payload, dict):
+        raise ComputeMetricsError(
+            f"JSON file is not an object: {directory / name}"
+        )
+    return payload
+
+
 def _sum_sizes(items) -> int:
     if not isinstance(items, list):
         return 0
@@ -135,6 +223,94 @@ def _bounded_text(value, default: str, maximum: int) -> str:
     # too so a malformed hand-written record cannot disrupt the dashboard.
     cleaned = " ".join(value.split())
     return (cleaned or default)[:maximum]
+
+
+def _diagnostic_text(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value[:MAX_DIAGNOSTIC_TEXT]
+
+
+def _failure_classification(
+    state: str,
+    exit_code: object,
+    execution: dict[str, object],
+    *,
+    execution_available: bool,
+) -> str | None:
+    """Classify failures from explicit worker markers, never numeric codes."""
+    if state != "failed":
+        return None
+    if (
+        _diagnostic_text(execution.get("worker_error"))
+        or _diagnostic_text(execution.get("resource_monitor_error"))
+        or execution.get("interrupted") is True
+    ):
+        return "infrastructure"
+    if _diagnostic_text(execution.get("resource_limit")):
+        return "resource"
+    if execution.get("timed_out") is True:
+        return "timeout"
+    if (
+        execution_available
+        and isinstance(exit_code, int)
+        and not isinstance(exit_code, bool)
+        and exit_code != 0
+    ):
+        return "task"
+    return "unknown"
+
+
+def _failure_summary(classification: str | None, exit_code: object) -> str | None:
+    if classification == "infrastructure":
+        return "Worker or infrastructure failure"
+    if classification == "resource":
+        return "Resource limit stopped execution"
+    if classification == "timeout":
+        return "Execution exceeded its time limit"
+    if classification == "task":
+        return f"Task exited with status {exit_code}"
+    if classification == "unknown":
+        return "Failure reason unavailable"
+    return None
+
+
+def _stream_excerpt(result_root: Path, name: str) -> dict[str, object]:
+    """Return a bounded tail from one real result file without following links."""
+    unavailable = {
+        "available": False,
+        "bytes": 0,
+        "excerpt": "",
+        "truncated": False,
+        "excerpt_from": "none",
+    }
+    try:
+        directory_descriptor, descriptor, info = _open_regular_at(result_root, name)
+    except (OSError, ComputeMetricsError):
+        return unavailable
+    try:
+        offset = max(0, info.st_size - MAX_JOB_DETAIL_TEXT_BYTES)
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        remaining = MAX_JOB_DETAIL_TEXT_BYTES
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError:
+        return unavailable
+    finally:
+        os.close(descriptor)
+        os.close(directory_descriptor)
+    return {
+        "available": True,
+        "bytes": info.st_size,
+        "excerpt": b"".join(chunks).decode("utf-8", "replace"),
+        "truncated": offset > 0,
+        "excerpt_from": "tail" if offset > 0 else "full",
+    }
 
 
 def _placement(value: object, worker: object = None, *, default: str = "remote") -> str:
@@ -477,18 +653,27 @@ class ComputeMetricsReader:
             manifest = _read_json(path / "manifest.json")
         except ComputeMetricsError:
             return None
-        job_id = str(manifest.get("id") or path.name)
+        job_id = path.name
         task = str(manifest.get("task") or "unknown")[:100]
         submitted_at = _timestamp(manifest.get("submitted_at"))
         started_at = _timestamp(manifest.get("started_at"))
         finished_at = _timestamp(manifest.get("finished_at"))
         execution: dict[str, object] = {}
-        execution_path = path / "result" / "execution.json"
-        if execution_path.exists():
-            try:
-                execution = _read_json(execution_path)
-            except ComputeMetricsError:
-                execution = {}
+        execution_available = False
+        result_root = path / "result"
+        try:
+            execution = _read_json_at(result_root, "execution.json")
+            execution_available = True
+        except (FileNotFoundError, ComputeMetricsError):
+            execution = {}
+        job_state = state
+        exit_code = manifest.get("exit_code")
+        failure_classification = _failure_classification(
+            job_state,
+            exit_code,
+            execution,
+            execution_available=execution_available,
+        )
         usage = execution.get("resource_usage")
         usage = usage if isinstance(usage, dict) else {}
         timing = execution.get("timing")
@@ -536,10 +721,15 @@ class ComputeMetricsReader:
         return {
             "id": job_id,
             "task": task,
-            "state": str(manifest.get("state") or state),
+            "state": job_state,
             "worker": worker,
             "placement": placement,
-            "exit_code": manifest.get("exit_code"),
+            "exit_code": exit_code,
+            "failure_classification": failure_classification,
+            "failure_summary": _failure_summary(
+                failure_classification, exit_code
+            ),
+            "details_available": bool(JOB_ID_RE.fullmatch(job_id)),
             "submitted_at": submitted_at,
             "started_at": started_at,
             "finished_at": finished_at,
@@ -563,13 +753,89 @@ class ComputeMetricsReader:
             "source_bytes": _sum_sizes(manifest.get("sources")),
             "result_bytes": _sum_sizes(manifest.get("results")),
             "telemetry": bool(usage),
-            "timed_out": bool(execution.get("timed_out", False)),
+            "timed_out": execution.get("timed_out") is True,
+            "interrupted": execution.get("interrupted") is True,
             # This opaque key is used only while aggregating the report and is
             # removed before any job is returned through the dashboard API.
             "_workload_fingerprint": _workload_fingerprint(manifest),
             "_benchmark_telemetry": (
                 raw_analysis_seconds is not None and raw_cpu_seconds is not None
             ),
+        }
+
+    def _job_location(self, job_id: str) -> tuple[str, Path]:
+        if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
+            raise ValueError("invalid compute job id")
+        for state in STATE_DIRECTORIES:
+            state_root = self.root / state
+            try:
+                state_info = state_root.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise ComputeMetricsError(
+                    f"cannot inspect compute queue: {exc}"
+                ) from None
+            if stat.S_ISLNK(state_info.st_mode) or not stat.S_ISDIR(
+                state_info.st_mode
+            ):
+                raise ComputeMetricsError(
+                    "compute queue state path is not a real directory"
+                )
+            candidate = state_root / job_id
+            try:
+                info = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise ComputeMetricsError(
+                    f"cannot inspect compute job: {exc}"
+                ) from None
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise ComputeMetricsError("compute job path is not a real directory")
+            return state, candidate
+        raise FileNotFoundError(job_id)
+
+    def job_details(self, job_id: str) -> dict[str, object]:
+        """Return bounded, explicitly whitelisted diagnostics for one job."""
+        state, path = self._job_location(job_id)
+        job = self._job(state, path)
+        if job is None:
+            raise ComputeMetricsError("compute job manifest is unavailable")
+        result_root = path / "result"
+        execution: dict[str, object] = {}
+        try:
+            execution = _read_json_at(result_root, "execution.json")
+        except FileNotFoundError:
+            execution = {}
+        return {
+            "ok": True,
+            "job": {
+                key: value
+                for key, value in job.items()
+                if not key.startswith("_")
+            },
+            "diagnostics": {
+                "failure_classification": job["failure_classification"],
+                "worker_error": _diagnostic_text(execution.get("worker_error")),
+                "resource_limit": _diagnostic_text(execution.get("resource_limit")),
+                "resource_monitor_error": _diagnostic_text(
+                    execution.get("resource_monitor_error")
+                ),
+                "timed_out": execution.get("timed_out") is True,
+                "interrupted": execution.get("interrupted") is True,
+                "truncated": {
+                    key: isinstance(execution.get(key), str)
+                    and len(execution[key]) > MAX_DIAGNOSTIC_TEXT
+                    for key in (
+                        "worker_error",
+                        "resource_limit",
+                        "resource_monitor_error",
+                    )
+                },
+            },
+            "stderr": _stream_excerpt(result_root, "stderr.txt"),
+            "stdout": _stream_excerpt(result_root, "stdout.txt"),
         }
 
     @staticmethod
