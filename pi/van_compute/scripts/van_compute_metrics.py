@@ -22,6 +22,9 @@ DEFAULT_QUEUE_ROOT = Path("/home/pi/dev/obd-things/tmp/compute")
 WORKER_PROTOCOL_VERSION = 1
 STATE_DIRECTORIES = ("queued", "running", "done", "failed")
 JOB_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{8}")
+# Keep task queries aligned with van_compute_protocol._NAME_RE without
+# importing the executable protocol surface into the read-only metrics reader.
+TASK_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_SCANNED_JOBS = 2000
 MAX_RECENT_JOBS = 50
@@ -836,6 +839,60 @@ class ComputeMetricsReader:
             },
             "stderr": _stream_excerpt(result_root, "stderr.txt"),
             "stdout": _stream_excerpt(result_root, "stdout.txt"),
+        }
+
+    def jobs_for_task(self, hours: int, task: str) -> dict[str, object]:
+        """Return a bounded recent-job list for one exact task name."""
+        if hours not in (6, 24, 168, 720):
+            raise ValueError(
+                "compute metrics range must be 6, 24, 168, or 720 hours"
+            )
+        if (
+            not isinstance(task, str)
+            or not TASK_NAME_RE.fullmatch(task)
+        ):
+            raise ValueError(
+                "compute task must use 1 to 64 lowercase letters, digits, or hyphens"
+            )
+        cutoff = self.clock() - hours * 3600
+        matches: list[dict[str, object]] = []
+        for state, path in self._job_paths():
+            job = self._job(state, path)
+            if job is None or job["task"] != task:
+                continue
+            if state in {"queued", "running"}:
+                if state == "queued" or job["placement"] == "remote":
+                    matches.append(job)
+                continue
+            if (
+                job["placement"] == "remote"
+                and job["finished_at"] is not None
+                and job["finished_at"] >= cutoff
+            ):
+                matches.append(job)
+        matches.sort(
+            key=lambda job: (
+                job["finished_at"]
+                or job["started_at"]
+                or job["submitted_at"]
+                or 0
+            ),
+            reverse=True,
+        )
+        return {
+            "ok": True,
+            "range_hours": hours,
+            "task": task,
+            "matching_jobs": len(matches),
+            "truncated": len(matches) > MAX_RECENT_JOBS,
+            "jobs": [
+                {
+                    key: value
+                    for key, value in job.items()
+                    if not key.startswith("_")
+                }
+                for job in matches[:MAX_RECENT_JOBS]
+            ],
         }
 
     @staticmethod

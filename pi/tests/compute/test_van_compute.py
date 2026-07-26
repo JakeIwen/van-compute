@@ -1124,6 +1124,7 @@ class ComputeMetricsTests(unittest.TestCase):
             metrics.WORKER_PROTOCOL_VERSION,
             protocol.WORKER_PROTOCOL_VERSION,
         )
+        self.assertEqual(metrics.TASK_NAME_RE.pattern, protocol._NAME_RE.pattern)
 
     @staticmethod
     def write_json(path, payload):
@@ -1426,6 +1427,76 @@ class ComputeMetricsTests(unittest.TestCase):
             jobs[job_ids["task"]]["failure_summary"],
             "Task exited with status 1",
         )
+
+    def test_jobs_for_task_is_exact_time_bounded_and_limited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "compute"
+            for index in range(55):
+                self.write_completed_metric_job(
+                    root,
+                    f"20260722T0159{index:02d}Z-{index:08x}",
+                    placement="remote",
+                    analysis_seconds=2,
+                    cpu_seconds=1,
+                    peak_rss_bytes=1024,
+                    task="repo-tests",
+                )
+            self.write_completed_metric_job(
+                root,
+                "20260722T015855Z-aaaa0001",
+                placement="remote",
+                analysis_seconds=2,
+                cpu_seconds=1,
+                peak_rss_bytes=1024,
+                task="repo-tests-extra",
+            )
+            self.write_completed_metric_job(
+                root,
+                "20260722T015856Z-aaaa0002",
+                placement="pi-local",
+                analysis_seconds=2,
+                cpu_seconds=1,
+                peak_rss_bytes=1024,
+                task="repo-tests",
+            )
+            self.write_completed_metric_job(
+                root,
+                "20260601T000000Z-aaaa0003",
+                placement="remote",
+                analysis_seconds=2,
+                cpu_seconds=1,
+                peak_rss_bytes=1024,
+                finished_at="2026-06-01T00:00:00+00:00",
+                task="repo-tests",
+            )
+            queued = root / "queued" / "20260722T020000Z-deadbeef"
+            self.write_json(
+                queued / "manifest.json",
+                {
+                    "id": queued.name,
+                    "task": "repo-tests",
+                    "state": "queued",
+                    "submitted_at": "2026-07-22T02:00:00+00:00",
+                },
+            )
+            reader = metrics.ComputeMetricsReader(root, clock=lambda: self.NOW)
+
+            result = reader.jobs_for_task(6, "repo-tests")
+
+        self.assertEqual(result["task"], "repo-tests")
+        self.assertEqual(result["matching_jobs"], 56)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["jobs"]), metrics.MAX_RECENT_JOBS)
+        self.assertTrue(all(job["task"] == "repo-tests" for job in result["jobs"]))
+        self.assertEqual(result["jobs"][0]["state"], "queued")
+        serialized = json.dumps(result)
+        self.assertNotIn("private-analysis.py", serialized)
+        self.assertNotIn("private-capture-name.log", serialized)
+        with self.assertRaises(ValueError):
+            reader.jobs_for_task(7, "repo-tests")
+        for invalid_task in ("", "Repo-Tests", "repo_tests", "x" * 65):
+            with self.assertRaises(ValueError):
+                reader.jobs_for_task(6, invalid_task)
 
     def test_job_details_bounds_outputs_and_rejects_unsafe_paths(self):
         with tempfile.TemporaryDirectory() as directory:
