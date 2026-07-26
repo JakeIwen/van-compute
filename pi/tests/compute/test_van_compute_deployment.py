@@ -1,3 +1,4 @@
+import ast
 import os
 from pathlib import Path
 import shutil
@@ -212,6 +213,18 @@ class VanComputeDeploymentTests(unittest.TestCase):
             app,
         )
         self.assertIn("from van_compute_metrics import", app)
+        imported_metric_names = {
+            alias.name
+            for node in ast.walk(ast.parse(app))
+            if isinstance(node, ast.ImportFrom)
+            and node.module in (
+                "pi.van_compute.scripts.van_compute_metrics",
+                "van_compute_metrics",
+            )
+            for alias in node.names
+        }
+        self.assertNotIn("TASK_NAME_RE", imported_metric_names)
+        self.assertIn("COMPUTE_TASK_NAME_RE = re.compile", app)
         for relative in (
             "templates/van_dashboard.html",
             "static/van_dashboard.js",
