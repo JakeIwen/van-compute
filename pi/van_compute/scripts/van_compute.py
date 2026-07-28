@@ -283,6 +283,30 @@ def verify_open_file_within(
         raise QueueError(f"opened {context} escaped source root {source_root}")
 
 
+def verify_open_file_matches(
+    descriptor: int,
+    expected_path: Path,
+    context: str,
+) -> None:
+    """On Linux, verify the opened file is the exact resolved requested path."""
+    if not sys.platform.startswith("linux"):
+        return
+    proc_path = Path("/proc/self/fd") / str(descriptor)
+    try:
+        target_text = os.readlink(proc_path)
+    except OSError as exc:
+        raise QueueError(
+            f"cannot verify opened {context} against {expected_path}: {exc}"
+        ) from None
+    if target_text.endswith(" (deleted)"):
+        raise QueueError(f"opened {context} was deleted before it could be verified")
+    target = Path(target_text)
+    if not target.is_absolute() or target != expected_path:
+        raise QueueError(
+            f"opened {context} does not match requested path {expected_path}"
+        )
+
+
 def hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -454,13 +478,11 @@ def _hash_open_prefix(handle: BinaryIO, size: int) -> str:
     return digest.hexdigest()
 
 
-def input_record(path_text: str, value: str | None, source_root: Path, index: int) -> dict[str, object]:
+def input_record(path_text: str, value: str | None, index: int) -> dict[str, object]:
     unresolved_path = Path(path_text).expanduser()
     if unresolved_path.is_symlink():
         raise QueueError(f"input cannot be a symlink: {unresolved_path}")
     path = unresolved_path.resolve()
-    if not is_within(path, source_root):
-        raise QueueError(f"input must be inside {source_root}: {path}")
     if path.is_symlink():
         raise QueueError(f"input cannot be a symlink: {path}")
     flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
@@ -472,7 +494,7 @@ def input_record(path_text: str, value: str | None, source_root: Path, index: in
         info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode):
             raise QueueError(f"input is not a regular file: {path}")
-        verify_open_file_within(handle.fileno(), source_root, f"input {path}")
+        verify_open_file_matches(handle.fileno(), path, f"input {path}")
         submitted_size = info.st_size
         digest = _hash_open_prefix(handle, submitted_size)
         after = os.fstat(handle.fileno())
@@ -527,7 +549,7 @@ def submit_job(args: argparse.Namespace) -> dict[str, object]:
         raise QueueError("--input-value must be supplied once per --input, or not at all")
     values = args.input_value or [None] * len(args.input)
     inputs = [
-        input_record(path, value, source_root, index)
+        input_record(path, value, index)
         for index, (path, value) in enumerate(zip(args.input, values))
     ]
     protocol.validate_inputs(task.name, inputs, task)
@@ -854,6 +876,7 @@ def stream_bounded_input(
         info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode):
             raise QueueError(f"input is no longer a regular file: {path}")
+        verify_open_file_matches(handle.fileno(), path, f"input {path}")
         if info.st_dev != device or info.st_ino != inode:
             raise QueueError(f"input was replaced after submission: {path}")
         remaining = submitted_size

@@ -115,6 +115,79 @@ class ProtocolTests(unittest.TestCase):
             ],
         )
 
+    def test_variadic_input_slice_expands_only_trailing_inputs(self):
+        task = protocol._parse_repo_task(
+            {
+                "name": "correlate-many",
+                "profile": "can-log-batch",
+                "source_paths": ["tools/correlate.py"],
+                "minimum_inputs": 2,
+                "maximum_inputs": 513,
+                "argv": [
+                    "{source:tools/correlate.py}",
+                    "--wire",
+                    "{input:0}",
+                    "{inputs:1}",
+                ],
+                "outputs": [],
+            },
+            0,
+        )
+        command = protocol.build_command(
+            task.name,
+            python="/python",
+            source_root=Path("/source"),
+            input_paths=[
+                Path("/inputs/wire.jsonl"),
+                Path("/inputs/chunk-1.zst"),
+                Path("/inputs/chunk-2.zst"),
+            ],
+            input_values=[None, None, None],
+            result_root=Path("/result"),
+            arguments=[],
+            execution=protocol.task_execution(task),
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "/python",
+                "/source/tools/correlate.py",
+                "--wire",
+                "/inputs/wire.jsonl",
+                "/inputs/chunk-1.zst",
+                "/inputs/chunk-2.zst",
+            ],
+        )
+
+    def test_variadic_input_slice_is_bounded_by_task_cardinality(self):
+        base = {
+            "name": "correlate-many",
+            "profile": "can-log-batch",
+            "source_paths": ["tools/correlate.py"],
+            "minimum_inputs": 2,
+            "maximum_inputs": 3,
+            "outputs": [],
+        }
+        for argv, message in (
+            (
+                ["{source:tools/correlate.py}", "{inputs:3}"],
+                "exceeds the task input range",
+            ),
+            (
+                [
+                    "{source:tools/correlate.py}",
+                    "{inputs}",
+                    "{inputs:1}",
+                ],
+                "at most once",
+            ),
+        ):
+            with self.subTest(argv=argv), self.assertRaisesRegex(
+                protocol.ProtocolError, message
+            ):
+                protocol._parse_repo_task(dict(base, argv=argv), 0)
+
     def test_repo_manifest_rejects_unknown_fields_and_family_substitution(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
@@ -1015,7 +1088,7 @@ class QueueLifecycleTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("finite positive", stderr.getvalue())
 
-    def test_submission_rejects_input_outside_source_root(self):
+    def test_submission_accepts_regular_input_outside_source_root(self):
         outside = Path(self.temporary.name) / "outside.log"
         outside.write_text("private", encoding="utf-8")
         args = argparse.Namespace(
@@ -1026,8 +1099,18 @@ class QueueLifecycleTests(unittest.TestCase):
             input=[str(outside)],
             input_value=None,
         )
-        with self.assertRaisesRegex(queue.QueueError, "inside"):
-            queue.submit_job(args)
+        submitted = queue.submit_job(args)
+        claimed = queue.worker_claim(queue.safe_root(self.queue_root), "m4mac.00")
+        streamed = BytesIO()
+        queue.stream_bounded_input(
+            claimed,
+            0,
+            streamed,
+            claimed["lease_token"],
+        )
+
+        self.assertEqual(submitted["inputs"][0]["remote_path"], str(outside.resolve()))
+        self.assertEqual(streamed.getvalue(), b"private")
 
     def test_linux_opened_fd_verification_rejects_ancestor_escape(self):
         source_root = self.source_root.resolve()
@@ -1043,8 +1126,8 @@ class QueueLifecycleTests(unittest.TestCase):
         with mock.patch.object(queue.sys, "platform", "linux"), mock.patch.object(
             queue.os, "readlink", side_effect=escaped_proc_target
         ):
-            with self.assertRaisesRegex(queue.QueueError, "escaped source root"):
-                queue.input_record(str(self.capture), None, source_root, 0)
+            with self.assertRaisesRegex(queue.QueueError, "does not match requested path"):
+                queue.input_record(str(self.capture), None, 0)
 
             destination = Path(self.temporary.name) / "source-copy.py"
             with self.assertRaisesRegex(queue.QueueError, "escaped source root"):
@@ -1069,7 +1152,7 @@ class QueueLifecycleTests(unittest.TestCase):
             queue.os, "readlink", side_effect=missing_proc
         ):
             with self.assertRaisesRegex(queue.QueueError, "cannot verify opened input"):
-                queue.input_record(str(self.capture), None, source_root, 0)
+                queue.input_record(str(self.capture), None, 0)
 
 
 class WorkerExecutionTests(unittest.TestCase):

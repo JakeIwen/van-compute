@@ -418,6 +418,12 @@ class VanComputeDeploymentTests(unittest.TestCase):
 
         self.assertIn("repo-tests", tasks)
         self.assertIn("oem-corpus-search", tasks)
+        self.assertEqual(tasks["candump-diagnostic-wire-tcm"].maximum_inputs, 512)
+        self.assertEqual(tasks["can-timeseries-correlate-tcm"].maximum_inputs, 513)
+        self.assertEqual(
+            tasks["can-timeseries-correlate-tcm"].argv[-1],
+            "{inputs:1}",
+        )
 
 
 if __name__ == "__main__":

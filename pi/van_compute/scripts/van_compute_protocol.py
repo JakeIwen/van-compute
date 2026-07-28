@@ -22,14 +22,15 @@ SCHEMA_VERSION = 1
 # Increment this whenever a worker built from an older checkout must not use the
 # current queue RPCs.  Unlike SCHEMA_VERSION, this covers the worker/queue
 # command contract rather than the shape of repository task declarations.
-WORKER_PROTOCOL_VERSION = 1
+WORKER_PROTOCOL_VERSION = 2
 REPO_MANIFEST = ".van-compute.json"
 MAX_REPO_TASKS = 128
 MAX_SOURCE_PATHS = 512
 MAX_ARGUMENTS = 256
 MAX_OUTPUTS = 64
 MAX_DATASETS = 16
-MAX_INPUTS = 256
+# One control/reference input plus as many as 512 bulk capture inputs.
+MAX_INPUTS = 513
 MAX_TOKEN_LENGTH = 4096
 MAX_RESULT_BYTES = 128 * 1024 * 1024
 
@@ -165,6 +166,7 @@ _NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 _DATASET_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}")
 _MODULE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 _PLACEHOLDER_RE = re.compile(r"\{(source|input|result|dataset):([^{}]+)\}")
+_INPUTS_SLICE_RE = re.compile(r"\{inputs:(\d+)\}")
 _RESULT_PATH_RE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9][A-Za-z0-9_.-]*)*"
 )
@@ -390,10 +392,15 @@ def _validate_argv(
     arguments_expansion = 0
     for index, argument in enumerate(argv):
         context = f"argv[{index}]"
-        if argument == "{inputs}":
+        inputs_slice = _INPUTS_SLICE_RE.fullmatch(argument)
+        if argument == "{inputs}" or inputs_slice:
             inputs_expansion += 1
             if maximum_inputs == 0:
                 raise ProtocolError("{inputs} is invalid for a task that accepts no inputs")
+            if inputs_slice and (
+                maximum_inputs is None or int(inputs_slice.group(1)) >= maximum_inputs
+            ):
+                raise ProtocolError(f"{context} exceeds the task input range")
             continue
         if argument == "{arguments}":
             arguments_expansion += 1
@@ -433,7 +440,13 @@ def _validate_profile_shape(
     outputs: Sequence[str],
     datasets: Sequence[str],
 ) -> None:
-    input_tokens = {item for item in argv if item == "{inputs}" or item.startswith("{input:")}
+    input_tokens = {
+        item
+        for item in argv
+        if item == "{inputs}"
+        or _INPUTS_SLICE_RE.fullmatch(item)
+        or item.startswith("{input:")
+    }
     result_tokens = {item for item in argv if item.startswith("{result:")}
     if profile in {"python-script", "can-log-batch"}:
         if not argv or not argv[0].startswith("{source:") or not argv[0].endswith(".py}"):
@@ -886,6 +899,15 @@ def build_command(
                 command.extend(
                     _render_input(path, value)
                     for path, value in zip(input_paths, input_values)
+                )
+            elif inputs_slice := _INPUTS_SLICE_RE.fullmatch(token):
+                start = int(inputs_slice.group(1))
+                command.extend(
+                    _render_input(path, value)
+                    for path, value in zip(
+                        input_paths[start:],
+                        input_values[start:],
+                    )
                 )
             elif token == "{arguments}":
                 command.extend(normalized)

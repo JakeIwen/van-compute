@@ -19,7 +19,7 @@ from typing import Callable
 DEFAULT_QUEUE_ROOT = Path("/home/pi/dev/obd-things/tmp/compute")
 # Keep telemetry readable if a queue protocol rollout is interrupted. A unit
 # test pins this value to van_compute_protocol.WORKER_PROTOCOL_VERSION.
-WORKER_PROTOCOL_VERSION = 1
+WORKER_PROTOCOL_VERSION = 2
 STATE_DIRECTORIES = ("queued", "running", "done", "failed")
 JOB_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{8}")
 # Keep task queries aligned with van_compute_protocol._NAME_RE without

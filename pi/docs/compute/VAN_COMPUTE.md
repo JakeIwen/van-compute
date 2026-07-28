@@ -245,6 +245,20 @@ Submit work and wait for a bounded time:
 # Remote-only decompilation; the declared directory returns as jadx.tar.gz.
 /home/pi/van_compute/scripts/pi_compute.py run apk-decompile \
   --input /home/pi/dev/obd-things/tmp/android/base.apk --wait 3600
+
+# Extract a TCM wire stream from 1-512 capture chunks. Inputs may live on
+# external storage; repeat --input in chronological order.
+/home/pi/van_compute/scripts/pi_compute.py run candump-diagnostic-wire-tcm \
+  --input /mnt/EXFAT512/obd-things/tmp/captures/chunk_000000_full.candump.zst \
+  --input /mnt/EXFAT512/obd-things/tmp/captures/chunk_000001_full.candump.zst \
+  --wait 3600
+
+# Correlate one wire stream followed by 1-512 chronological capture chunks.
+/home/pi/van_compute/scripts/pi_compute.py run can-timeseries-correlate-tcm \
+  --input /home/pi/dev/obd-things/tmp/tcm_wire.jsonl \
+  --input /mnt/EXFAT512/obd-things/tmp/captures/chunk_000000_full.candump.zst \
+  --input /mnt/EXFAT512/obd-things/tmp/captures/chunk_000001_full.candump.zst \
+  --wait 3600
 ```
 
 Inspect and retrieve results without knowing the queue layout:
@@ -259,12 +273,14 @@ Inspect and retrieve results without knowing the queue layout:
 /home/pi/van_compute/scripts/pi_compute.py result JOB_ID jadx.tar.gz > tmp/jadx.tar.gz
 ```
 
-Inputs must be regular, non-symlink files inside the selected source root. The
-submitted byte range is fingerprinted and immutable: appending to a growing
-capture is safe, but replacement, prefix editing, or truncation makes staging
-fail closed. This adds one bounded linear read on submission; an actively
-changing file may require a second prefix read to distinguish an append from an
-edit. Source snapshots are hashed, then transferred to the Mac as one bounded
+Inputs may be regular, non-symlink files at any path the Pi user can read,
+including mounted external drives; they do not need to be inside the selected
+source root. The submitted byte range is fingerprinted and immutable: appending
+to a growing capture is safe, but replacement, prefix editing, or truncation
+makes staging fail closed. This adds one bounded linear read on submission; an
+actively changing file may require a second prefix read to distinguish an
+append from an edit. Source-code snapshots remain confined to the selected
+repository root. They are hashed, then transferred to the Mac as one bounded
 verified bundle rather than one SSH process per file. Repository source
 snapshots are capped at 10,000 files and 256 MiB; large captures, APKs, and
 corpora belong in `--input` files or private dataset aliases instead.
