@@ -399,22 +399,12 @@ class ResourceAdmissionTests(unittest.TestCase):
         free_bytes=100,
         minimum_free=40,
         maximum_result=0,
-        maximum_job_memory=10,
-        physical_memory=100,
-        memory_headroom=20,
-        available_memory=100,
-        group_reader=None,
     ):
         return worker.SchedulerResourceManager(
             Path("/tmp"),
             minimum_free_bytes=minimum_free,
             maximum_result_bytes=maximum_result,
-            maximum_job_memory_bytes=maximum_job_memory,
-            minimum_memory_headroom_bytes=memory_headroom,
             free_space_reader=lambda _path: free_bytes,
-            physical_memory_reader=lambda: physical_memory,
-            available_memory_reader=lambda: available_memory,
-            group_resource_reader=group_reader,
         )
 
     def test_disk_reservations_serialize_staging_across_slots(self):
@@ -439,65 +429,20 @@ class ResourceAdmissionTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(manager.reserved_disk_bytes, 0)
 
-    def test_memory_headroom_serializes_jobs_without_reducing_slot_count(self):
+    def test_disk_capacity_allows_all_ten_slots_without_memory_reservations(self):
         manager = self.manager(
             free_bytes=1_000,
             minimum_free=0,
-            maximum_job_memory=40,
-            physical_memory=100,
-            memory_headroom=40,
         )
-        first = manager.acquire({"sources": [], "inputs": []}, None)
-        acquired = threading.Event()
-        reservations = []
-
-        def acquire_second():
-            reservations.append(
-                manager.acquire({"sources": [], "inputs": []}, None)
-            )
-            acquired.set()
-
-        thread = threading.Thread(target=acquire_second)
-        thread.start()
-        self.assertFalse(acquired.wait(0.1))
-        self.assertEqual(manager.reserved_memory_bytes, 40)
-        first.release()
-        self.assertTrue(acquired.wait(2))
-        reservations[0].release()
-        thread.join(2)
-        self.assertFalse(thread.is_alive())
-
-    def test_global_rss_guard_stops_only_the_largest_group(self):
-        readings = {101: (35, 1), 202: (40, 1)}
-        manager = self.manager(
-            physical_memory=100,
-            memory_headroom=30,
-            available_memory=20,
-            group_reader=lambda group: readings[group],
-        )
-        manager.register_process_group(101)
-        manager.register_process_group(202)
-
-        self.assertIsNone(manager.global_memory_violation(101))
-        self.assertIn("scheduler headroom", manager.global_memory_violation(202))
-
-    def test_memory_admission_does_not_double_count_current_worker_rss(self):
-        manager = self.manager(
-            free_bytes=1_000,
-            minimum_free=0,
-            maximum_job_memory=20,
-            physical_memory=100,
-            memory_headroom=40,
-            available_memory=65,
-            group_reader=lambda _group: (15, 1),
-        )
-        first = manager.acquire({"sources": [], "inputs": []}, None)
-        manager.register_process_group(101)
-
-        second = manager.acquire({"sources": [], "inputs": []}, None)
-
-        second.release()
-        first.release()
+        manifest = {"sources": [{"size": 10}], "inputs": []}
+        reservations = [
+            manager.acquire(manifest, None)
+            for _slot in range(worker.SCHEDULER_SLOTS)
+        ]
+        self.assertEqual(manager.reserved_disk_bytes, 200)
+        for reservation in reservations:
+            reservation.release()
+        self.assertEqual(manager.reserved_disk_bytes, 0)
 
     def test_drain_aborts_a_job_waiting_for_admission(self):
         manager = self.manager()

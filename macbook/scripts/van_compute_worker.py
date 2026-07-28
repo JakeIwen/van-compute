@@ -50,10 +50,9 @@ DEFAULT_WORK_ROOT = DEFAULT_PRIVATE_ROOT / "jobs"
 DEFAULT_CONTROL_PATH = DEFAULT_PRIVATE_ROOT / "ssh" / "control.sock"
 DEFAULT_TIMEOUT = 3600
 DEFAULT_MAX_RESULT_BYTES = protocol.MAX_RESULT_BYTES
-DEFAULT_MAX_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_MAX_MEMORY_BYTES = 16 * 1024 * 1024 * 1024
 DEFAULT_MAX_PROCESSES = 256
 DEFAULT_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024
-DEFAULT_MIN_MEMORY_HEADROOM_BYTES = 4 * 1024 * 1024 * 1024
 DEFAULT_HEARTBEAT_INTERVAL = 15.0
 DEFAULT_POLL_INTERVAL = 15.0
 SCHEDULER_SLOTS = 10
@@ -62,9 +61,6 @@ RESOURCE_POLL_INTERVAL = 1.0
 _PROCESS_TABLE_LOCK = threading.Lock()
 _PROCESS_TABLE_SAMPLED_AT = 0.0
 _PROCESS_TABLE_GROUPS: dict[int, tuple[int, int]] = {}
-_AVAILABLE_MEMORY_LOCK = threading.Lock()
-_AVAILABLE_MEMORY_SAMPLED_AT = 0.0
-_AVAILABLE_MEMORY_BYTES = 0
 COPY_CHUNK = 1024 * 1024
 DATASET_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 JOB_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{8}")
@@ -756,90 +752,6 @@ def filesystem_free_bytes(path: Path) -> int:
     return max(0, shutil.disk_usage(path).free)
 
 
-def physical_memory_bytes() -> int:
-    """Return installed physical memory without starting another process."""
-    try:
-        pages = int(os.sysconf("SC_PHYS_PAGES"))
-        page_size = int(os.sysconf("SC_PAGE_SIZE"))
-    except (OSError, ValueError) as exc:
-        raise WorkerError(f"cannot determine physical memory: {exc}") from None
-    total = pages * page_size
-    if total <= 0:
-        raise WorkerError("cannot determine physical memory")
-    return total
-
-
-def system_available_memory_bytes() -> int:
-    """Return reclaimable host memory from one shared, short-lived sample."""
-    global _AVAILABLE_MEMORY_BYTES, _AVAILABLE_MEMORY_SAMPLED_AT
-    with _AVAILABLE_MEMORY_LOCK:
-        now = time.monotonic()
-        if now - _AVAILABLE_MEMORY_SAMPLED_AT < RESOURCE_POLL_INTERVAL:
-            return _AVAILABLE_MEMORY_BYTES
-        if sys.platform == "darwin":
-            try:
-                completed = subprocess.run(
-                    ["/usr/bin/vm_stat"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=5,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError) as exc:
-                raise WorkerError(
-                    f"cannot inspect available system memory: {exc}"
-                ) from None
-            if completed.returncode != 0:
-                raise WorkerError(
-                    completed.stderr.strip()
-                    or f"vm_stat exited {completed.returncode}"
-                )
-            first, *rows = completed.stdout.splitlines()
-            match = re.search(r"page size of (\d+) bytes", first)
-            if match is None:
-                raise WorkerError("vm_stat did not report its page size")
-            page_size = int(match.group(1))
-            pages: dict[str, int] = {}
-            for row in rows:
-                name, separator, raw_value = row.partition(":")
-                if not separator:
-                    continue
-                value = raw_value.strip().rstrip(".")
-                if value.isdigit():
-                    pages[name.strip()] = int(value)
-            available_pages = sum(
-                pages.get(name, 0)
-                for name in (
-                    "Pages free",
-                    "Pages inactive",
-                    "Pages speculative",
-                )
-            )
-            available = available_pages * page_size
-        elif sys.platform.startswith("linux"):
-            try:
-                records = Path("/proc/meminfo").read_text(encoding="utf-8")
-            except OSError as exc:
-                raise WorkerError(
-                    f"cannot inspect available system memory: {exc}"
-                ) from None
-            match = re.search(r"^MemAvailable:\s+(\d+)\s+kB$", records, re.MULTILINE)
-            if match is None:
-                raise WorkerError("/proc/meminfo has no MemAvailable record")
-            available = int(match.group(1)) * 1024
-        else:
-            # The production worker is Darwin. Fail conservatively on other
-            # test/development Unix platforms rather than claiming free memory.
-            available = physical_memory_bytes()
-        if available < 0:
-            raise WorkerError("available system memory is invalid")
-        _AVAILABLE_MEMORY_BYTES = available
-        _AVAILABLE_MEMORY_SAMPLED_AT = now
-        return available
-
-
 def manifest_record_bytes(records: object) -> int:
     if not isinstance(records, list):
         return 0
@@ -869,11 +781,9 @@ class ResourceReservation:
         self,
         manager: "SchedulerResourceManager",
         disk_bytes: int,
-        memory_bytes: int,
     ) -> None:
         self._manager = manager
         self.disk_bytes = disk_bytes
-        self.memory_bytes = memory_bytes
         self._released = False
 
     def release(self) -> None:
@@ -884,7 +794,7 @@ class ResourceReservation:
 
 
 class SchedulerResourceManager:
-    """Coordinate conservative disk/RAM admission across all ten slots."""
+    """Coordinate staging and result disk reservations across all ten slots."""
 
     def __init__(
         self,
@@ -892,46 +802,20 @@ class SchedulerResourceManager:
         *,
         minimum_free_bytes: int,
         maximum_result_bytes: int,
-        maximum_job_memory_bytes: int,
-        minimum_memory_headroom_bytes: int,
         free_space_reader: Callable[[Path], int] = filesystem_free_bytes,
-        physical_memory_reader: Callable[[], int] = physical_memory_bytes,
-        available_memory_reader: Callable[[], int] = system_available_memory_bytes,
-        group_resource_reader: Callable[[int], tuple[int, int]] | None = None,
     ) -> None:
         self.work_root = work_root.expanduser().resolve()
         self.minimum_free_bytes = minimum_free_bytes
         self.maximum_result_bytes = maximum_result_bytes
-        self.maximum_job_memory_bytes = maximum_job_memory_bytes
-        self.minimum_memory_headroom_bytes = minimum_memory_headroom_bytes
         self.free_space_reader = free_space_reader
-        self.available_memory_reader = available_memory_reader
-        self.group_resource_reader = group_resource_reader or process_group_resources
-        physical = physical_memory_reader()
-        self.maximum_worker_memory_bytes = physical - minimum_memory_headroom_bytes
-        if self.maximum_worker_memory_bytes <= 0:
-            raise WorkerError(
-                "configured memory headroom is not smaller than physical memory"
-            )
-        if maximum_job_memory_bytes > self.maximum_worker_memory_bytes:
-            raise WorkerError(
-                "one job's memory limit exceeds memory available after headroom"
-            )
         self._condition = threading.Condition()
         self._reserved_disk_bytes = 0
-        self._reserved_memory_bytes = 0
         self._active_reservations = 0
-        self._process_groups: set[int] = set()
 
     @property
     def reserved_disk_bytes(self) -> int:
         with self._condition:
             return self._reserved_disk_bytes
-
-    @property
-    def reserved_memory_bytes(self) -> int:
-        with self._condition:
-            return self._reserved_memory_bytes
 
     def acquire(
         self,
@@ -942,7 +826,6 @@ class SchedulerResourceManager:
         disk_bytes = job_disk_reservation_bytes(
             manifest, self.maximum_result_bytes
         )
-        memory_bytes = self.maximum_job_memory_bytes
         with self._condition:
             while True:
                 if stop_event is not None and stop_event.is_set():
@@ -965,25 +848,10 @@ class SchedulerResourceManager:
                     - disk_bytes
                     >= self.minimum_free_bytes
                 )
-                current_worker_rss = sum(
-                    self.group_resource_reader(group_id)[0]
-                    for group_id in self._process_groups
-                )
-                remaining_reserved_memory = max(
-                    0, self._reserved_memory_bytes - current_worker_rss
-                )
-                available_memory = self.available_memory_reader()
-                memory_available = (
-                    available_memory
-                    - remaining_reserved_memory
-                    - memory_bytes
-                    >= self.minimum_memory_headroom_bytes
-                )
-                if disk_available and memory_available:
+                if disk_available:
                     self._reserved_disk_bytes += disk_bytes
-                    self._reserved_memory_bytes += memory_bytes
                     self._active_reservations += 1
-                    return ResourceReservation(self, disk_bytes, memory_bytes)
+                    return ResourceReservation(self, disk_bytes)
                 if self._active_reservations == 0 and not disk_available:
                     raise WorkerError(
                         "insufficient free space for job preparation and packaging "
@@ -994,11 +862,9 @@ class SchedulerResourceManager:
     def release(self, reservation: ResourceReservation) -> None:
         with self._condition:
             self._reserved_disk_bytes -= reservation.disk_bytes
-            self._reserved_memory_bytes -= reservation.memory_bytes
             self._active_reservations -= 1
             if (
                 self._reserved_disk_bytes < 0
-                or self._reserved_memory_bytes < 0
                 or self._active_reservations < 0
             ):
                 raise WorkerError("scheduler resource reservation accounting underflow")
@@ -1013,40 +879,6 @@ class SchedulerResourceManager:
             raise WorkerError(
                 f"filesystem free space fell below reserve during {phase}"
             )
-
-    def register_process_group(self, group_id: int) -> None:
-        with self._condition:
-            self._process_groups.add(group_id)
-
-    def unregister_process_group(self, group_id: int) -> None:
-        with self._condition:
-            self._process_groups.discard(group_id)
-
-    def global_memory_violation(self, group_id: int) -> str | None:
-        with self._condition:
-            groups = tuple(self._process_groups)
-            reserved_memory = self._reserved_memory_bytes
-        readings = {
-            candidate: self.group_resource_reader(candidate)[0]
-            for candidate in groups
-        }
-        total = sum(readings.values())
-        remaining_reserved_memory = max(0, reserved_memory - total)
-        available_memory = self.available_memory_reader()
-        if (
-            available_memory - remaining_reserved_memory
-            >= self.minimum_memory_headroom_bytes
-            or not readings
-        ):
-            return None
-        # Stop one largest group per sample rather than killing every active job.
-        largest = max(readings, key=lambda candidate: (readings[candidate], candidate))
-        if largest != group_id:
-            return None
-        return (
-            "projected available system memory fell below scheduler headroom of "
-            f"{self.minimum_memory_headroom_bytes} bytes"
-        )
 
 
 def terminate_remaining_process_group(group_id: int, grace_seconds: float = 2.0) -> None:
@@ -1090,7 +922,6 @@ def wait_for_analysis_process(
     work_path: Path | None = None,
     minimum_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
     free_space_reader: Callable[[Path], int] = filesystem_free_bytes,
-    global_memory_guard: Callable[[int], str | None] | None = None,
 ) -> AnalysisOutcome:
     """Wait for one process without mixing rusage between concurrent jobs."""
     resource_reader = resource_reader or process_group_resources
@@ -1138,14 +969,6 @@ def wait_for_analysis_process(
                     f"process-group RSS exceeded {maximum_memory} bytes"
                 )
                 break
-            if global_memory_guard is not None:
-                try:
-                    resource_limit = global_memory_guard(process.pid)
-                except (OSError, subprocess.SubprocessError, WorkerError) as exc:
-                    resource_monitor_error = str(exc)
-                    break
-                if resource_limit is not None:
-                    break
             if process_count > maximum_processes:
                 resource_limit = (
                     f"process count exceeded {maximum_processes}"
@@ -1413,7 +1236,6 @@ def execute_job(
     stop_event: threading.Event | None = None,
     worker_id: str | None = None,
     allow_unsandboxed_dynamic: bool = False,
-    resource_manager: SchedulerResourceManager | None = None,
 ) -> tuple[int, dict[str, object]]:
     task_name = str(manifest.get("task", ""))
     arguments = manifest.get("arguments", [])
@@ -1510,26 +1332,15 @@ def execute_job(
             stderr=stderr,
             start_new_session=True,
         )
-        if resource_manager is not None:
-            resource_manager.register_process_group(process.pid)
-        try:
-            outcome = wait_for_analysis_process(
-                process,
-                timeout=timeout,
-                stop_event=stop_event,
-                maximum_memory=maximum_memory,
-                maximum_processes=maximum_processes,
-                work_path=job_root,
-                minimum_free_bytes=minimum_free_bytes,
-                global_memory_guard=(
-                    resource_manager.global_memory_violation
-                    if resource_manager is not None
-                    else None
-                ),
-            )
-        finally:
-            if resource_manager is not None:
-                resource_manager.unregister_process_group(process.pid)
+        outcome = wait_for_analysis_process(
+            process,
+            timeout=timeout,
+            stop_event=stop_event,
+            maximum_memory=maximum_memory,
+            maximum_processes=maximum_processes,
+            work_path=job_root,
+            minimum_free_bytes=minimum_free_bytes,
+        )
     duration_seconds = time.monotonic() - started_monotonic
     resource_usage = child_resource_usage(outcome.usage, duration_seconds)
     resource_usage.update(
@@ -1824,14 +1635,6 @@ def resource_manager_for_args(
         maximum_result_bytes=getattr(
             args, "max_result_bytes", DEFAULT_MAX_RESULT_BYTES
         ),
-        maximum_job_memory_bytes=getattr(
-            args, "max_memory_bytes", DEFAULT_MAX_MEMORY_BYTES
-        ),
-        minimum_memory_headroom_bytes=getattr(
-            args,
-            "min_memory_headroom_bytes",
-            DEFAULT_MIN_MEMORY_HEADROOM_BYTES,
-        ),
     )
 
 
@@ -1913,7 +1716,6 @@ def run_claimed_job(
                 stop_event=stop_event,
                 worker_id=remote.worker,
                 allow_unsandboxed_dynamic=args.allow_unsandboxed_dynamic,
-                resource_manager=resources,
             )
             if execution.get("interrupted"):
                 raise WorkerShutdown(
@@ -2422,11 +2224,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-memory-bytes", type=int, default=DEFAULT_MAX_MEMORY_BYTES)
     parser.add_argument("--max-processes", type=int, default=DEFAULT_MAX_PROCESSES)
     parser.add_argument("--min-free-bytes", type=int, default=DEFAULT_MIN_FREE_BYTES)
-    parser.add_argument(
-        "--min-memory-headroom-bytes",
-        type=int,
-        default=DEFAULT_MIN_MEMORY_HEADROOM_BYTES,
-    )
     parser.add_argument("--heartbeat-interval", type=float, default=DEFAULT_HEARTBEAT_INTERVAL)
     parser.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL)
     parser.add_argument("--dataset-config", type=Path)
@@ -2464,10 +2261,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise WorkerError("--max-processes must be from 1 through 4096")
         if not 1024 * 1024 * 1024 <= args.min_free_bytes <= 10 * 1024**4:
             raise WorkerError("--min-free-bytes must be from 1 GiB through 10 TiB")
-        if not 1024 * 1024 * 1024 <= args.min_memory_headroom_bytes <= 1024**4:
-            raise WorkerError(
-                "--min-memory-headroom-bytes must be from 1 GiB through 1 TiB"
-            )
         if not 1 <= args.heartbeat_interval <= 40:
             raise WorkerError("--heartbeat-interval must be from 1 through 40 seconds")
         if not 1 <= args.poll_interval <= 300:
@@ -2494,8 +2287,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.work_root,
             minimum_free_bytes=args.min_free_bytes,
             maximum_result_bytes=args.max_result_bytes,
-            maximum_job_memory_bytes=args.max_memory_bytes,
-            minimum_memory_headroom_bytes=args.min_memory_headroom_bytes,
         )
         if not args.serve:
             payload = run_once(args)

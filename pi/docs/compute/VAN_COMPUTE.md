@@ -57,15 +57,16 @@ installer tests the actual OS behavior before replacing a working LaunchAgent.
 
 The Mac parent shares one process-table sample per second across all slots and
 tracks each job process group's aggregate resident memory and process count,
-terminating it above the default 2 GiB or 256-process ceiling. Scheduler-wide
-admission also reserves every admitted job's full memory allowance against live
-host-available memory, preserving 4 GiB for macOS and other apps. Disk admission
-reserves concurrent staging and packaging peaks and preserves 5 GiB of free
-space through those phases and execution. Jobs wait without reducing the ten
-logical slots when either shared reserve is temporarily unavailable. These are
-watchdogs rather than Darwin kernel hard limits; a process that deliberately
-detaches into another session can evade them. The Pi fallback has the stronger
-systemd cgroup ceiling in addition to its child limits.
+terminating it above the default 16 GiB or 256-process emergency ceiling.
+van_compute does not impose a host-wide Mac memory reservation or kill running
+jobs based on estimated macOS free memory; macOS remains responsible for
+pressure management across the ten slots and the user's other applications.
+Disk admission reserves concurrent staging and packaging peaks and preserves
+5 GiB of free space through those phases and execution. Jobs wait when that
+shared disk reserve is temporarily unavailable without reducing the ten logical
+slots. These are watchdogs rather than Darwin kernel hard limits; a process
+that deliberately detaches into another session can evade them. The Pi fallback
+has the stronger systemd cgroup ceiling in addition to its child limits.
 
 Pi fallback jobs run inside Bubblewrap with a private PID/user/network/IPC/UTS
 namespace. Only staged source and inputs, a minimal system runtime, and the
