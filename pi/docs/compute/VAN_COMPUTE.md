@@ -96,6 +96,22 @@ Codex-managed or otherwise sandboxed shell:
 ./macbook/scripts/install_van_compute_worker.zsh
 ```
 
+The repository-wide updater is also a supported entry point:
+
+```zsh
+./pi/sync_scripts.sh
+```
+
+After its normal Pi deployment succeeds, `sync_scripts.sh` invokes the compute
+installer with `--if-needed`. A fingerprint covers the installer, worker,
+LaunchAgent template, Pi compute scripts/configuration, worker identity,
+connection target, dataset configuration, and isolation mode. Matching local
+and Pi deployment markers plus healthy loaded services make the check exit
+immediately. A changed or unhealthy deployment runs the ordinary drain-first
+installer in the foreground, and any installer failure makes `sync_scripts.sh`
+fail. A required compute upgrade may therefore take time; the updater never
+reports success while that work is still running.
+
 macOS cannot apply the worker's Seatbelt profile from inside another sandbox.
 The installer checks that capability before downloading or building anything
 and fails closed if profiles cannot be nested in its current environment.
@@ -127,19 +143,18 @@ into pi-owned `/home`, which would let the service account replace
 root-interpreted configuration. This is the sole deployed-file exception.
 
 Queue jobs and results remain runtime data under the configured `obd-things`
-compute directory; they are not deployed files. The general
-`pi/sync_scripts.sh` process neither copies nor excludes compute files, so it
-cannot publish half of a Pi/Mac protocol upgrade. During the one-time layout
-migration, the installer retires the legacy `/home/pi/scripts/compute/` tree
-only after the replacement broker and worker have been validated.
+compute directory; they are not deployed files. The generic staging portion of
+`pi/sync_scripts.sh` does not copy compute files. Its final conditional
+installer call preserves the coupled Pi/Mac protocol boundary, so it cannot
+publish half of an upgrade. During the one-time layout migration, the installer
+retires the legacy `/home/pi/scripts/compute/` tree only after the replacement
+broker and worker have been validated.
 
 The dashboard migration to
 `/home/pi/van_compute/scripts/van_compute_metrics.py` is complete. Its retired
 copies under `/home/pi/scripts/python-automation/` have been removed, and
 `pi/sync_scripts.sh` does not recreate them. Normal compute deployments
-therefore require no dashboard sync or retired-file cleanup. Run
-`./pi/sync_scripts.sh` only after changing dashboard application, template,
-static, or service files.
+therefore require no retired-file cleanup.
 
 Upgrades are drain-first. The installer requires the running queue to be empty,
 disables new launches, asks a current persistent scheduler to stop claiming,

@@ -82,13 +82,10 @@ class VanComputeDeploymentTests(unittest.TestCase):
         self.assertIn("/home/pi/van_compute/venv/bin/python3", service)
         self.assertNotIn("/home/pi/scripts/compute", service)
 
-    def test_generic_sync_has_no_compute_specific_carveouts(self):
+    def test_generic_sync_delegates_compute_to_conditional_installer(self):
         sync = SYNC_SCRIPT.read_text(encoding="utf-8")
 
-        self.assertNotIn("van_compute", sync)
-        self.assertNotIn("van-compute", sync)
         self.assertNotIn("--exclude '/compute/'", sync)
-
         self.assertIn('staged_services="$local_stage/services"', sync)
         self.assertIn(
             'scp $mux -r "$staged_services" "$staged_scripts"',
@@ -98,6 +95,26 @@ class VanComputeDeploymentTests(unittest.TestCase):
             'scp $mux -r "$services" "$staged_scripts"',
             sync,
         )
+        self.assertIn(
+            'compute_installer="$dsc/macbook/scripts/install_van_compute_worker.zsh"',
+            sync,
+        )
+        self.assertIn('"$compute_installer" --if-needed', sync)
+        self.assertIn("conditional van_compute deployment failed", sync)
+        self.assertGreater(
+            sync.index('"$compute_installer" --if-needed'),
+            sync.index('wait "$services_pid"'),
+        )
+        for child in (
+            "home_pid",
+            "dirs_pid",
+            "services_pid",
+            "smb_pid",
+            "chmod_pid",
+        ):
+            self.assertIn(f'wait "${child}"', sync)
+        self.assertIn("if (( sync_failed )); then", sync)
+        self.assertNotIn("\nwait\n", sync)
         self.assertFalse(
             (
                 REPOSITORY_ROOT
@@ -372,7 +389,24 @@ class VanComputeDeploymentTests(unittest.TestCase):
         )
         self.assertNotIn("retired dashboard-metrics cleanup", installer)
         self.assertIn(
-            "Run ./pi/sync_scripts.sh only after changing dashboard app",
+            "Repository-wide updates remain available through: ./pi/sync_scripts.sh",
+            installer,
+        )
+        self.assertIn("deployment_source_paths=(", installer)
+        self.assertIn('if (( if_needed )); then', installer)
+        self.assertIn('"$release/deployment.sha256"', installer)
+        self.assertIn("'$remote_root/deployment.sha256'", installer)
+        self.assertIn('"$release/source.sha256"', installer)
+        self.assertIn('"$release/source.sha256" \\', installer)
+        self.assertLess(
+            installer.index('if (( if_needed )); then'),
+            installer.index("Checking local installer prerequisites"),
+        )
+        self.assertIn(
+            "van_compute deployment is current; skipping installer.", installer
+        )
+        self.assertIn(
+            "van_compute deployment changed or is unhealthy; running installer.",
             installer,
         )
 

@@ -2,6 +2,24 @@
 set -euo pipefail
 setopt NO_BG_NICE
 
+if_needed=0
+case "${1:-}" in
+  --if-needed)
+    if_needed=1
+    shift
+    ;;
+  "")
+    ;;
+  *)
+    echo "Usage: ${0:t} [--if-needed]" >&2
+    exit 2
+    ;;
+esac
+if (( $# )); then
+  echo "Usage: ${0:t} [--if-needed]" >&2
+  exit 2
+fi
+
 script_dir="${0:A:h}"
 repo_root="${script_dir:h:h}"
 pi_host="${VAN_COMPUTE_HOST:-pi@vanpi}"
@@ -23,8 +41,26 @@ remote_config_root="$remote_root/configs"
 remote_venv="$remote_root/venv"
 old_compute_root="/home/pi/scripts/compute"
 upgrade_public_root=""
-allow_unsandboxed="${VAN_COMPUTE_ALLOW_UNSANDBOXED:-0}"
 dataset_source="${VAN_COMPUTE_DATASET_CONFIG:-}"
+default_dataset_source="$repo_root/macbook/secrets/van-compute-datasets.json"
+if [[ -z "$dataset_source" && -f "$default_dataset_source" && ! -L "$default_dataset_source" ]]; then
+  dataset_source="$default_dataset_source"
+fi
+if [[ -n "${VAN_COMPUTE_ALLOW_UNSANDBOXED+x}" ]]; then
+  allow_unsandboxed="$VAN_COMPUTE_ALLOW_UNSANDBOXED"
+elif [[ -f "$target_plist" && ! -L "$target_plist" ]] && \
+     /usr/bin/plutil -extract ProgramArguments json -o - "$target_plist" 2>/dev/null |
+       /usr/bin/grep -Fq '"--allow-unsandboxed-dynamic"'; then
+  # Preserve an already explicit escape-hatch deployment when sync_scripts
+  # invokes this installer without repeating its environment variable.
+  allow_unsandboxed=1
+else
+  allow_unsandboxed=0
+fi
+if [[ "$allow_unsandboxed" != 0 && "$allow_unsandboxed" != 1 ]]; then
+  echo "VAN_COMPUTE_ALLOW_UNSANDBOXED must be 0 or 1." >&2
+  exit 2
+fi
 installer_lock="$support_root/installer.lock"
 maintenance_owner_file="$support_root/installer-owner"
 installer_lock_fd=""
@@ -41,6 +77,104 @@ maintenance_active=0
 maintenance_owner=""
 submission_gate_active=0
 rollback_safe=1
+
+deployment_source_paths=(
+  macbook/scripts/install_van_compute_worker.zsh
+  macbook/scripts/van_compute_worker.py
+  macbook/launchagents/com.jacobr.van-compute-worker.plist
+  pi/van_compute/__init__.py
+  pi/van_compute/scripts/__init__.py
+  pi/van_compute/scripts/pi_compute.py
+  pi/van_compute/scripts/van_compute.py
+  pi/van_compute/scripts/van_compute_broker.py
+  pi/van_compute/scripts/van_compute_metrics.py
+  pi/van_compute/scripts/van_compute_protocol.py
+  pi/van_compute/scripts/van_compute_upgrade_gate.py
+  pi/van_compute/configs/van-compute-broker.service
+  pi/van_compute/configs/van-compute-obd.example.json
+)
+for source_path in "${deployment_source_paths[@]}"; do
+  [[ -f "$repo_root/$source_path" && ! -L "$repo_root/$source_path" ]] || {
+    echo "Compute deployment source is missing or unsafe: $source_path" >&2
+    exit 1
+  }
+done
+source_fingerprint="$(
+  (
+    cd "$repo_root"
+    /usr/bin/shasum -a 256 "${deployment_source_paths[@]}"
+  ) | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
+)"
+dataset_fingerprint=none
+if [[ -n "$dataset_source" ]]; then
+  [[ -f "$dataset_source" && ! -L "$dataset_source" ]] || {
+    echo "VAN_COMPUTE_DATASET_CONFIG is not a regular non-symlink file: $dataset_source" >&2
+    exit 1
+  }
+  dataset_fingerprint="$(/usr/bin/shasum -a 256 "$dataset_source" | /usr/bin/awk '{print $1}')"
+elif [[ -f "$dataset_target" && ! -L "$dataset_target" ]]; then
+  dataset_fingerprint="$(/usr/bin/shasum -a 256 "$dataset_target" | /usr/bin/awk '{print $1}')"
+fi
+deployment_fingerprint="$(
+  print -r -- \
+    "source=$source_fingerprint host=$pi_host worker=$worker_name unsandboxed=$allow_unsandboxed dataset=$dataset_fingerprint" |
+    /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
+)"
+
+if (( if_needed )); then
+  installed_worker_path="$(
+    /usr/libexec/PlistBuddy -c "Print :ProgramArguments:1" "$target_plist" 2>/dev/null ||
+      true
+  )"
+  worker_suffix="/app/macbook/scripts/van_compute_worker.py"
+  installed_release=""
+  if [[ "$installed_worker_path" == "$release_parent"/20*"$worker_suffix" ]]; then
+    installed_release="${installed_worker_path%$worker_suffix}"
+  fi
+  deployment_current=1
+  if [[ -z "$installed_release" || ! -d "$installed_release" || -L "$installed_release" ]] ||
+     [[ ! -f "$installed_release/deployment.sha256" || -L "$installed_release/deployment.sha256" ]] ||
+     [[ "$(<"$installed_release/deployment.sha256")" != "$deployment_fingerprint" ]] ||
+     ! /bin/launchctl print "gui/$user_id/$label" >/dev/null 2>&1 ||
+     ! /usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=5 "$pi_host" "
+       set -eu
+       test -f '$remote_root/deployment.sha256'
+       test ! -L '$remote_root/deployment.sha256'
+       test \"\$(/bin/cat '$remote_root/deployment.sha256')\" = '$source_fingerprint'
+       /usr/bin/systemctl is-active --quiet van-compute-broker.service
+       /usr/bin/systemctl cat van-compute-broker.service |
+         /bin/grep -Fq '$remote_scripts_root/van_compute_broker.py'
+       '$remote_scripts_root/van_compute.py' available |
+         /usr/bin/python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+worker = next(
+    (
+        item
+        for item in payload.get(\"workers\", [])
+        if item.get(\"worker\") == sys.argv[1]
+    ),
+    None,
+)
+raise SystemExit(
+    worker is None
+    or worker.get(\"age_seconds\", 999) > 45
+    or worker.get(\"slots_total\") != 10
+    or not isinstance(worker.get(\"slots_busy\"), int)
+    or not 0 <= worker[\"slots_busy\"] <= 10
+)
+' '$worker_name'
+     " >/dev/null 2>&1; then
+    deployment_current=0
+  fi
+  if (( deployment_current )); then
+    echo "van_compute deployment is current; skipping installer."
+    exit 0
+  fi
+  echo "van_compute deployment changed or is unhealthy; running installer."
+fi
 
 cleanup_sandbox_sentinel() {
   if [[ -n "$sentinel" && -f "$sentinel" && ! -L "$sentinel" && \
@@ -594,6 +728,9 @@ release_id="$(/bin/date -u +%Y%m%dT%H%M%SZ)-$$"
 release="$release_parent/$release_id"
 /bin/mv "$staging" "$release"
 staging=""
+print -r -- "$source_fingerprint" > "$release/source.sha256"
+print -r -- "$deployment_fingerprint" > "$release/deployment.sha256"
+/bin/chmod 600 "$release/source.sha256" "$release/deployment.sha256"
 
 validate_dataset_config() {
   "$release/venv/bin/python" -c '
@@ -643,6 +780,7 @@ remote_stage_created=1
   "$repo_root/pi/van_compute/scripts/van_compute_upgrade_gate.py" \
   "$repo_root/pi/van_compute/configs/van-compute-broker.service" \
   "$repo_root/pi/van_compute/configs/van-compute-obd.example.json" \
+  "$release/source.sha256" \
   "$pi_host:$remote_stage/"
 
 echo "Validating the staged Pi broker before stopping the current worker..."
@@ -666,6 +804,7 @@ echo "Validating the staged Pi broker before stopping the current worker..."
   rm -f '$remote_stage/.van-compute.json'
   /usr/bin/python3 '$remote_stage/pi_compute.py' --help >/dev/null
   /usr/bin/python3 '$remote_stage/van_compute_broker.py' --help >/dev/null
+  test \"\$(/bin/cat '$remote_stage/source.sha256')\" = '$source_fingerprint'
   rm -rf '$remote_stage/__pycache__'
   sudo -n /usr/bin/systemd-analyze verify '$remote_stage/van-compute-broker.service' >/dev/null
 "
@@ -919,6 +1058,7 @@ remote_upgrade_started=1
   install -m 700 '$remote_stage/van_compute_upgrade_gate.py' '$remote_scripts_root/van_compute_upgrade_gate.py'
   install -m 600 '$remote_stage/van-compute-obd.example.json' '$remote_config_root/van-compute-obd.example.json'
   install -m 600 '$remote_stage/van-compute-broker.service' '$remote_config_root/van-compute-broker.service'
+  install -m 600 '$remote_stage/source.sha256' '$remote_root/deployment.sha256'
   # systemd must read a root-owned copy. A unit symlink into pi-owned /home
   # would let the service account replace root-parsed configuration.
   sudo -n install -m 644 '$remote_stage/van-compute-broker.service' /etc/systemd/system/van-compute-broker.service
@@ -934,7 +1074,8 @@ remote_upgrade_started=1
     '$remote_stage/van-compute-broker.service' \
     '$remote_stage/van-compute-obd.example.json' \
     '$remote_stage/van_compute_protocol.py' \
-    '$remote_stage/van_compute_metrics.py'
+    '$remote_stage/van_compute_metrics.py' \
+    '$remote_stage/source.sha256'
   rmdir '$remote_stage'
   '$remote_scripts_root/van_compute.py' tasks >/dev/null
   '$remote_scripts_root/pi_compute.py' tasks >/dev/null
@@ -1178,7 +1319,7 @@ raise SystemExit(
     echo "A dedicated worker account, container, or VM would provide stronger isolation but requires separate admin setup."
     echo "Installed release: $release"
     echo "Dashboard follow-up: none for this compute deployment."
-    echo "Run ./pi/sync_scripts.sh only after changing dashboard app, template, static, or service files."
+    echo "Repository-wide updates remain available through: ./pi/sync_scripts.sh"
     exit 0
   fi
   /bin/sleep 1
