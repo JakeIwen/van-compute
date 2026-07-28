@@ -367,6 +367,14 @@ class VanComputeDeploymentTests(unittest.TestCase):
             installer.index("Checking Mac process-group resource watchdog"),
             installer.index("WARNING: VAN_COMPUTE_ALLOW_UNSANDBOXED=1"),
         )
+        self.assertNotIn(
+            "run pi/sync_scripts.sh once to publish the dashboard", installer
+        )
+        self.assertNotIn("retired dashboard-metrics cleanup", installer)
+        self.assertIn(
+            "Run ./pi/sync_scripts.sh only after changing dashboard app",
+            installer,
+        )
 
     def test_example_tasks_are_a_valid_repository_manifest(self):
         with tempfile.TemporaryDirectory() as directory:

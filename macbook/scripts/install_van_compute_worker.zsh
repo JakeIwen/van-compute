@@ -1177,8 +1177,8 @@ raise SystemExit(
     echo "Worker isolation: $([[ "$allow_unsandboxed" == 1 ]] && echo disabled || echo sandbox-exec validated)"
     echo "A dedicated worker account, container, or VM would provide stronger isolation but requires separate admin setup."
     echo "Installed release: $release"
-    echo "Next: run pi/sync_scripts.sh once to publish the dashboard's new metrics import."
-    echo "Then run the retired dashboard-metrics cleanup documented in pi/docs/compute/VAN_COMPUTE.md."
+    echo "Dashboard follow-up: none for this compute deployment."
+    echo "Run ./pi/sync_scripts.sh only after changing dashboard app, template, static, or service files."
     exit 0
   fi
   /bin/sleep 1

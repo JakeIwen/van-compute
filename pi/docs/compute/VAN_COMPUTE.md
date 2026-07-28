@@ -133,34 +133,13 @@ cannot publish half of a Pi/Mac protocol upgrade. During the one-time layout
 migration, the installer retires the legacy `/home/pi/scripts/compute/` tree
 only after the replacement broker and worker have been validated.
 
-For that migration, run the compute installer first so the metrics module is at
-its canonical path, then run `pi/sync_scripts.sh` to publish the dashboard app,
-assets, and updated service definition. Once the dashboard is active with that
-definition, remove its retired module copy:
-
-```bash
-ssh pi@vanpi '
-  set -eu
-  systemctl is-active --quiet van-dashboard.service
-  systemctl cat van-dashboard.service |
-    grep -Fq /home/pi/van_compute/scripts/van_compute_metrics.py
-  for old in \
-    /home/pi/scripts/python-automation/van_compute_metrics.py \
-    /home/pi/scripts/python-automation/van_compute_protocol.py; do
-    if test -e "$old" || test -L "$old"; then
-      test -f "$old" && test ! -L "$old"
-      rm -f -- "$old"
-    fi
-  done
-  cache=/home/pi/scripts/python-automation/__pycache__
-  if test -e "$cache" || test -L "$cache"; then
-    test -d "$cache" && test ! -L "$cache"
-    find "$cache" -mindepth 1 -maxdepth 1 -type f \
-      \( -name "van_compute_metrics.*.pyc" \
-         -o -name "van_compute_protocol.*.pyc" \) -delete
-  fi
-'
-```
+The dashboard migration to
+`/home/pi/van_compute/scripts/van_compute_metrics.py` is complete. Its retired
+copies under `/home/pi/scripts/python-automation/` have been removed, and
+`pi/sync_scripts.sh` does not recreate them. Normal compute deployments
+therefore require no dashboard sync or retired-file cleanup. Run
+`./pi/sync_scripts.sh` only after changing dashboard application, template,
+static, or service files.
 
 Upgrades are drain-first. The installer requires the running queue to be empty,
 disables new launches, asks a current persistent scheduler to stop claiming,
