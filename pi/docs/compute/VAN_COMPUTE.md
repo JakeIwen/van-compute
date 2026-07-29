@@ -28,7 +28,7 @@ needed. The queue and broker are intentionally not a general remote shell.
   workers. This naturally extends to additional compute nodes later.
 - If every remote lease is stale, the broker waits a short grace period and may
   run one eligible task locally. Memory, disk free space, load, temperature,
-  throttling, runtime, process count, file size, and cgroup limits guard that
+  throttling, runtime, file size, and cgroup limits guard that
   fallback.
 - A remotely claimed job whose exact slot heartbeat has been stale for five
   minutes is conservatively returned to the queue. Attempt tokens reject late
@@ -72,8 +72,12 @@ Pi fallback jobs run inside Bubblewrap with a private PID/user/network/IPC/UTS
 namespace. Only staged source and inputs, a minimal system runtime, and the
 job's writable output directories are visible. The systemd service also has no
 CAN devices, no network address families, no service-manager sockets, no
-capabilities, no swap allowance, and a 1 GiB cgroup ceiling. Dynamic local work
-fails closed if the Bubblewrap self-test or runtime dependency check fails.
+capabilities, no swap allowance, a 1 GiB memory ceiling, and a 128-task cgroup
+ceiling shared only by the broker and its one local job. A per-process
+`RLIMIT_NPROC` is intentionally not used because Linux counts it across every
+process and thread owned by the shared `pi` account rather than per job. Dynamic
+local work fails closed if the Bubblewrap self-test or runtime dependency check
+fails.
 
 Neither sandbox is a VM. The Mac worker runs under the logged-in account;
 same-account process metadata is therefore not a strong isolation boundary,

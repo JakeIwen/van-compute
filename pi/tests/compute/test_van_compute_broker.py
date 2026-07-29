@@ -89,6 +89,31 @@ GOOD_HEALTH = broker.HealthSnapshot(
 )
 
 
+class LimitedChildTests(unittest.TestCase):
+    def test_child_does_not_apply_shared_uid_process_limit(self):
+        arguments = [
+            str(768 * 1024 * 1024),
+            "1200",
+            str(128 * 1024 * 1024),
+            "256",
+            "0",
+            "--",
+            "/usr/bin/true",
+        ]
+        with mock.patch.object(broker, "_set_limit") as set_limit, mock.patch.object(
+            broker.os,
+            "execvpe",
+            side_effect=OSError("test stopped before exec"),
+        ), redirect_stderr(StringIO()):
+            result = broker.limited_child_main(arguments)
+
+        limited_resources = [call.args[0] for call in set_limit.call_args_list]
+        self.assertEqual(result, 126)
+        self.assertNotIn(broker.resource.RLIMIT_NPROC, limited_resources)
+        self.assertIn(broker.resource.RLIMIT_CPU, limited_resources)
+        self.assertIn(broker.resource.RLIMIT_NOFILE, limited_resources)
+
+
 class BrokerHarness(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -125,7 +150,6 @@ class BrokerHarness(unittest.TestCase):
             max_result_bytes=1024 * 1024,
             min_work_free_bytes=0,
             max_open_files=128,
-            max_processes=4096,
             nice=0,
             python=sys.executable,
             sqlite3="/usr/bin/sqlite3",

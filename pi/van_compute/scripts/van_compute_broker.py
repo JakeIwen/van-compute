@@ -80,7 +80,6 @@ DEFAULT_MAX_SWAP_BYTES = 512 * 1024 * 1024
 DEFAULT_MAX_LOAD_PER_CPU = 1.25
 DEFAULT_MAX_TEMPERATURE_C = 75.0
 DEFAULT_NOFILE = 256
-DEFAULT_NPROC = 256
 DEFAULT_BWRAP = "/usr/bin/bwrap"
 DEFAULT_LOCAL_PYTHON = "/home/pi/van_compute/venv/bin/python3"
 RESOURCE_POLL_INTERVAL = 0.5
@@ -875,11 +874,11 @@ def _set_limit(kind: int, soft: int, hard: int | None = None) -> None:
 
 
 def limited_child_main(argv: Sequence[str]) -> int:
-    if len(argv) < 8 or argv[6] != "--":
+    if len(argv) < 7 or argv[5] != "--":
         print("van-compute-broker: invalid internal child invocation", file=sys.stderr)
         return 125
     try:
-        memory, cpu, file_size, nofile, nproc, nice = map(int, argv[:6])
+        memory, cpu, file_size, nofile, nice = map(int, argv[:5])
         if nice:
             os.nice(nice)
         # Darwin exposes RLIMIT_AS but rejects lowering its synthetic infinity.
@@ -890,8 +889,12 @@ def limited_child_main(argv: Sequence[str]) -> int:
         _set_limit(resource.RLIMIT_CPU, cpu, cpu + 5)
         _set_limit(resource.RLIMIT_FSIZE, file_size)
         _set_limit(resource.RLIMIT_NOFILE, nofile)
-        _set_limit(resource.RLIMIT_NPROC, nproc)
-        command = list(argv[7:])
+        # RLIMIT_NPROC is counted across every process/thread with the same
+        # real UID, not just this job.  The shared pi account routinely owns
+        # more tasks than a sensible per-job ceiling, which makes Bubblewrap's
+        # initial namespace clone fail with EAGAIN.  The broker service's
+        # TasksMax cgroup is the actual per-broker process boundary.
+        command = list(argv[6:])
         if not command:
             raise BrokerError("internal child command is empty")
         os.execvpe(command[0], command, os.environ)
@@ -1679,7 +1682,6 @@ def execute_claimed_job(
                 str(args.cpu_seconds),
                 str(args.max_result_bytes),
                 str(args.max_open_files),
-                str(args.max_processes),
                 str(args.nice),
                 "--",
                 *sandboxed_command,
@@ -1985,7 +1987,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="free disk bytes the Pi fallback must preserve during local work",
     )
     parser.add_argument("--max-open-files", type=int, default=DEFAULT_NOFILE)
-    parser.add_argument("--max-processes", type=int, default=DEFAULT_NPROC)
     parser.add_argument("--nice", type=int, default=10)
     parser.add_argument(
         "--python",
@@ -2024,8 +2025,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if not 32 <= args.max_open_files <= 1024:
         raise BrokerError("--max-open-files must be from 32 through 1024")
-    if not 16 <= args.max_processes <= 512:
-        raise BrokerError("--max-processes must be from 16 through 512")
     if not 0 <= args.nice <= 19:
         raise BrokerError("--nice must be from 0 through 19")
     if (
