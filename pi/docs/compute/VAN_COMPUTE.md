@@ -72,7 +72,7 @@ Pi fallback jobs run inside Bubblewrap with a private PID/user/network/IPC/UTS
 namespace. Only staged source and inputs, a minimal system runtime, and the
 job's writable output directories are visible. The systemd service also has no
 CAN devices, no network address families, no service-manager sockets, no
-capabilities, no swap allowance, a 1 GiB memory ceiling, and a 128-task cgroup
+capabilities, no swap allowance, a 1 GiB memory ceiling, and a 256-task cgroup
 ceiling shared only by the broker and its one local job. A per-process
 `RLIMIT_NPROC` is intentionally not used because Linux counts it across every
 process and thread owned by the shared `pi` account rather than per job. Dynamic

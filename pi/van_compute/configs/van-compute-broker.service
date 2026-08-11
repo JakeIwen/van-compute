@@ -23,7 +23,7 @@ MemoryMax=1G
 MemorySwapMax=0
 CPUQuota=150%
 IOWeight=10
-TasksMax=128
+TasksMax=256
 
 NoNewPrivileges=true
 PrivateDevices=true

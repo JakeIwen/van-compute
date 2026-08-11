@@ -81,7 +81,7 @@ class VanComputeDeploymentTests(unittest.TestCase):
         self.assertIn("/home/pi/van_compute/scripts/van_compute_broker.py", service)
         self.assertIn("/home/pi/van_compute/venv/bin/python3", service)
         self.assertNotIn("/home/pi/scripts/compute", service)
-        self.assertIn("TasksMax=128", service)
+        self.assertIn("TasksMax=256", service)
 
     def test_generic_sync_delegates_compute_to_conditional_installer(self):
         sync = SYNC_SCRIPT.read_text(encoding="utf-8")
