@@ -43,7 +43,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from pi.van_compute.scripts import van_compute_protocol as protocol
 
 
-DEFAULT_HOST = "pi@vanpi"
+DEFAULT_HOST = "pi@vanpi.lan"
 DEFAULT_REMOTE_CLI = "/home/pi/van_compute/scripts/van_compute.py"
 DEFAULT_PRIVATE_ROOT = Path.home() / "Library" / "Caches" / "van-compute"
 DEFAULT_WORK_ROOT = DEFAULT_PRIVATE_ROOT / "jobs"

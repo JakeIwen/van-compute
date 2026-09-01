@@ -22,7 +22,7 @@ fi
 
 script_dir="${0:A:h}"
 repo_root="${script_dir:h:h}"
-pi_host="${VAN_COMPUTE_HOST:-pi@vanpi}"
+pi_host="${VAN_COMPUTE_HOST:-pi@vanpi.lan}"
 worker_name="${VAN_COMPUTE_WORKER:-m4mac}"
 label="com.jacobr.van-compute-worker"
 source_plist="$repo_root/macbook/launchagents/$label.plist"

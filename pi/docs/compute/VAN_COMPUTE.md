@@ -178,7 +178,7 @@ separate live `obd-things` checkout. After reviewing it, activate it only if no
 policy already exists:
 
 ```bash
-ssh pi@vanpi '
+ssh pi@vanpi.lan '
   set -eu
   cd /home/pi/dev/obd-things
   test ! -e .van-compute.json
@@ -331,9 +331,9 @@ tail -n 100 "$HOME/Library/Caches/van-compute/logs/worker.stderr.log"
 ```
 
 ```bash
-ssh pi@vanpi '/home/pi/van_compute/scripts/van_compute.py available'
-ssh pi@vanpi 'systemctl status van-compute-broker --no-pager'
-ssh pi@vanpi 'journalctl -u van-compute-broker -n 100 --no-pager'
+ssh pi@vanpi.lan '/home/pi/van_compute/scripts/van_compute.py available'
+ssh pi@vanpi.lan 'systemctl status van-compute-broker --no-pager'
+ssh pi@vanpi.lan 'journalctl -u van-compute-broker -n 100 --no-pager'
 ```
 
 ## Drop-in agent instructions

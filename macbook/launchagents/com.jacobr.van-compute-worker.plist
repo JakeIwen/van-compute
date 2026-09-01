@@ -10,7 +10,7 @@
         <string>/Users/jacobr/Library/Caches/van-compute/app/macbook/scripts/van_compute_worker.py</string>
         <string>--serve</string>
         <string>--host</string>
-        <string>pi@vanpi</string>
+        <string>pi@vanpi.lan</string>
         <string>--worker</string>
         <string>m4mac</string>
         <string>--python</string>
