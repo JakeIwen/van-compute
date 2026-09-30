@@ -55,7 +55,7 @@ class RemoteQueueProtocolTests(unittest.TestCase):
 
     def test_heartbeat_and_claim_send_current_protocol_version(self):
         remote = worker.RemoteQueue(
-            "pi@vanpi", "/home/pi/van_compute/scripts/van_compute.py", "m4mac.00"
+            "pi@vanpi.lan", "/home/pi/van_compute/scripts/van_compute.py", "m4mac.00"
         )
         version = str(worker.protocol.WORKER_PROTOCOL_VERSION)
         with mock.patch.object(

@@ -324,6 +324,21 @@ is acceptable. There is intentionally no forced-placement benchmark command.
 
 ## Diagnostics
 
+The LAN deployment uses `pi@vanpi.lan`. Older installed LaunchAgents may still
+contain `pi@vanpi`; changing repository defaults does not update a loaded agent.
+If stderr reports `Could not resolve hostname vanpi`, compare the installed
+plist and `launchctl print` arguments. Automatic restart retries the configured
+hostname, so it cannot repair an obsolete connection target. A hostname-only
+repair must preserve the installed release, dataset and isolation options, save
+the original plist, reload the agent from a regular Terminal, and verify a fresh
+10-slot lease on the Pi. Check for running jobs before restarting the worker.
+
+The full installer deliberately refuses queued or running work. If the worker
+is offline and jobs are waiting for it, restore connectivity to the existing
+worker first so those jobs can finish; do not delete jobs or bypass the upgrade
+preflight to change the hostname. A fresh worker lease, rather than a loaded
+LaunchAgent alone, confirms availability.
+
 ```zsh
 launchctl print "gui/$(id -u)/com.jacobr.van-compute-worker"
 launchctl kickstart -k "gui/$(id -u)/com.jacobr.van-compute-worker"
