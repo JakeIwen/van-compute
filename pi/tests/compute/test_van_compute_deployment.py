@@ -1,4 +1,3 @@
-import ast
 import os
 from pathlib import Path
 import shutil
@@ -7,6 +6,8 @@ import sys
 import tempfile
 import unittest
 
+from pi import deploy_python
+from pi.tests.unit_contract import command_arguments, parse_directives, parse_environment
 from pi.van_compute.scripts import van_compute_protocol as protocol
 
 
@@ -34,9 +35,6 @@ EXAMPLE_TASKS = (
     / "van-compute-obd.example.json"
 )
 DASHBOARD_SERVICE = REPOSITORY_ROOT / "pi" / "services" / "van-dashboard.service"
-DASHBOARD_APP = (
-    REPOSITORY_ROOT / "pi" / "apps" / "van_dashboard" / "van_dashboard.py"
-)
 BROKER_SERVICE = (
     REPOSITORY_ROOT
     / "pi"
@@ -214,45 +212,101 @@ class VanComputeDeploymentTests(unittest.TestCase):
 
     def test_dashboard_declares_restart_triggers_for_compute_assets(self):
         service = DASHBOARD_SERVICE.read_text(encoding="utf-8")
-        app = DASHBOARD_APP.read_text(encoding="utf-8")
         updater = UPDATE_SERVICES.read_text(encoding="utf-8")
+        directives = parse_directives(service)
+        environment = parse_environment(directives)
 
+        pythonpath = environment.get("PYTHONPATH", "").split(":")
+        self.assertIn("/home/pi/scripts/python-packages/current", pythonpath)
+        self.assertIn("/home/pi/van_compute/scripts", pythonpath)
+
+        pre_commands = [
+            command_arguments(value) for value in directives.get("ExecStartPre", [])
+        ]
         self.assertIn(
-            "ExecStartPre=/usr/bin/test -r "
-            "/home/pi/van_compute/scripts/van_compute_metrics.py",
-            service,
+            [
+                "/usr/bin/test",
+                "-r",
+                "/home/pi/van_compute/scripts/van_compute_metrics.py",
+            ],
+            pre_commands,
         )
-        self.assertIn(
-            "Environment=PYTHONPATH=/home/pi/van_compute/scripts",
-            service,
+
+        start = command_arguments(directives["ExecStart"][0])
+        self.assertGreaterEqual(len(start), 4)
+        self.assertEqual(start[:2], ["/usr/bin/python3", "-P"])
+        self.assertEqual(start[2:4], ["-m", "pi.apps.van_dashboard"])
+        module = start[3]
+        module_parts = module.split(".")
+        module_path = REPOSITORY_ROOT.joinpath(*module_parts)
+        self.assertTrue(module_path.is_dir(), str(module_path))
+        resolved = module_path / "__main__.py"
+        self.assertTrue(resolved.is_file(), str(resolved))
+        relative_module_dir = module_path.relative_to(REPOSITORY_ROOT).as_posix()
+        self.assertTrue(
+            any(
+                relative_module_dir == allowlist
+                or relative_module_dir.startswith(f"{allowlist}/")
+                for allowlist in deploy_python.MODULE_DIRS
+            ),
+            relative_module_dir,
         )
-        self.assertIn(
-            '"VAN_COMPUTE_SCRIPTS", "/home/pi/van_compute/scripts"',
-            app,
+
+        plan = deploy_python.build_plan(REPOSITORY_ROOT, mode="legacy")
+        self.assertFalse(
+            any(relative.startswith("pi/van_compute/") for relative in plan["manifest"]["files"])
         )
-        self.assertIn("from van_compute_metrics import", app)
-        imported_metric_names = {
-            alias.name
-            for node in ast.walk(ast.parse(app))
-            if isinstance(node, ast.ImportFrom)
-            and node.module in (
-                "pi.van_compute.scripts.van_compute_metrics",
-                "van_compute_metrics",
+
+        with tempfile.TemporaryDirectory() as directory:
+            staged = Path(directory)
+            self.assertFalse(staged.is_relative_to(REPOSITORY_ROOT))
+            for relative in plan["manifest"]["files"]:
+                if not relative.endswith(".py"):
+                    continue
+                destination = staged / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(REPOSITORY_ROOT / relative, destination)
+            (staged / "van_compute_metrics.py").write_text(
+                "class ComputeMetricsError(RuntimeError):\n"
+                "    pass\n\n"
+                "class ComputeMetricsReader:\n"
+                "    def __init__(self, root):\n"
+                "        self.root = root\n",
+                encoding="utf-8",
             )
-            for alias in node.names
-        }
-        self.assertNotIn("TASK_NAME_RE", imported_metric_names)
-        self.assertIn("COMPUTE_TASK_NAME_RE = re.compile", app)
-        for relative in (
-            "templates/van_dashboard.html",
-            "static/van_dashboard.js",
-            "static/van_dashboard.css",
-        ):
-            self.assertIn(
-                "ExecStartPre=/usr/bin/test -r "
-                f"/home/pi/scripts/python-automation/{relative}",
-                service,
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(staged)
+            environment["VAN_DASHBOARD_COMPUTE_ROOT"] = str(staged / "compute")
+            environment["VAN_DASHBOARD_STATE_PATH"] = str(staged / "state.json")
+            environment["VAN_DASHBOARD_RUNTIME_DIR"] = str(staged / "runtime")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-P",
+                    "-c",
+                    (
+                        "import os; "
+                        "import van_compute_metrics as metrics; "
+                        "assert {name for name in vars(metrics) if not name.startswith('_')} "
+                        "== {'ComputeMetricsError', 'ComputeMetricsReader'}; "
+                        "assert not hasattr(metrics, 'TASK_NAME_RE'); "
+                        "import pi.apps.van_dashboard as dashboard; "
+                        "from pi.apps.van_dashboard import runtime; "
+                        "app = dashboard.create_app(); "
+                        "assert app is not None; "
+                        "assert isinstance(runtime.compute_monitor, metrics.ComputeMetricsReader); "
+                        "assert runtime.compute_monitor.root == " "os.environ['VAN_DASHBOARD_COMPUTE_ROOT']"
+                    ),
+                ],
+                cwd=staged,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
             )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
         self.assertIn("'s/^ExecStartPre=//p'", updater)
         self.assertIn(
             'for staged_script in "$staged_scripts"/*',
