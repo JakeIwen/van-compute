@@ -312,7 +312,8 @@ class VanComputeDeploymentTests(unittest.TestCase):
             'for staged_script in "$staged_scripts"/*',
             updater,
         )
-        self.assertIn('chmod 770 "$live_scripts/${staged_script##*/}"', updater)
+        # pi/tests/test_update_services.py exercises the mode behaviour itself.
+        self.assertIn('chmod 770 "$staged_script"', updater)
         self.assertNotIn('chmod 770 "$live_scripts"/*', updater)
 
         installer = INSTALLER.read_text(encoding="utf-8")
