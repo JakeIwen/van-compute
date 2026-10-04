@@ -252,10 +252,10 @@ class VanComputeDeploymentTests(unittest.TestCase):
             relative_module_dir,
         )
 
-        plan = deploy_python.build_plan(REPOSITORY_ROOT, mode="legacy")
-        self.assertFalse(
-            any(relative.startswith("pi/van_compute/") for relative in plan["manifest"]["files"])
-        )
+        plan = deploy_python.build_plan(REPOSITORY_ROOT, mode="stage")
+        self.assertNotIn("legacy", plan["manifest"])
+        with self.assertRaises(ValueError):
+            deploy_python.build_plan(REPOSITORY_ROOT, mode="legacy")
 
         with tempfile.TemporaryDirectory() as directory:
             staged = Path(directory)
