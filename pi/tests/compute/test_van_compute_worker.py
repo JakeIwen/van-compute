@@ -1,5 +1,5 @@
-import argparse
 from collections import deque
+from dataclasses import replace
 from io import BytesIO
 import hashlib
 import json
@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 from van_compute import limited_child, worker
+from van_compute import config
 
 
 CHILD_ENV_SCRIPT = """import json
@@ -81,6 +82,46 @@ class FakeRemote:
                 (self.worker, slots_total, slots_busy)
             )
         return {"worker": self.worker}
+
+
+def worker_config(**overrides):
+    values = {
+        "host": "pi@vanpi.lan",
+        "remote_cli": "/home/pi/van_compute/scripts/van_compute.py",
+        "remote_root": None,
+        "worker": "m4mac",
+        "work_root": Path("."),
+        "control_path": Path("control.sock"),
+        "python": sys.executable,
+        "sqlite3": "/usr/bin/sqlite3",
+        "rg": "/usr/bin/rg",
+        "jadx": "/usr/bin/jadx",
+        "timeout": 30,
+        "connect_timeout": 5,
+        "nice": 0,
+        "max_result_bytes": 1024 * 1024,
+        "max_memory_bytes": 512 * 1024 * 1024,
+        "max_processes": worker.DEFAULT_MAX_PROCESSES,
+        "min_free_bytes": worker.DEFAULT_MIN_FREE_BYTES,
+        "heartbeat_interval": 0.01,
+        "poll_interval": 0.01,
+        "dataset_config": None,
+        "dataset": (),
+        "sandbox_profile": None,
+        "allow_unsandboxed_dynamic": False,
+        "serve": False,
+        "run_once": True,
+        "executables": {"python": sys.executable},
+        "datasets": {},
+    }
+    values.update(overrides)
+    if "resource_manager" not in overrides:
+        values["resource_manager"] = worker.SchedulerResourceManager(
+            values["work_root"],
+            minimum_free_bytes=values["min_free_bytes"],
+            maximum_result_bytes=values["max_result_bytes"],
+        )
+    return config.WorkerConfig(**values)
 
 
 class RemoteQueueProtocolTests(unittest.TestCase):
@@ -155,7 +196,7 @@ class RunOnceTests(unittest.TestCase):
             self.assertTrue(release_job.wait(2), "test job was not released")
             return {"ok": True, "job": manifest["id"]}
 
-        args = argparse.Namespace(worker="m4mac", heartbeat_interval=0.01)
+        args = worker_config(heartbeat_interval=0.01)
         result = []
         with mock.patch.object(worker, "make_remote", return_value=Remote()), mock.patch.object(
             worker, "run_claimed_job", side_effect=run_job
@@ -182,11 +223,7 @@ class RunOnceTests(unittest.TestCase):
 
 
 def scheduler_args():
-    return argparse.Namespace(
-        worker="m4mac",
-        poll_interval=0.01,
-        heartbeat_interval=0.01,
-    )
+    return worker_config()
 
 
 class PersistentSchedulerTests(unittest.TestCase):
@@ -264,7 +301,7 @@ class PersistentSchedulerTests(unittest.TestCase):
         state = FakeQueueState(0)
         stop = threading.Event()
         args = scheduler_args()
-        args.poll_interval = 0.05
+        args = replace(args, poll_interval=0.05)
         service = threading.Thread(
             target=worker.run_scheduler,
             args=(args,),
@@ -699,7 +736,7 @@ Path(args.json).write_text(json.dumps({'bytes': Path(args.capture).stat().st_siz
             self.tar_bytes((("tools/can_capture_summary.py", script),))
         )
         with tempfile.TemporaryDirectory() as directory:
-            args = argparse.Namespace(
+            args = worker_config(
                 work_root=Path(directory),
                 python=sys.executable,
                 timeout=30,
@@ -708,8 +745,6 @@ Path(args.json).write_text(json.dumps({'bytes': Path(args.capture).stat().st_siz
                 max_memory_bytes=512 * 1024 * 1024,
                 executables={"python": sys.executable},
                 datasets={},
-                sandbox_profile=None,
-                allow_unsandboxed_dynamic=False,
             )
             payload = worker.run_claimed_job(args, remote, manifest)
 
@@ -750,7 +785,7 @@ Path(args.json).write_text(json.dumps({'bytes': Path(args.capture).stat().st_siz
             "arguments": [],
         }
         with tempfile.TemporaryDirectory() as directory:
-            args = argparse.Namespace(work_root=Path(directory))
+            args = worker_config(work_root=Path(directory))
             with self.assertRaises(worker.WorkerShutdown):
                 worker.run_claimed_job(args, Remote(), manifest, stop)
 
@@ -774,7 +809,7 @@ Path(args.json).write_text(json.dumps({'bytes': Path(args.capture).stat().st_siz
         }
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
-            args = argparse.Namespace(
+            args = worker_config(
                 work_root=work,
                 python=sys.executable,
                 timeout=30,
@@ -784,8 +819,6 @@ Path(args.json).write_text(json.dumps({'bytes': Path(args.capture).stat().st_siz
                 max_processes=10,
                 executables={"python": sys.executable},
                 datasets={},
-                sandbox_profile=None,
-                allow_unsandboxed_dynamic=False,
             )
             with mock.patch.object(
                 worker,

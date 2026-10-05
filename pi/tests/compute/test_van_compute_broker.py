@@ -15,6 +15,7 @@ from unittest import mock
 from van_compute import frontend as pi_compute
 from van_compute import queue
 from van_compute import limited_child, broker
+from van_compute import config
 from van_compute import protocol
 
 
@@ -173,12 +174,15 @@ class BrokerHarness(unittest.TestCase):
         self.apk.write_bytes(b"not really an apk")
         self.capture = self.source / "tmp" / "capture.log"
         self.capture.write_bytes(b"can capture bytes\n")
-        self.args = argparse.Namespace(
+        self.args = config.BrokerConfig(
             root=self.root,
             work_root=self.work,
+            once=False,
+            self_test=False,
             remote_max_age=45.0,
             remote_grace=0.0,
             stale_running_age=300.0,
+            poll_interval=5.0,
             timeout=30,
             cpu_seconds=30,
             # Darwin reserves a large virtual address range even for a tiny
@@ -191,7 +195,12 @@ class BrokerHarness(unittest.TestCase):
             python=sys.executable,
             sqlite3="/usr/bin/sqlite3",
             bwrap=sys.executable,
-            health_thresholds=broker.HealthThresholds(
+            min_available_memory_mb=512,
+            max_swap_used=0.20,
+            max_swap_used_mb=512,
+            max_load_per_cpu=1.25,
+            max_temperature_c=75.0,
+            health_thresholds=config.HealthThresholds(
                 minimum_available_bytes=512 * 1024 * 1024,
                 maximum_swap_used_fraction=0.20,
                 maximum_load_per_cpu=1.25,

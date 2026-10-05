@@ -12,6 +12,7 @@ from unittest import mock
 
 from van_compute import worker
 from van_compute import queue
+from van_compute import config
 from van_compute import metrics
 from van_compute import protocol
 
@@ -920,7 +921,7 @@ class QueueLifecycleTests(unittest.TestCase):
         queue.MAX_MISSED_EVENTS = 2
         try:
             for index in range(3):
-                args = argparse.Namespace(
+                args = config.MissedOffloadRecord(
                     profile="repo-test",
                     label=f"test run {index}",
                     reason="worker-unavailable",

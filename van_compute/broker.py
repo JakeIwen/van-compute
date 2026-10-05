@@ -32,13 +32,13 @@ import signal
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 from typing import Callable, Mapping, Sequence
 
 
-from van_compute import limited_child, queue
+from van_compute import engine, limited_child, queue
+from van_compute.config import BrokerConfig, HealthThresholds, MissedOffloadRecord
 
 protocol = queue.protocol
 
@@ -94,15 +94,6 @@ class HealthSnapshot:
     cpu_count: int
     temperature_c: float | None
     throttled_flags: int | None
-
-
-@dataclass(frozen=True)
-class HealthThresholds:
-    minimum_available_bytes: int = DEFAULT_MIN_AVAILABLE_BYTES
-    maximum_swap_used_fraction: float = DEFAULT_MAX_SWAP_FRACTION
-    maximum_swap_used_bytes: int = DEFAULT_MAX_SWAP_BYTES
-    maximum_load_per_cpu: float = DEFAULT_MAX_LOAD_PER_CPU
-    maximum_temperature_c: float = DEFAULT_MAX_TEMPERATURE_C
 
 
 @dataclass(frozen=True)
@@ -464,7 +455,7 @@ def local_work_required_bytes(
 
 
 def work_capacity_eligibility(
-    manifest: Mapping[str, object], args: argparse.Namespace
+    manifest: Mapping[str, object], args: BrokerConfig
 ) -> tuple[bool, str]:
     try:
         required = local_work_required_bytes(manifest, args.max_result_bytes)
@@ -483,7 +474,7 @@ def work_capacity_eligibility(
 
 
 def runtime_eligibility(
-    manifest: Mapping[str, object], args: argparse.Namespace
+    manifest: Mapping[str, object], args: BrokerConfig
 ) -> tuple[bool, str]:
     eligible, reason = local_eligibility(manifest)
     if not eligible:
@@ -854,13 +845,8 @@ def _copy_inputs(
     return paths, values
 
 
-
 def _wait4_nohang(process: subprocess.Popen[bytes]):
-    waited_pid, status, usage = os.wait4(process.pid, os.WNOHANG)
-    if waited_pid == 0:
-        return None
-    process.returncode = os.waitstatus_to_exitcode(status)
-    return process.returncode, usage
+    return engine.wait4_nohang(process)
 
 
 def _wait_for_process(
@@ -874,178 +860,52 @@ def _wait_for_process(
         0, shutil.disk_usage(path).free
     ),
 ) -> LocalProcessOutcome:
-    deadline = time.monotonic() + timeout
-    next_resource_poll = 0.0
-    timed_out = False
-    interrupted = False
-    resource_limit: str | None = None
-    resource_monitor_error: str | None = None
-    lowest_free_bytes: int | None = None
-
-    def sample_free_space() -> None:
-        nonlocal lowest_free_bytes, resource_limit, resource_monitor_error
-        try:
-            free_bytes = free_space_reader(work_path)
-        except OSError as exc:
-            resource_monitor_error = f"free-space watchdog failed: {exc}"
-            return
-        lowest_free_bytes = (
-            free_bytes
-            if lowest_free_bytes is None
-            else min(lowest_free_bytes, free_bytes)
-        )
-        if free_bytes < minimum_free_bytes:
-            resource_limit = (
-                "filesystem free space fell below execution safety threshold "
-                f"{minimum_free_bytes} bytes"
-            )
-
-    while True:
-        completed = _wait4_nohang(process)
-        if completed is not None:
-            # A fast child may finish between polls after creating substantial
-            # output. Sample once more before any packaging or result upload.
-            sample_free_space()
-            return LocalProcessOutcome(
-                137
-                if resource_limit is not None
-                else 125
-                if resource_monitor_error is not None
-                else completed[0],
-                completed[1],
-                timed_out,
-                interrupted,
-                resource_limit,
-                resource_monitor_error,
-                lowest_free_bytes,
-            )
-        if should_stop():
-            interrupted = True
-            break
-        now = time.monotonic()
-        if now >= deadline:
-            timed_out = True
-            break
-        if now >= next_resource_poll:
-            sample_free_space()
-            if resource_limit is not None or resource_monitor_error is not None:
-                break
-            next_resource_poll = now + RESOURCE_POLL_INTERVAL
-        time.sleep(0.1)
-    if resource_limit is not None or resource_monitor_error is not None:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        waited_pid, status, usage = os.wait4(process.pid, 0)
-        if waited_pid != process.pid:
-            raise BrokerError("lost track of resource-limited local analysis process")
-        process.returncode = os.waitstatus_to_exitcode(status)
-        return LocalProcessOutcome(
-            137 if resource_limit is not None else 125,
-            usage,
-            timed_out,
-            interrupted,
-            resource_limit,
-            resource_monitor_error,
-            lowest_free_bytes,
-        )
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    terminate_deadline = time.monotonic() + 10
-    while time.monotonic() < terminate_deadline:
-        completed = _wait4_nohang(process)
-        if completed is not None:
-            return LocalProcessOutcome(
-                124 if timed_out else 143,
-                completed[1],
-                timed_out,
-                interrupted,
-                resource_limit,
-                resource_monitor_error,
-                lowest_free_bytes,
-            )
-        time.sleep(0.1)
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    waited_pid, status, usage = os.wait4(process.pid, 0)
-    if waited_pid != process.pid:
-        raise BrokerError("lost track of local analysis process")
-    process.returncode = os.waitstatus_to_exitcode(status)
+    outcome = engine.wait_for_process(
+        process,
+        host=engine.Host.PI,
+        error_type=BrokerError,
+        timeout=timeout,
+        should_stop=should_stop,
+        work_path=work_path,
+        minimum_free_bytes=minimum_free_bytes,
+        free_space_reader=free_space_reader,
+        poll=_wait4_nohang,
+        clock=time,
+    )
     return LocalProcessOutcome(
-        124 if timed_out else 143,
-        usage,
-        timed_out,
-        interrupted,
-        resource_limit,
-        resource_monitor_error,
-        lowest_free_bytes,
+        outcome.exit_code,
+        outcome.usage,
+        outcome.timed_out,
+        outcome.interrupted,
+        outcome.resource_limit,
+        outcome.resource_monitor_error,
+        outcome.minimum_filesystem_free_bytes,
     )
 
 
 def _process_group_exists(process_group: int) -> bool:
-    try:
-        os.killpg(process_group, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError as exc:
-        raise BrokerError(f"cannot inspect analysis process group {process_group}: {exc}") from None
+    return engine.process_group_exists(
+        process_group, host=engine.Host.PI, error_type=BrokerError
+    )
 
 
 def terminate_remaining_process_group(
-    process_group: int,
-    *,
-    terminate_grace: float = 2.0,
-    kill_grace: float = 2.0,
+    process_group: int, *, terminate_grace: float = 2.0, kill_grace: float = 2.0
 ) -> bool:
-    """Stop background descendants left after the command leader exits."""
-    if not _process_group_exists(process_group):
-        return False
-    try:
-        os.killpg(process_group, signal.SIGTERM)
-    except ProcessLookupError:
-        return True
-    deadline = time.monotonic() + terminate_grace
-    while time.monotonic() < deadline:
-        if not _process_group_exists(process_group):
-            return True
-        time.sleep(0.05)
-    try:
-        os.killpg(process_group, signal.SIGKILL)
-    except ProcessLookupError:
-        return True
-    deadline = time.monotonic() + kill_grace
-    while time.monotonic() < deadline:
-        if not _process_group_exists(process_group):
-            return True
-        time.sleep(0.05)
-    raise BrokerError(f"analysis process group {process_group} survived SIGKILL")
+    return engine.terminate_group(
+        process_group,
+        exists=_process_group_exists,
+        error_type=BrokerError,
+        host=engine.Host.PI,
+        terminate_grace=terminate_grace,
+        kill_grace=kill_grace,
+        clock=time,
+    )
 
 
 def _resource_usage(usage, wall_seconds: float) -> dict[str, object]:
-    user_seconds = max(0.0, usage.ru_utime)
-    system_seconds = max(0.0, usage.ru_stime)
-    cpu_seconds = user_seconds + system_seconds
-    peak_rss_bytes = int(usage.ru_maxrss)
-    if sys.platform != "darwin":
-        peak_rss_bytes *= 1024
     return {
-        "user_cpu_seconds": round(user_seconds, 6),
-        "system_cpu_seconds": round(system_seconds, 6),
-        "cpu_seconds": round(cpu_seconds, 6),
-        "average_cpu_percent": (
-            round(100 * cpu_seconds / wall_seconds, 2) if wall_seconds > 0 else None
-        ),
-        "peak_rss_bytes": peak_rss_bytes,
-        "minor_page_faults": max(0, usage.ru_minflt),
-        "major_page_faults": max(0, usage.ru_majflt),
-        "voluntary_context_switches": max(0, usage.ru_nvcsw),
-        "involuntary_context_switches": max(0, usage.ru_nivcsw),
+        **engine.resource_usage(usage, wall_seconds),
         "scope": "wait4 resource usage for the local analysis process",
         "peak_rss_note": (
             "maximum RSS returned by wait4 for the reaped process; it is not a "
@@ -1067,145 +927,25 @@ def bubblewrap_command(
     job_id: str,
     runtime_bindings: Sequence[tuple[Path, str]] = (),
 ) -> list[str]:
-    """Build a fixed, no-network sandbox around one protocol command."""
-    bwrap = Path(executable)
-    if not bwrap.is_absolute() or not bwrap.is_file() or not os.access(bwrap, os.X_OK):
-        raise BrokerError(f"bubblewrap is required for Pi fallback: {bwrap}")
-    wrapped = [
-        str(bwrap),
-        "--die-with-parent",
-        "--new-session",
-        "--unshare-user",
-        "--unshare-pid",
-        "--unshare-net",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--uid",
-        "0",
-        "--gid",
-        "0",
-        "--cap-drop",
-        "ALL",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--tmpfs",
-        "/tmp",
-        "--dir",
-        "/run",
-        "--dir",
-        "/etc",
-        "--dir",
-        "/job",
-        "--dir",
-        "/job/runtime",
-    ]
-    # These contain the interpreter, shared libraries, and ordinary system
-    # modules.  No user or service data directory is exposed.
-    for raw in ("/usr", "/bin", "/sbin", "/lib", "/lib64"):
-        path = Path(raw)
-        if path.exists():
-            wrapped.extend(("--ro-bind", raw, raw))
-    for raw in (
-        "/etc/ld.so.cache",
-        "/etc/ld.so.conf",
-        "/etc/ld.so.conf.d",
-        "/etc/localtime",
-        "/etc/passwd",
-        "/etc/group",
-        "/etc/python3",
-    ):
-        path = Path(raw)
-        if path.exists():
-            wrapped.extend(("--ro-bind", raw, raw))
-    for host, sandbox_path in runtime_bindings:
-        if not host.is_dir() or host.is_symlink():
-            raise BrokerError(f"sandbox runtime is not a real directory: {host}")
-        wrapped.extend(("--ro-bind", str(host), sandbox_path))
-    wrapped.extend(
-        (
-            "--ro-bind",
-            str(source_root),
-            "/job/source",
-            "--ro-bind",
-            str(inputs_root),
-            "/job/inputs",
-            "--bind",
-            str(result_root),
-            "/job/result",
-            "--bind",
-            str(home_root),
-            "/job/home",
-            "--bind",
-            str(temporary_root),
-            "/job/tmp",
-            "--bind",
-            str(cache_root),
-            "/job/cache",
-            "--chdir",
-            "/job/source",
-            "--clearenv",
-            "--setenv",
-            "HOME",
-            "/job/home",
-            "--setenv",
-            "TMPDIR",
-            "/job/tmp/",
-            "--setenv",
-            "XDG_CACHE_HOME",
-            "/job/cache",
-            "--setenv",
-            "XDG_CONFIG_HOME",
-            "/job/home/.config",
-            "--setenv",
-            "LANG",
-            "C.UTF-8",
-            "--setenv",
-            "LC_ALL",
-            "C.UTF-8",
-            "--setenv",
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "--setenv",
-            "PYTHONPATH",
-            "/job/source",
-            "--setenv",
-            "PYTHONNOUSERSITE",
-            "1",
-            "--setenv",
-            "PYTHONDONTWRITEBYTECODE",
-            "1",
-            "--setenv",
-            "PYTEST_ADDOPTS",
-            "-p no:cacheprovider",
-            "--setenv",
-            "VAN_COMPUTE_JOB_ID",
-            job_id,
-            "--setenv",
-            "VAN_COMPUTE_PLACEMENT",
-            "pi-local",
-            "--",
-            *command,
-        )
+    sandbox: engine.Sandbox = engine.BubblewrapSandbox(
+        executable,
+        source_root,
+        inputs_root,
+        result_root,
+        home_root,
+        temporary_root,
+        cache_root,
+        job_id,
+        BrokerError,
+        runtime_bindings,
     )
-    return wrapped
+    return sandbox.wrap(command)
 
 
-def sandbox_executable(executable: str, family: str) -> tuple[str, list[tuple[Path, str]]]:
-    """Map a dedicated Python venv into the sandbox without exposing its home."""
-    path = Path(executable)
-    for system_root in (Path("/usr"), Path("/bin"), Path("/sbin"), Path("/lib")):
-        try:
-            path.relative_to(system_root)
-            return str(path), []
-        except ValueError:
-            continue
-    if family != "python" or path.parent.name != "bin":
-        raise BrokerError(f"non-system {family} runtime is not supported: {path}")
-    runtime_root = path.parent.parent
-    sandbox_root = "/job/runtime/python"
-    return f"{sandbox_root}/bin/{path.name}", [(runtime_root, sandbox_root)]
+def sandbox_executable(
+    executable: str, family: str
+) -> tuple[str, list[tuple[Path, str]]]:
+    return engine._sandbox_executable(executable, family, BrokerError)
 
 
 @lru_cache(maxsize=4)
@@ -1296,40 +1036,8 @@ def bubblewrap_self_test(
     return True, "bubblewrap isolation verified"
 
 
-def _real_declared_output(
-    result_root: Path,
-    relative: Path,
-) -> Path | None:
-    """Return a declared file/directory only when every component is real."""
-    try:
-        root_info = result_root.lstat()
-    except OSError as exc:
-        raise BrokerError(f"cannot inspect result root: {exc}") from None
-    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
-        raise BrokerError("result root is not a real directory")
-
-    current = result_root
-    for index, part in enumerate(relative.parts):
-        current = current / part
-        try:
-            info = current.lstat()
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            raise BrokerError(
-                f"cannot inspect declared output component {current}: {exc}"
-            ) from None
-        if stat.S_ISLNK(info.st_mode):
-            raise BrokerError(
-                f"declared output has a symlinked path component: {relative}"
-            )
-        if index < len(relative.parts) - 1 and not stat.S_ISDIR(info.st_mode):
-            return None
-        if index == len(relative.parts) - 1:
-            if stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode):
-                return current
-            raise BrokerError(f"declared output is a special file: {relative}")
-    return None
+def _real_declared_output(result_root: Path, relative: Path) -> Path | None:
+    return engine.real_declared_output(result_root, relative, BrokerError)
 
 
 def _real_declared_output_directory(
@@ -1341,81 +1049,27 @@ def _real_declared_output_directory(
 
 
 def validate_declared_outputs(
-    manifest: Mapping[str, object],
-    result_root: Path,
-    *,
-    require_all: bool,
+    manifest: Mapping[str, object], result_root: Path, *, require_all: bool
 ) -> None:
-    embedded = manifest.get("execution")
-    if embedded is None:
-        return
-    specification = protocol.validate_execution(embedded)
-    missing: list[str] = []
-    for item in specification["outputs"]:
-        relative = Path(str(item))
-        if _real_declared_output(result_root, relative) is None:
-            missing.append(relative.as_posix())
-    if require_all and missing:
-        raise BrokerError(
-            "successful job omitted declared result(s): " + ", ".join(missing)
-        )
+    engine.validate_declared_outputs(
+        manifest,
+        result_root,
+        require_all=require_all,
+        host=engine.Host.PI,
+        error_type=BrokerError,
+    )
 
 
 def _package_output_directories(
-    manifest: Mapping[str, object],
-    result_root: Path,
-    maximum_bytes: int,
+    manifest: Mapping[str, object], result_root: Path, maximum_bytes: int
 ) -> dict[str, str]:
-    if manifest.get("execution") is None:
-        return {}
-    specification = protocol.validate_execution(manifest.get("execution"))
-    artifacts: dict[str, str] = {}
-    for output_text in specification["outputs"]:
-        relative = Path(str(output_text))
-        output = _real_declared_output_directory(result_root, relative)
-        if output is None:
-            continue
-        estimated = 4096
-        for entry in output.rglob("*"):
-            if entry.is_symlink():
-                raise BrokerError(f"declared output contains a symlink: {relative}")
-            if entry.is_file():
-                estimated += entry.stat().st_size
-            elif not entry.is_dir():
-                raise BrokerError(f"declared output contains a special file: {relative}")
-            estimated += 4096
-            if estimated > maximum_bytes:
-                raise BrokerError(f"declared output exceeds result limit: {relative}")
-        archive_relative = relative.with_name(f"{relative.name}.tar.gz")
-        archive = result_root / archive_relative
-        archive.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if archive.exists() or archive.is_symlink():
-            raise BrokerError(f"output archive path already exists: {archive_relative}")
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{archive.name}.", suffix=".partial", dir=archive.parent
-        )
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "wb") as raw_archive:
-                with tarfile.open(
-                    fileobj=raw_archive, mode="w:gz", dereference=False
-                ) as bundle:
-                    bundle.add(output, arcname=relative.as_posix(), recursive=True)
-                raw_archive.flush()
-                os.fsync(raw_archive.fileno())
-                archive_size = os.fstat(raw_archive.fileno()).st_size
-            if archive_size > maximum_bytes:
-                raise BrokerError(
-                    f"declared output archive exceeds result limit: {relative}"
-                )
-            # os.replace replaces the directory entry itself and never follows
-            # a destination symlink created after the collision check.
-            os.replace(temporary, archive)
-        finally:
-            temporary.unlink(missing_ok=True)
-        shutil.rmtree(output)
-        artifacts[relative.as_posix()] = archive_relative.as_posix()
-    return artifacts
+    return engine.package_output_directories(
+        manifest,
+        result_root,
+        maximum_bytes,
+        host=engine.Host.PI,
+        error_type=BrokerError,
+    )
 
 
 def _result_files(
@@ -1437,26 +1091,13 @@ def _result_files(
         expected.update(
             artifacts.get(str(path), str(path)) for path in specification["outputs"]
         )
-    files: list[tuple[str, Path]] = []
-    total = 0
-    for path in sorted(result_root.rglob("*")):
-        if path.is_symlink():
-            raise BrokerError(f"result contains a symlink: {path}")
-        if not path.is_file():
-            continue
-        relative = path.relative_to(result_root).as_posix()
-        if relative not in expected:
-            raise BrokerError(f"job produced undeclared result file: {relative}")
-        size = path.stat().st_size
-        if size > maximum_bytes:
-            raise BrokerError(f"result exceeds per-file limit: {relative}")
-        total += size
-        if total > maximum_bytes:
-            raise BrokerError("job results exceed total result limit")
-        files.append((relative, path))
-    if len(files) > protocol.MAX_OUTPUTS + 3:
-        raise BrokerError("job produced too many result files")
-    return files
+    return engine.result_files(
+        result_root,
+        maximum_bytes,
+        expected=expected,
+        host=engine.Host.PI,
+        error_type=BrokerError,
+    )
 
 
 def _failure_results(
@@ -1496,9 +1137,7 @@ def _record_local_execution_once(
 ) -> dict[str, object] | None:
     """Mirror one real Pi fallback run into eligible-local-work telemetry."""
     usage = execution.get("resource_usage")
-    duration = execution.get(
-        "broker_active_seconds", execution.get("duration_seconds")
-    )
+    duration = execution.get("broker_active_seconds", execution.get("duration_seconds"))
     if not isinstance(usage, dict) or not isinstance(duration, (int, float)):
         return None
     profile = job_profile(manifest)
@@ -1517,7 +1156,7 @@ def _record_local_execution_once(
             continue
         if prior.get("label") == label:
             return prior
-    telemetry_args = argparse.Namespace(
+    telemetry_record = MissedOffloadRecord(
         profile=profile,
         label=label,
         reason="worker-unavailable",
@@ -1526,11 +1165,11 @@ def _record_local_execution_once(
         peak_rss_bytes=int(usage.get("peak_rss_bytes", 0)),
         input_bytes=int(execution.get("input_bytes", 0)),
     )
-    return queue.record_missed_offload(root, telemetry_args)
+    return queue.record_missed_offload(root, telemetry_record)
 
 
 def execute_claimed_job(
-    args: argparse.Namespace,
+    args: BrokerConfig,
     root: Path,
     manifest: dict[str, object],
     *,
@@ -1565,9 +1204,7 @@ def execute_claimed_job(
             _copy_sources(job_path, manifest, source_root)
             source_preparation_seconds = time.monotonic() - source_preparation_started
             input_preparation_started = time.monotonic()
-            input_paths, input_values = _copy_inputs(
-                manifest, inputs_root, lease_token
-            )
+            input_paths, input_values = _copy_inputs(manifest, inputs_root, lease_token)
             input_preparation_seconds = time.monotonic() - input_preparation_started
             result_root.mkdir(mode=0o700)
             home_root = work / "home"
@@ -1575,13 +1212,28 @@ def execute_claimed_job(
             cache_root = work / "cache"
             for path in (home_root, temporary_root, cache_root):
                 path.mkdir(mode=0o700)
+            sandbox: engine.Sandbox = engine.BubblewrapSandbox(
+                args.bwrap,
+                source_root,
+                inputs_root,
+                result_root,
+                home_root,
+                temporary_root,
+                cache_root,
+                job_id,
+                BrokerError,
+            )
             host_executables = {"python": args.python, "sqlite3": args.sqlite3}
             profile = job_profile(manifest)
-            family = "python" if profile is None else protocol.PROFILE_FAMILIES[str(profile)]
+            family = (
+                "python" if profile is None else protocol.PROFILE_FAMILIES[str(profile)]
+            )
             executable = Path(host_executables[family])
             if not executable.is_file() or not os.access(executable, os.X_OK):
-                raise BrokerError(f"required {family} executable is unavailable: {executable}")
-            sandbox_binary, runtime_bindings = sandbox_executable(
+                raise BrokerError(
+                    f"required {family} executable is unavailable: {executable}"
+                )
+            sandbox_binary, runtime_bindings = sandbox.executable(
                 str(executable), family
             )
             executables = dict(host_executables)
@@ -1589,11 +1241,13 @@ def execute_claimed_job(
             sandbox_python = (
                 sandbox_binary
                 if family == "python"
-                else sandbox_executable(args.python, "python")[0]
+                else sandbox.executable(args.python, "python")[0]
             )
-            sandbox_source = Path("/job/source")
-            sandbox_inputs = [Path("/job/inputs") / path.name for path in input_paths]
-            sandbox_result = Path("/job/result")
+            sandbox_source = sandbox.command_path(source_root, "source")
+            sandbox_inputs = [
+                sandbox.command_path(path, "inputs") for path in input_paths
+            ]
+            sandbox_result = sandbox.command_path(result_root, "result")
             command = protocol.build_command(
                 str(manifest.get("task", "")),
                 python=sandbox_python,
@@ -1637,32 +1291,27 @@ def execute_claimed_job(
                 "--",
                 *sandboxed_command,
             ]
-            stdout_path = result_root / "stdout.txt"
-            stderr_path = result_root / "stderr.txt"
             started = utc_now()
             started_monotonic = time.monotonic()
-            with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-                process = subprocess.Popen(
-                    child_command,
-                    cwd=work,
-                    env=environment,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout,
-                    stderr=stderr,
-                    start_new_session=True,
-                )
+
+            def supervise(process):
                 outcome = _wait_for_process(
                     process,
                     timeout=args.timeout,
                     should_stop=should_stop,
                     work_path=work,
-                    minimum_free_bytes=(
-                        args.min_work_free_bytes + args.max_result_bytes
-                    ),
+                    minimum_free_bytes=args.min_work_free_bytes + args.max_result_bytes,
                 )
-                background_descendants_terminated = terminate_remaining_process_group(
-                    process.pid
-                )
+                cleaned = terminate_remaining_process_group(process.pid)
+                return outcome, cleaned
+
+            outcome, background_descendants_terminated = engine.run_child(
+                child_command,
+                cwd=work,
+                environment=environment,
+                result_root=result_root,
+                supervise=supervise,
+            )
             duration = time.monotonic() - started_monotonic
             resource_usage = _resource_usage(outcome.usage, duration)
             resource_usage.update(
@@ -1709,14 +1358,19 @@ def execute_claimed_job(
                 json.dumps(execution, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-            if outcome.resource_limit is not None or outcome.resource_monitor_error is not None:
+            if (
+                outcome.resource_limit is not None
+                or outcome.resource_monitor_error is not None
+            ):
                 # Free space is already under the execution headroom. Remove
                 # potentially large task output before publishing only bounded
                 # failure metadata back into the queue on the same filesystem.
                 shutil.rmtree(result_root)
                 result_root.mkdir(mode=0o700)
                 (result_root / "stdout.txt").touch(mode=0o600)
-                failure_reason = outcome.resource_limit or outcome.resource_monitor_error
+                failure_reason = (
+                    outcome.resource_limit or outcome.resource_monitor_error
+                )
                 (result_root / "stderr.txt").write_text(
                     f"van-compute local fallback stopped: {failure_reason}\n",
                     encoding="utf-8",
@@ -1745,7 +1399,9 @@ def execute_claimed_job(
                         json.dumps(execution, indent=2, sort_keys=True) + "\n",
                         encoding="utf-8",
                     )
-            files = _result_files(manifest, result_root, args.max_result_bytes, artifacts)
+            files = _result_files(
+                manifest, result_root, args.max_result_bytes, artifacts
+            )
         except Exception as exc:
             exit_code, execution = _failure_results(result_root, manifest, exc)
             artifacts = {}
@@ -1786,9 +1442,7 @@ def execute_claimed_job(
             if relative != "execution.json":
                 continue
             with path.open("rb") as handle:
-                _put_local_result(
-                    root, job_id, lease_token, relative, handle
-                )
+                _put_local_result(root, job_id, lease_token, relative, handle)
             uploaded.append(relative)
         try:
             completed = _finish_local_job(
@@ -1810,14 +1464,15 @@ def execute_claimed_job(
 
 
 def run_once(
-    args: argparse.Namespace,
+    args: BrokerConfig,
     *,
     now: dt.datetime | None = None,
     health_reader: Callable[[], HealthSnapshot] = read_health_snapshot,
     should_stop: Callable[[], bool] = lambda: False,
 ) -> dict[str, object]:
     root = queue.safe_root(args.root)
-    args.work_root = prepare_work_root(args.work_root)
+    work_root = prepare_work_root(args.work_root)
+    args.work_root = work_root
     now = now or dt.datetime.now(dt.timezone.utc)
     if queue.maintenance_status(root) is not None:
         return {"action": "deferred", "reason": "queue maintenance is active"}
@@ -1851,7 +1506,7 @@ def run_once(
     sandbox_ok, sandbox_reason = bubblewrap_self_test(
         args.bwrap,
         args.python,
-        str(args.work_root),
+        str(work_root),
         str(root),
     )
     if not sandbox_ok:
@@ -1878,10 +1533,11 @@ def run_once(
     return {"action": "executed", **result}
 
 
-def run_self_test(args: argparse.Namespace) -> dict[str, object]:
+def run_self_test(args: BrokerConfig) -> dict[str, object]:
     """Verify the effective task sandbox and configured Python runtime."""
     root = queue.safe_root(args.root)
-    args.work_root = prepare_work_root(args.work_root)
+    work_root = prepare_work_root(args.work_root)
+    args.work_root = work_root
     throttle_flags = _read_throttled()
     if throttle_flags is None:
         raise BrokerError(
@@ -1890,7 +1546,7 @@ def run_self_test(args: argparse.Namespace) -> dict[str, object]:
     ok, reason = bubblewrap_self_test(
         args.bwrap,
         args.python,
-        str(args.work_root),
+        str(work_root),
         str(root),
     )
     if not ok:
@@ -1961,7 +1617,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _validate_args(args: argparse.Namespace) -> None:
+def _validate_args(args: argparse.Namespace) -> BrokerConfig:
     if not 1 <= args.timeout <= 24 * 60 * 60:
         raise BrokerError("--timeout must be from 1 second through 24 hours")
     if not 1 <= args.cpu_seconds <= 24 * 60 * 60:
@@ -1971,9 +1627,7 @@ def _validate_args(args: argparse.Namespace) -> None:
     if not 1024 <= args.max_result_bytes <= protocol.MAX_RESULT_BYTES:
         raise BrokerError("--max-result-bytes must be from 1 KiB through 128 MiB")
     if not 256 * 1024 * 1024 <= args.min_work_free_bytes <= 1024**4:
-        raise BrokerError(
-            "--min-work-free-bytes must be from 256 MiB through 1 TiB"
-        )
+        raise BrokerError("--min-work-free-bytes must be from 256 MiB through 1 TiB")
     if not 32 <= args.max_open_files <= 1024:
         raise BrokerError("--max-open-files must be from 32 through 1024")
     if not 0 <= args.nice <= 19:
@@ -2004,18 +1658,22 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise BrokerError("--max-swap-used-mb must be from 0 through 16384")
     if not math.isfinite(args.max_load_per_cpu) or args.max_load_per_cpu <= 0:
         raise BrokerError("--max-load-per-cpu must be positive")
-    if not math.isfinite(args.max_temperature_c) or not 40 <= args.max_temperature_c <= 100:
+    if (
+        not math.isfinite(args.max_temperature_c)
+        or not 40 <= args.max_temperature_c <= 100
+    ):
         raise BrokerError("--max-temperature-c must be from 40 through 100")
-    args.health_thresholds = HealthThresholds(
+    health_thresholds = HealthThresholds(
         minimum_available_bytes=args.min_available_memory_mb * 1024 * 1024,
         maximum_swap_used_fraction=args.max_swap_used,
         maximum_swap_used_bytes=args.max_swap_used_mb * 1024 * 1024,
         maximum_load_per_cpu=args.max_load_per_cpu,
         maximum_temperature_c=args.max_temperature_c,
     )
+    return BrokerConfig.from_namespace(args, health_thresholds=health_thresholds)
 
 
-def serve(args: argparse.Namespace) -> None:
+def serve(args: BrokerConfig) -> None:
     stopping = False
 
     def stop(_signum: int, _frame: object) -> None:
@@ -2028,7 +1686,10 @@ def serve(args: argparse.Namespace) -> None:
     while not stopping:
         result = run_once(args, should_stop=lambda: stopping)
         rendered = json.dumps(result, sort_keys=True)
-        if rendered != last_message and result.get("reason") != "no eligible queued jobs":
+        if (
+            rendered != last_message
+            and result.get("reason") != "no eligible queued jobs"
+        ):
             print(rendered, flush=True)
         last_message = rendered
         if stopping:
@@ -2058,14 +1719,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(raw)
     try:
-        _validate_args(args)
-        with broker_lock(args.root):
-            if args.self_test:
-                print(json.dumps(run_self_test(args), indent=2, sort_keys=True))
-            elif args.once:
-                print(json.dumps(run_once(args), indent=2, sort_keys=True))
+        config = _validate_args(args)
+        with broker_lock(config.root):
+            if config.self_test:
+                print(json.dumps(run_self_test(config), indent=2, sort_keys=True))
+            elif config.once:
+                print(json.dumps(run_once(config), indent=2, sort_keys=True))
             else:
-                serve(args)
+                serve(config)
         return 0
     except (BrokerError, queue.QueueError, protocol.ProtocolError, OSError) as exc:
         print(f"van-compute-broker: {exc}", file=sys.stderr)

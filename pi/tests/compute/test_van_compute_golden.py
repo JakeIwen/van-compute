@@ -33,7 +33,6 @@ not tested here; the existing execution/security suites cover those boundaries.
 
 from __future__ import annotations
 
-import argparse
 import base64
 from contextlib import ExitStack, contextmanager, redirect_stderr
 import datetime as dt
@@ -63,6 +62,7 @@ from flask import Flask, jsonify
 from van_compute import queue
 from van_compute import protocol
 from van_compute import broker
+from van_compute import config
 from van_compute import metrics
 from van_compute import frontend
 from van_compute import worker
@@ -424,11 +424,34 @@ class ComputeGoldenTests(unittest.TestCase):
         self.assertIsNotNone(manifest)
         self.golden(f"{prefix}/running-manifest.json", (self.root / "running" / manifest["id"] / "manifest.json").read_bytes())
         work = self.base / "worker-work"
-        args = argparse.Namespace(
-            work_root=work, python=sys.executable, timeout=30, nice=0,
-            max_result_bytes=MAX_RESULT_BYTES, max_memory_bytes=64 * 1024**3,
-            max_processes=10, min_free_bytes=0, executables={"python": sys.executable},
-            datasets={}, sandbox_profile=self.base / "test.sb", allow_unsandboxed_dynamic=False,
+        args = config.WorkerConfig(
+            host="pi@vanpi.lan",
+            remote_cli="/home/pi/van_compute/scripts/van_compute.py",
+            remote_root=None,
+            worker="golden-mac",
+            work_root=work,
+            control_path=Path("control.sock"),
+            python=sys.executable,
+            sqlite3="/usr/bin/sqlite3",
+            rg="/usr/bin/rg",
+            jadx="/usr/bin/jadx",
+            timeout=30,
+            connect_timeout=5,
+            nice=0,
+            max_result_bytes=MAX_RESULT_BYTES,
+            max_memory_bytes=64 * 1024**3,
+            max_processes=10,
+            min_free_bytes=0,
+            heartbeat_interval=15.0,
+            poll_interval=15.0,
+            dataset_config=None,
+            dataset=(),
+            sandbox_profile=self.base / "test.sb",
+            allow_unsandboxed_dynamic=False,
+            serve=False,
+            run_once=True,
+            executables={"python": sys.executable},
+            datasets={},
             resource_manager=worker.SchedulerResourceManager(work, minimum_free_bytes=0,
                 maximum_result_bytes=MAX_RESULT_BYTES, free_space_reader=lambda _path: FREE_BYTES),
         )
