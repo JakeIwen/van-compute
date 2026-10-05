@@ -1,0 +1,21 @@
+{
+  "argv": [
+    "<TMP>/source/tools/capture_child.py",
+    "<TMP>/result/child-env.json",
+    "relative/argument"
+  ],
+  "environment": {
+    "HOME": "<TMP>/home",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONPATH": "<TMP>/source",
+    "TMPDIR": "<TMP>/tmp/",
+    "VAN_COMPUTE_JOB_ID": "20260722T120000Z-0000000a",
+    "XDG_CACHE_HOME": "<TMP>/cache",
+    "XDG_CONFIG_HOME": "<TMP>/home/.config",
+    "__CF_USER_TEXT_ENCODING": "0x1F5:0x0:0x0"
+  }
+}

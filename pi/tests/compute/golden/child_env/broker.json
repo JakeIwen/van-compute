@@ -1,0 +1,15 @@
+{
+  "argv": [
+    "<TMP>/source/tools/capture_child.py",
+    "<TMP>/result/child-env.json",
+    "relative/argument"
+  ],
+  "environment": {
+    "HOME": "<TMP>/home",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "TMPDIR": "<TMP>/tmp/",
+    "__CF_USER_TEXT_ENCODING": "0x1F5:0x0:0x0"
+  }
+}

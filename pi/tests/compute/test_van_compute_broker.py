@@ -18,6 +18,43 @@ from pi.van_compute.scripts import van_compute_broker as broker
 from pi.van_compute.scripts import van_compute_protocol as protocol
 
 
+CHILD_ENV_SCRIPT = """import json
+import os
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_text(
+    json.dumps(
+        {"argv": sys.argv, "environment": dict(os.environ)},
+        indent=2,
+        sort_keys=True,
+    ) + "\\n",
+    encoding="utf-8",
+)
+"""
+CHILD_ENV_GOLDEN = Path(__file__).with_name("golden") / "child_env" / "broker.json"
+
+
+def normalized_child_capture(payload, *, temporary_root, python):
+    replacements = []
+    for value, marker in ((temporary_root, b"<TMP>"), (python, b"<PYTHON>")):
+        literals = {
+            os.path.abspath(os.fspath(value)),
+            os.path.realpath(os.fspath(value)),
+        }
+        for literal in tuple(literals):
+            if literal.startswith("/private/"):
+                literals.add(literal.removeprefix("/private"))
+            elif literal.startswith(("/tmp/", "/var/")):
+                literals.add("/private" + literal)
+        replacements.extend(
+            (literal.encode("utf-8"), marker) for literal in literals
+        )
+    for literal, marker in sorted(replacements, key=lambda item: len(item[0]), reverse=True):
+        payload = payload.replace(literal, marker)
+    return payload
+
+
 LOCAL_SCRIPT = """#!/usr/bin/env python3
 import subprocess
 import sys
@@ -219,6 +256,96 @@ class PlacementTests(BrokerHarness):
             broker.DEFAULT_MAX_RESULT_BYTES,
             protocol.MAX_RESULT_BYTES,
         )
+
+    def test_exec_helper_child_environment_and_argv_match_golden(self):
+        tool = self.source / "tools" / "capture_child.py"
+        tool.write_text(CHILD_ENV_SCRIPT, encoding="utf-8")
+        declaration = {
+            "schema_version": 1,
+            "tasks": [
+                *DECLARATION["tasks"],
+                {
+                    "name": "child-env-capture",
+                    "profile": "python-script",
+                    "source_paths": ["tools/capture_child.py"],
+                    "minimum_inputs": 0,
+                    "maximum_inputs": 0,
+                    "argv": [
+                        "{source:tools/capture_child.py}",
+                        "{result:child-env.json}",
+                        "{arguments}",
+                    ],
+                    "outputs": ["child-env.json"],
+                },
+            ],
+        }
+        (self.source / protocol.REPO_MANIFEST).write_text(
+            json.dumps(declaration), encoding="utf-8"
+        )
+        submitted = self.submit(
+            "child-env-capture",
+            arguments=["relative/argument"],
+        )
+        helper_calls = []
+        real_popen = broker.subprocess.Popen
+
+        def recording_popen(command, *args, **kwargs):
+            helper_calls.append((list(command), dict(kwargs)))
+            return real_popen(command, *args, **kwargs)
+
+        with mock.patch.object(
+            broker.subprocess, "Popen", side_effect=recording_popen
+        ):
+            result = self.run_once()
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(helper_calls), 1)
+        helper_command, helper_options = helper_calls[0]
+        self.assertEqual(
+            helper_command[:9],
+            [
+                sys.executable,
+                str(Path(broker.__file__).resolve()),
+                "__exec__",
+                str(self.args.max_memory_bytes),
+                str(self.args.cpu_seconds),
+                str(self.args.max_result_bytes),
+                str(self.args.max_open_files),
+                str(self.args.nice),
+                "--",
+            ],
+        )
+        temporary_root = Path(helper_options["cwd"])
+        self.assertEqual(
+            helper_command[9:],
+            [
+                sys.executable,
+                str(temporary_root / "source" / "tools" / "capture_child.py"),
+                str(temporary_root / "result" / "child-env.json"),
+                "relative/argument",
+            ],
+        )
+        raw_capture = (
+            self.root
+            / "done"
+            / submitted["id"]
+            / "result"
+            / "child-env.json"
+        ).read_bytes()
+        captured = json.loads(raw_capture)
+        self.assertEqual(
+            captured["environment"]["HOME"], str(temporary_root / "home")
+        )
+        normalized = normalized_child_capture(
+            raw_capture,
+            temporary_root=temporary_root,
+            python=helper_command[0],
+        )
+        if os.environ.get("VAN_COMPUTE_GOLDEN_UPDATE") == "1":
+            CHILD_ENV_GOLDEN.parent.mkdir(parents=True, exist_ok=True)
+            CHILD_ENV_GOLDEN.write_bytes(normalized)
+        self.assertTrue(CHILD_ENV_GOLDEN.is_file())
+        self.assertEqual(CHILD_ENV_GOLDEN.read_bytes(), normalized)
 
     def test_queue_maintenance_defers_pi_fallback(self):
         submitted = self.submit()
