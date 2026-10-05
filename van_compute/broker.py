@@ -26,7 +26,6 @@ import math
 import os
 from pathlib import Path
 import re
-import resource
 import secrets
 import shutil
 import signal
@@ -39,7 +38,7 @@ import time
 from typing import Callable, Mapping, Sequence
 
 
-from van_compute import queue
+from van_compute import limited_child, queue
 
 protocol = queue.protocol
 
@@ -855,46 +854,6 @@ def _copy_inputs(
     return paths, values
 
 
-def _set_limit(kind: int, soft: int, hard: int | None = None) -> None:
-    current_soft, current_hard = resource.getrlimit(kind)
-    del current_soft
-    desired_hard = soft if hard is None else hard
-    if current_hard != resource.RLIM_INFINITY:
-        desired_hard = min(desired_hard, current_hard)
-        soft = min(soft, desired_hard)
-    resource.setrlimit(kind, (soft, desired_hard))
-
-
-def limited_child_main(argv: Sequence[str]) -> int:
-    if len(argv) < 7 or argv[5] != "--":
-        print("van-compute-broker: invalid internal child invocation", file=sys.stderr)
-        return 125
-    try:
-        memory, cpu, file_size, nofile, nice = map(int, argv[:5])
-        if nice:
-            os.nice(nice)
-        # Darwin exposes RLIMIT_AS but rejects lowering its synthetic infinity.
-        # The broker is deployed on Linux, where this limit is mandatory and
-        # complements the service MemoryMax.
-        if sys.platform != "darwin":
-            _set_limit(resource.RLIMIT_AS, memory)
-        _set_limit(resource.RLIMIT_CPU, cpu, cpu + 5)
-        _set_limit(resource.RLIMIT_FSIZE, file_size)
-        _set_limit(resource.RLIMIT_NOFILE, nofile)
-        # RLIMIT_NPROC is counted across every process/thread with the same
-        # real UID, not just this job.  The shared pi account routinely owns
-        # more tasks than a sensible per-job ceiling, which makes Bubblewrap's
-        # initial namespace clone fail with EAGAIN.  The broker service's
-        # TasksMax cgroup is the actual per-broker process boundary.
-        command = list(argv[6:])
-        if not command:
-            raise BrokerError("internal child command is empty")
-        os.execvpe(command[0], command, os.environ)
-    except (BrokerError, OSError, ValueError) as exc:
-        print(f"van-compute-broker child: {exc}", file=sys.stderr)
-        return 126
-    return 126
-
 
 def _wait4_nohang(process: subprocess.Popen[bytes]):
     waited_pid, status, usage = os.wait4(process.pid, os.WNOHANG)
@@ -1668,8 +1627,8 @@ def execute_claimed_job(
             }
             child_command = [
                 sys.executable,
-                str(Path(__file__).resolve()),
-                "__exec__",
+                str(Path(limited_child.__file__).resolve()),
+                "broker",
                 str(args.max_memory_bytes),
                 str(args.cpu_seconds),
                 str(args.max_result_bytes),
@@ -2095,8 +2054,6 @@ def broker_lock(queue_root: Path):
 
 def main(argv: Sequence[str] | None = None) -> int:
     raw = list(argv) if argv is not None else sys.argv[1:]
-    if raw and raw[0] == "__exec__":
-        return limited_child_main(raw[1:])
     os.umask(0o077)
     parser = build_parser()
     args = parser.parse_args(raw)

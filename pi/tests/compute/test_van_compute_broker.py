@@ -14,7 +14,7 @@ from unittest import mock
 
 from van_compute import frontend as pi_compute
 from van_compute import queue
-from van_compute import broker
+from van_compute import limited_child, broker
 from van_compute import protocol
 
 
@@ -137,18 +137,18 @@ class LimitedChildTests(unittest.TestCase):
             "--",
             "/usr/bin/true",
         ]
-        with mock.patch.object(broker, "_set_limit") as set_limit, mock.patch.object(
-            broker.os,
+        with mock.patch.object(limited_child, "_set_limit") as set_limit, mock.patch.object(
+            limited_child.os,
             "execvpe",
             side_effect=OSError("test stopped before exec"),
         ), redirect_stderr(StringIO()):
-            result = broker.limited_child_main(arguments)
+            result = limited_child.broker_main(arguments)
 
         limited_resources = [call.args[0] for call in set_limit.call_args_list]
         self.assertEqual(result, 126)
-        self.assertNotIn(broker.resource.RLIMIT_NPROC, limited_resources)
-        self.assertIn(broker.resource.RLIMIT_CPU, limited_resources)
-        self.assertIn(broker.resource.RLIMIT_NOFILE, limited_resources)
+        self.assertNotIn(limited_child.resource.RLIMIT_NPROC, limited_resources)
+        self.assertIn(limited_child.resource.RLIMIT_CPU, limited_resources)
+        self.assertIn(limited_child.resource.RLIMIT_NOFILE, limited_resources)
 
 
 class BrokerHarness(unittest.TestCase):
@@ -305,8 +305,8 @@ class PlacementTests(BrokerHarness):
             helper_command[:9],
             [
                 sys.executable,
-                str(Path(broker.__file__).resolve()),
-                "__exec__",
+                str(Path(limited_child.__file__).resolve()),
+                "broker",
                 str(self.args.max_memory_bytes),
                 str(self.args.cpu_seconds),
                 str(self.args.max_result_bytes),

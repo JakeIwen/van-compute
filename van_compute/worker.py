@@ -23,7 +23,6 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import resource
 import shlex
 import shutil
 import signal
@@ -38,7 +37,10 @@ import time
 from typing import BinaryIO, Callable, Mapping, Sequence
 
 
-from van_compute import protocol
+from van_compute import limited_child, protocol
+
+# Mac releases place this module at <release>/app/van_compute/worker.py.
+WORKER_ROOT = Path(__file__).resolve().parents[2]
 
 
 DEFAULT_HOST = "pi@vanpi.lan"
@@ -625,32 +627,6 @@ def prepare_job(remote: RemoteQueue, manifest: dict[str, object], job_root: Path
     return source_root, input_paths, values
 
 
-def child_limits(
-    nice: int,
-    timeout: int,
-    maximum_file_size: int,
-    maximum_memory: int,
-) -> None:
-    # Sandboxed or launchd-managed processes can have immutable hard limits.
-    # The parent still enforces wall time and validates result sizes, so a
-    # platform refusal here should not prevent an otherwise safe job.
-    for operation in (
-        lambda: os.nice(nice),
-        lambda: resource.setrlimit(resource.RLIMIT_CPU, (timeout + 30, timeout + 60)),
-        lambda: resource.setrlimit(
-            resource.RLIMIT_FSIZE, (maximum_file_size, maximum_file_size)
-        ),
-        lambda: resource.setrlimit(
-            resource.RLIMIT_AS, (maximum_memory, maximum_memory)
-        ),
-        lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256)),
-    ):
-        try:
-            operation()
-        except (OSError, ValueError):
-            pass
-
-
 def child_resource_usage(usage, wall_seconds: float) -> dict[str, object]:
     """Return usage for one waited job process, safe under concurrent slots."""
     user_seconds = max(0.0, usage.ru_utime)
@@ -1077,30 +1053,6 @@ def wait_for_analysis_process(
     )
 
 
-def limited_child_main(argv: Sequence[str]) -> int:
-    """Apply per-job limits in a single-threaded helper, then exec argv."""
-    if len(argv) < 6 or argv[4] != "--":
-        print("van-compute-worker: invalid internal child invocation", file=sys.stderr)
-        return 125
-    try:
-        nice, timeout, maximum_file_size, maximum_memory = map(int, argv[:4])
-        child_pythonpath = os.environ.pop("VAN_COMPUTE_CHILD_PYTHONPATH", None)
-        child_limits(nice, timeout, maximum_file_size, maximum_memory)
-        command = list(argv[5:])
-        if not command:
-            raise WorkerError("internal child command is empty")
-        # The helper interpreter must not start with untrusted snapshotted
-        # source on sys.path: sitecustomize would run before limits/sandboxing.
-        # Add it only at the final exec boundary, where sandbox-exec comes first.
-        if child_pythonpath is not None:
-            os.environ["PYTHONPATH"] = child_pythonpath
-        os.execvpe(command[0], command, os.environ)
-    except (OSError, ValueError, WorkerError) as exc:
-        print(f"van-compute-worker child: {exc}", file=sys.stderr)
-        return 126
-    return 126
-
-
 def sandbox_command(
     command: Sequence[str],
     *,
@@ -1120,7 +1072,7 @@ def sandbox_command(
     if not sandbox.is_file():
         raise WorkerError("sandbox-exec was requested but is unavailable")
     parameters = {
-        "WORKER_ROOT": Path(__file__).resolve().parents[3],
+        "WORKER_ROOT": WORKER_ROOT,
         "JOB_ROOT": job_root,
         "SOURCE_ROOT": source_root,
         "INPUT_ROOT": job_root / "inputs",
@@ -1181,7 +1133,7 @@ def scrub_private_paths(
     replacements.extend(
         (
             (str(job_root).encode(), b"{job}"),
-            (str(Path(__file__).resolve().parents[3]).encode(), b"{worker-root}"),
+            (str(WORKER_ROOT).encode(), b"{worker-root}"),
             (str(Path.home()).encode(), b"{mac-home}"),
         )
     )
@@ -1309,8 +1261,8 @@ def execute_job(
     )
     child_command = [
         sys.executable,
-        str(Path(__file__).resolve()),
-        "__exec__",
+        str(Path(limited_child.__file__).resolve()),
+        "worker",
         str(nice),
         str(timeout),
         str(maximum_file_size),
@@ -2241,8 +2193,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     raw_arguments = list(argv) if argv is not None else sys.argv[1:]
-    if raw_arguments and raw_arguments[0] == "__exec__":
-        return limited_child_main(raw_arguments[1:])
     os.umask(0o077)
     parser = build_parser()
     args = parser.parse_args(raw_arguments)

@@ -12,54 +12,40 @@ from van_compute import protocol
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
-COMPUTE_ROOT = REPOSITORY_ROOT / "pi" / "van_compute"
+COMPUTE_ROOT = REPOSITORY_ROOT / "van_compute"
 SYNC_SCRIPT = REPOSITORY_ROOT / "pi" / "sync_scripts.sh"
 INSTALLER = REPOSITORY_ROOT / "macbook" / "scripts" / "install_van_compute_worker.zsh"
-WORKER = REPOSITORY_ROOT / "macbook" / "scripts" / "van_compute_worker.py"
-QUEUE_CLI = REPOSITORY_ROOT / "pi" / "van_compute" / "scripts" / "van_compute.py"
-UPGRADE_GATE = (
-    REPOSITORY_ROOT
-    / "pi"
-    / "van_compute"
-    / "scripts"
-    / "van_compute_upgrade_gate.py"
-)
-PROTOCOL = (
-    REPOSITORY_ROOT / "pi" / "van_compute" / "scripts" / "van_compute_protocol.py"
-)
-EXAMPLE_TASKS = (
-    REPOSITORY_ROOT
-    / "pi"
-    / "van_compute"
-    / "configs"
-    / "van-compute-obd.example.json"
-)
+QUEUE_CLI = COMPUTE_ROOT / "entrypoints" / "van_compute.py"
+FRONTEND_CLI = COMPUTE_ROOT / "entrypoints" / "pi_compute.py"
+UPGRADE_GATE = COMPUTE_ROOT / "upgrade_gate.py"
+EXAMPLE_TASKS = COMPUTE_ROOT / "configs" / "van-compute-obd.example.json"
 DASHBOARD_SERVICE = REPOSITORY_ROOT / "pi" / "services" / "van-dashboard.service"
-BROKER_SERVICE = (
-    REPOSITORY_ROOT
-    / "pi"
-    / "van_compute"
-    / "configs"
-    / "van-compute-broker.service"
-)
+BROKER_SERVICE = COMPUTE_ROOT / "configs" / "van-compute-broker.service"
 UPDATE_SERVICES = REPOSITORY_ROOT / "pi" / "scripts" / "update_services.sh"
 
 
 class VanComputeDeploymentTests(unittest.TestCase):
     def test_compute_deployment_sources_have_one_repository_root(self):
         for relative in (
-            "scripts/pi_compute.py",
-            "scripts/van_compute.py",
-            "scripts/van_compute_broker.py",
-            "scripts/van_compute_metrics.py",
-            "scripts/van_compute_protocol.py",
-            "scripts/van_compute_upgrade_gate.py",
+            "__init__.py",
+            "queue.py",
+            "protocol.py",
+            "frontend.py",
+            "broker.py",
+            "metrics.py",
+            "worker.py",
+            "upgrade_gate.py",
+            "limited_child.py",
+            "entrypoints/pi_compute.py",
+            "entrypoints/van_compute.py",
             "configs/van-compute-broker.service",
             "configs/van-compute-obd.example.json",
         ):
             self.assertTrue((COMPUTE_ROOT / relative).is_file(), relative)
 
         for retired in (
+            REPOSITORY_ROOT / "pi" / "van_compute",
+            REPOSITORY_ROOT / "macbook" / "scripts" / "van_compute_worker.py",
             REPOSITORY_ROOT / "pi" / "scripts" / "compute",
             REPOSITORY_ROOT / "pi" / "services" / "van-compute-broker.service",
             REPOSITORY_ROOT / "pi" / "configs" / "van-compute-obd.example.json",
@@ -76,7 +62,16 @@ class VanComputeDeploymentTests(unittest.TestCase):
         )
         self.assertNotIn("/run/systemd", inaccessible.split())
         self.assertIn("RestrictAddressFamilies=AF_UNIX AF_NETLINK", service)
-        self.assertIn("/home/pi/van_compute/scripts/van_compute_broker.py", service)
+        self.assertIn(
+            "ExecStartPre=/usr/bin/python3 -P -m van_compute.broker --self-test",
+            service,
+        )
+        self.assertIn(
+            "ExecStart=/usr/bin/python3 -P -m van_compute.broker",
+            service,
+        )
+        self.assertIn("Environment=PYTHONPATH=/home/pi/van_compute/current", service)
+        self.assertIn("Environment=PYTHONDONTWRITEBYTECODE=1", service)
         self.assertIn("/home/pi/van_compute/venv/bin/python3", service)
         self.assertNotIn("/home/pi/scripts/compute", service)
         self.assertIn("TasksMax=256", service)
@@ -153,54 +148,111 @@ class VanComputeDeploymentTests(unittest.TestCase):
             "example tasks are not installed under /home/pi/van_compute/configs",
         )
 
-    def test_deployed_queue_cli_finds_sibling_protocol_without_repo_path(self):
+    def test_deployed_entrypoints_use_installed_release_and_upgrade_gate(self):
+        self.assertEqual(QUEUE_CLI.read_bytes().splitlines()[0], b"#!/usr/bin/python3 -P")
+        self.assertEqual(
+            FRONTEND_CLI.read_bytes().splitlines()[0], b"#!/usr/bin/python3 -P"
+        )
         with tempfile.TemporaryDirectory() as directory:
-            compute = Path(directory) / "compute"
-            compute.mkdir(parents=True)
-            shutil.copy2(QUEUE_CLI, compute / "van_compute.py")
-            shutil.copy2(PROTOCOL, compute / "van_compute_protocol.py")
+            root = Path(directory)
+            pi_root = root / "pi"
+            scripts = pi_root / "scripts"
+            release = pi_root / "releases" / "r1"
+            package = release / "van_compute"
+            current = pi_root / "current"
+            outside = root / "outside"
+            scripts.mkdir(parents=True)
+            release.mkdir(parents=True)
+            outside.mkdir()
+            shutil.copytree(COMPUTE_ROOT, package)
+            current.symlink_to(Path("releases") / "r1", target_is_directory=True)
+            queue_script = scripts / "van_compute.py"
+            frontend_script = scripts / "pi_compute.py"
+            shutil.copy2(QUEUE_CLI, queue_script)
+            shutil.copy2(FRONTEND_CLI, frontend_script)
 
             environment = os.environ.copy()
             environment.pop("PYTHONPATH", None)
-            result = subprocess.run(
-                [sys.executable, str(compute / "van_compute.py"), "--help"],
-                cwd=directory,
+            for script in (queue_script, frontend_script):
+                result = subprocess.run(
+                    [sys.executable, "-P", str(script), "--help"],
+                    cwd=outside,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("usage:", result.stdout)
+
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-P",
+                    "-c",
+                    (
+                        "import runpy, sys\n"
+                        "script = sys.argv[1]\n"
+                        "sys.argv = [script, '--help']\n"
+                        "try:\n"
+                        "    runpy.run_path(script, run_name='__main__')\n"
+                        "except SystemExit as exc:\n"
+                        "    assert exc.code == 0, exc.code\n"
+                        "import van_compute\n"
+                        "print(van_compute.__file__)\n"
+                    ),
+                    str(queue_script),
+                ],
+                cwd=outside,
                 env=environment,
                 capture_output=True,
                 text=True,
                 timeout=10,
                 check=False,
             )
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            imported = Path(probe.stdout.splitlines()[-1]).resolve()
+            self.assertTrue(imported.is_relative_to(current.resolve()), imported)
+            self.assertFalse(imported.is_relative_to(REPOSITORY_ROOT), imported)
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("usage:", result.stdout)
+            gate_marker = b"UPGRADE_GATE = True"
+            self.assertIn(gate_marker, UPGRADE_GATE.read_bytes().splitlines())
+            shutil.copy2(UPGRADE_GATE, queue_script)
+            expected_gate_message = (
+                "van-compute is being upgraded; retry this command shortly\n"
+            )
+            for command in (
+                [str(queue_script), "submit", "repo-tests"],
+                [str(frontend_script), "run", "repo-tests"],
+                [str(frontend_script), "tasks"],
+            ):
+                result = subprocess.run(
+                    [sys.executable, "-P", *command],
+                    cwd=outside,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 75, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, expected_gate_message)
 
     def test_mac_release_contains_the_worker_protocol_package(self):
         with tempfile.TemporaryDirectory() as directory:
             app = Path(directory) / "app"
-            worker_dir = app / "macbook" / "scripts"
-            package_dir = app / "pi" / "van_compute" / "scripts"
-            worker_dir.mkdir(parents=True)
-            package_dir.mkdir(parents=True)
-            shutil.copy2(WORKER, worker_dir / "van_compute_worker.py")
-            shutil.copy2(
-                COMPUTE_ROOT / "__init__.py",
-                package_dir.parent / "__init__.py",
-            )
-            shutil.copy2(
-                COMPUTE_ROOT / "scripts" / "__init__.py",
-                package_dir / "__init__.py",
-            )
-            shutil.copy2(PROTOCOL, package_dir / "van_compute_protocol.py")
+            package_dir = app / "van_compute"
+            package_dir.parent.mkdir(parents=True)
+            shutil.copytree(COMPUTE_ROOT, package_dir)
 
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(app)
             result = subprocess.run(
-                [
-                    sys.executable,
-                    "-I",
-                    str(worker_dir / "van_compute_worker.py"),
-                    "--help",
-                ],
+                [sys.executable, "-P", "-m", "van_compute.worker", "--help"],
                 cwd=directory,
+                env=environment,
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -218,7 +270,7 @@ class VanComputeDeploymentTests(unittest.TestCase):
 
         pythonpath = environment.get("PYTHONPATH", "").split(":")
         self.assertIn("/home/pi/scripts/python-packages/current", pythonpath)
-        self.assertIn("/home/pi/van_compute/scripts", pythonpath)
+        self.assertIn("/home/pi/van_compute/current", pythonpath)
 
         pre_commands = [
             command_arguments(value) for value in directives.get("ExecStartPre", [])
@@ -227,7 +279,7 @@ class VanComputeDeploymentTests(unittest.TestCase):
             [
                 "/usr/bin/test",
                 "-r",
-                "/home/pi/van_compute/scripts/van_compute_metrics.py",
+                "/home/pi/van_compute/current/van_compute/metrics.py",
             ],
             pre_commands,
         )
@@ -266,7 +318,13 @@ class VanComputeDeploymentTests(unittest.TestCase):
                 destination = staged / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(REPOSITORY_ROOT / relative, destination)
-            (staged / "van_compute_metrics.py").write_text(
+            metrics_package = staged / "van_compute"
+            metrics_package.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(
+                COMPUTE_ROOT / "__init__.py",
+                metrics_package / "__init__.py",
+            )
+            (metrics_package / "metrics.py").write_text(
                 "class ComputeMetricsError(RuntimeError):\n"
                 "    pass\n\n"
                 "class ComputeMetricsReader:\n"
@@ -286,7 +344,7 @@ class VanComputeDeploymentTests(unittest.TestCase):
                     "-c",
                     (
                         "import os; "
-                        "import van_compute_metrics as metrics; "
+                        "from van_compute import metrics; "
                         "assert {name for name in vars(metrics) if not name.startswith('_')} "
                         "== {'ComputeMetricsError', 'ComputeMetricsReader'}; "
                         "assert not hasattr(metrics, 'TASK_NAME_RE'); "

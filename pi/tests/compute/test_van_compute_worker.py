@@ -13,7 +13,7 @@ import threading
 import unittest
 from unittest import mock
 
-from van_compute import worker
+from van_compute import limited_child, worker
 
 
 CHILD_ENV_SCRIPT = """import json
@@ -1105,8 +1105,8 @@ Path(args.json).write_text(json.dumps({'bytes': Path(args.capture).stat().st_siz
                 helper_command[:8],
                 [
                     sys.executable,
-                    str(Path(worker.__file__).resolve()),
-                    "__exec__",
+                    str(Path(limited_child.__file__).resolve()),
+                    "worker",
                     "0",
                     "30",
                     str(1024 * 1024),
@@ -1211,8 +1211,8 @@ Path(args.json).write_text(json.dumps({
             result = subprocess.run(
                 [
                     sys.executable,
-                    str(Path(worker.__file__).resolve()),
-                    "__exec__",
+                    str(Path(limited_child.__file__).resolve()),
+                    "worker",
                     "0",
                     "5",
                     str(1024 * 1024),
