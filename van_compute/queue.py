@@ -28,16 +28,8 @@ import time
 from typing import BinaryIO, Iterator, Sequence
 
 
-def _import_protocol():
-    if __package__:
-        from pi.van_compute.scripts import van_compute_protocol as protocol
-    else:
-        import van_compute_protocol as protocol
+from van_compute import protocol
 
-    return protocol
-
-
-protocol = _import_protocol()
 
 DEFAULT_SOURCE_ROOT = Path("/home/pi/dev/obd-things")
 DEFAULT_QUEUE_ROOT = DEFAULT_SOURCE_ROOT / "tmp" / "compute"

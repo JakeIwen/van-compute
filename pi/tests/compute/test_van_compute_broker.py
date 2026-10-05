@@ -12,10 +12,10 @@ import time
 import unittest
 from unittest import mock
 
-from pi.van_compute.scripts import pi_compute
-from pi.van_compute.scripts import van_compute as queue
-from pi.van_compute.scripts import van_compute_broker as broker
-from pi.van_compute.scripts import van_compute_protocol as protocol
+from van_compute import frontend as pi_compute
+from van_compute import queue
+from van_compute import broker
+from van_compute import protocol
 
 
 CHILD_ENV_SCRIPT = """import json

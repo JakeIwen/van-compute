@@ -8,7 +8,7 @@ import unittest
 
 from pi import deploy_python
 from pi.tests.unit_contract import command_arguments, parse_directives, parse_environment
-from pi.van_compute.scripts import van_compute_protocol as protocol
+from van_compute import protocol
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]

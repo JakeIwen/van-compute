@@ -18,16 +18,8 @@ import sys
 from typing import Sequence
 
 
-def _import_queue():
-    if __package__:
-        from pi.van_compute.scripts import van_compute as queue_module
-    else:
-        import van_compute as queue_module
+from van_compute import queue
 
-    return queue_module
-
-
-queue = _import_queue()
 protocol = queue.protocol
 MAX_WAIT_SECONDS = 24 * 60 * 60
 MAX_INLINE_OUTPUT = 256 * 1024

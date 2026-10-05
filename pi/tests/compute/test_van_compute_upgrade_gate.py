@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from pi.van_compute.scripts import van_compute_upgrade_gate as gate
+from van_compute import upgrade_gate as gate
 
 
 class VanComputeUpgradeGateTests(unittest.TestCase):

@@ -38,9 +38,7 @@ import time
 from typing import BinaryIO, Callable, Mapping, Sequence
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO_ROOT))
-from pi.van_compute.scripts import van_compute_protocol as protocol
+from van_compute import protocol
 
 
 DEFAULT_HOST = "pi@vanpi.lan"

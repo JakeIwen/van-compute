@@ -13,7 +13,7 @@ import threading
 import unittest
 from unittest import mock
 
-from macbook.scripts import van_compute_worker as worker
+from van_compute import worker
 
 
 CHILD_ENV_SCRIPT = """import json

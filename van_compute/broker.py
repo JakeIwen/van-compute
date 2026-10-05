@@ -39,16 +39,8 @@ import time
 from typing import Callable, Mapping, Sequence
 
 
-def _import_queue():
-    if __package__:
-        from pi.van_compute.scripts import van_compute as queue_module
-    else:
-        import van_compute as queue_module
+from van_compute import queue
 
-    return queue_module
-
-
-queue = _import_queue()
 protocol = queue.protocol
 
 LOCAL_WORKER = "vanpi-local.00"

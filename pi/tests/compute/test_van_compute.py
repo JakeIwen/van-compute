@@ -10,10 +10,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from macbook.scripts import van_compute_worker as worker
-from pi.van_compute.scripts import van_compute as queue
-from pi.van_compute.scripts import van_compute_metrics as metrics
-from pi.van_compute.scripts import van_compute_protocol as protocol
+from van_compute import worker
+from van_compute import queue
+from van_compute import metrics
+from van_compute import protocol
 
 
 SUMMARY_STUB = """#!/usr/bin/env python3

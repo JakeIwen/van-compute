@@ -60,15 +60,15 @@ from unittest import mock
 from flask import Flask, jsonify
 
 # The ONE import/location indirection point for the subsequent package move.
-from pi.van_compute.scripts import van_compute as queue
-from pi.van_compute.scripts import van_compute_protocol as protocol
-from pi.van_compute.scripts import van_compute_broker as broker
-from pi.van_compute.scripts import van_compute_metrics as metrics
-from pi.van_compute.scripts import pi_compute as frontend
-from macbook.scripts import van_compute_worker as worker
+from van_compute import queue
+from van_compute import protocol
+from van_compute import broker
+from van_compute import metrics
+from van_compute import frontend
+from van_compute import worker
 from pi.tests.compute import test_van_compute as queue_tests
 from pi.tests.compute import test_van_compute_broker as broker_tests
-EXAMPLE = Path(queue.__file__).resolve().parents[1] / "configs/van-compute-obd.example.json"
+EXAMPLE = Path(queue.__file__).resolve().parent / "configs/van-compute-obd.example.json"
 
 GOLDEN_ROOT = Path(__file__).with_name("golden")
 EPOCH = dt.datetime(2026, 7, 22, 12, 0, tzinfo=dt.timezone.utc)
