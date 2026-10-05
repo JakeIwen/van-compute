@@ -1,0 +1,75 @@
+[
+  {
+    "argv": [
+      "worker",
+      "claim",
+      "--worker",
+      "golden-mac.00",
+      "--protocol-version",
+      "2"
+    ],
+    "stdin_base64": ""
+  },
+  {
+    "argv": [
+      "worker",
+      "put-result",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--path",
+      "stderr.txt",
+      "--lease-token",
+      "00000000000000000000000000000002"
+    ],
+    "stdin_base64": "dmFuLWNvbXB1dGUgd29ya2VyOiBPU0Vycm9yOiBmaXh0dXJlIHNvdXJjZSB1bmF2YWlsYWJsZQo="
+  },
+  {
+    "argv": [
+      "worker",
+      "put-result",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--path",
+      "stdout.txt",
+      "--lease-token",
+      "00000000000000000000000000000002"
+    ],
+    "stdin_base64": ""
+  },
+  {
+    "argv": [
+      "worker",
+      "put-result",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--path",
+      "execution.json",
+      "--lease-token",
+      "00000000000000000000000000000002"
+    ],
+    "stdin_base64": "ewogICJleGl0X2NvZGUiOiA3MCwKICAiZmluaXNoZWRfYXQiOiAiMjAyNi0wNy0yMlQxMjowMDowNCswMDowMCIsCiAgImpvYl9pZCI6ICIyMDI2MDcyMlQxMjAwMDBaLTAwMDAwMDAxIiwKICAicGxhY2VtZW50IjogInJlbW90ZSIsCiAgInNjaGVtYV92ZXJzaW9uIjogMSwKICAidGFzayI6ICJnb2xkZW4tZmlsZSIsCiAgInRpbWluZyI6IHsKICAgICJhbmFseXNpc19zZWNvbmRzIjogMC4wLAogICAgInBhY2thZ2luZ19ub3RlIjogInZhbGlkYXRpb24sIHJlZGFjdGlvbiwgcmVzdWx0IGVudW1lcmF0aW9uLCBhbmQgZGlyZWN0b3J5IGFyY2hpdmluZzsgZXhjbHVkZXMgZmluYWwgdGVsZW1ldHJ5IHNlcmlhbGl6YXRpb24iLAogICAgInBhY2thZ2luZ19zZWNvbmRzIjogMC4xMjUsCiAgICAicmVzb3VyY2VfYWRtaXNzaW9uX3NlY29uZHMiOiAwLjEyNSwKICAgICJyZXN1bHRfdXBsb2FkX3NlY29uZHNfZXhjbHVkaW5nX2V4ZWN1dGlvbl9qc29uIjogMC4xMjUsCiAgICAic291cmNlX2lucHV0X3ByZXBhcmF0aW9uX3NlY29uZHMiOiAwLjM3NSwKICAgICJ3b3JrZXJfYXR0ZW1wdF9hY3RpdmVfbm90ZSI6ICJmcm9tIHBvc3QtY2xhaW0gc3RhZ2luZyB0aHJvdWdoIG5vbi10ZWxlbWV0cnkgcmVzdWx0IHVwbG9hZHM7IGV4Y2x1ZGVzIGZpbmFsIGV4ZWN1dGlvbi5qc29uIHVwbG9hZCBhbmQgcXVldWUgZmluaXNoIiwKICAgICJ3b3JrZXJfYXR0ZW1wdF9hY3RpdmVfc2Vjb25kcyI6IDEuMTI1CiAgfSwKICAid29ya2VyIjogImdvbGRlbi1tYWMuMDAiLAogICJ3b3JrZXJfZXJyb3IiOiAiZml4dHVyZSBzb3VyY2UgdW5hdmFpbGFibGUiCn0K"
+  },
+  {
+    "argv": [
+      "worker",
+      "finish",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--exit-code",
+      "70",
+      "--result-file",
+      "stderr.txt",
+      "--result-file",
+      "stdout.txt",
+      "--result-file",
+      "execution.json",
+      "--lease-token",
+      "00000000000000000000000000000002"
+    ],
+    "stdin_base64": ""
+  }
+]

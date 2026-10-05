@@ -1,0 +1,61 @@
+{
+  "command": {
+    "arguments": [
+      "--fail"
+    ],
+    "argv_template": [
+      "{source:tools/offline.py}",
+      "{input:0}",
+      "--output",
+      "{result:report.json}",
+      "{arguments}"
+    ],
+    "datasets": [],
+    "family": "python",
+    "kind": "repo-task",
+    "profile": "python-script"
+  },
+  "duration_scope": "analysis child execution plus descendant process-group cleanup",
+  "duration_seconds": 0.125,
+  "exit_code": 7,
+  "finished_at": "2026-07-22T12:00:05+00:00",
+  "input_bytes": 29,
+  "interrupted": false,
+  "job_id": "20260722T120000Z-00000001",
+  "placement": "remote",
+  "resource_limit": null,
+  "resource_monitor_error": null,
+  "resource_usage": {
+    "average_cpu_percent": 75.0,
+    "cpu_seconds": 0.09375,
+    "involuntary_context_switches": 4,
+    "major_page_faults": 2,
+    "minimum_filesystem_free_bytes": 17179869184,
+    "minor_page_faults": 11,
+    "peak_process_count": 2,
+    "peak_process_group_rss_bytes": 12582912,
+    "peak_rss_bytes": 8388608,
+    "peak_rss_note": "wait4 maximum resident set; concurrent descendant RSS is not summed",
+    "process_group_watchdog_interval_seconds": 1.0,
+    "scope": "wait4 resource usage for the analysis process",
+    "system_cpu_seconds": 0.03125,
+    "user_cpu_seconds": 0.0625,
+    "voluntary_context_switches": 3
+  },
+  "schema_version": 1,
+  "source_bytes": 1824,
+  "started_at": "2026-07-22T12:00:04+00:00",
+  "task": "golden-file",
+  "timed_out": false,
+  "timing": {
+    "analysis_seconds": 0.125,
+    "packaging_note": "validation, redaction, result enumeration, and directory archiving; excludes final telemetry serialization",
+    "packaging_seconds": 0.125,
+    "resource_admission_seconds": 0.125,
+    "result_upload_seconds_excluding_execution_json": 0.125,
+    "source_input_preparation_seconds": 0.375,
+    "worker_attempt_active_note": "from post-claim staging through non-telemetry result uploads; excludes final execution.json upload and queue finish",
+    "worker_attempt_active_seconds": 1.625
+  },
+  "worker": "golden-mac.00"
+}

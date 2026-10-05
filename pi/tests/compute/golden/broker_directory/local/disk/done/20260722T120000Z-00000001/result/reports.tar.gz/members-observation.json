@@ -1,0 +1,30 @@
+[
+  {
+    "gid": 20,
+    "gname": "golden",
+    "mode": 448,
+    "mtime": 1784721600.0,
+    "name": "reports",
+    "pax_headers": {
+      "mtime": "1784721600.0"
+    },
+    "size": 0,
+    "type": "5",
+    "uid": 501,
+    "uname": "golden"
+  },
+  {
+    "gid": 20,
+    "gname": "golden",
+    "mode": 384,
+    "mtime": 1784721600.0,
+    "name": "reports/report.json",
+    "pax_headers": {
+      "mtime": "1784721600.0"
+    },
+    "size": 35,
+    "type": "0",
+    "uid": 501,
+    "uname": "golden"
+  }
+]

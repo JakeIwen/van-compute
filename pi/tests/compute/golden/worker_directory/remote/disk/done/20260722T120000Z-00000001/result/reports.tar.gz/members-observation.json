@@ -1,0 +1,26 @@
+[
+  {
+    "gid": 0,
+    "gname": "",
+    "mode": 448,
+    "mtime": 0,
+    "name": "reports",
+    "pax_headers": {},
+    "size": 0,
+    "type": "5",
+    "uid": 0,
+    "uname": ""
+  },
+  {
+    "gid": 0,
+    "gname": "",
+    "mode": 384,
+    "mtime": 0,
+    "name": "reports/report.json",
+    "pax_headers": {},
+    "size": 35,
+    "type": "0",
+    "uid": 0,
+    "uname": ""
+  }
+]

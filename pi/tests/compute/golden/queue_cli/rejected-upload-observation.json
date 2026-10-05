@@ -1,0 +1,5 @@
+{
+  "exit_code": 2,
+  "stderr": "van-compute: lease token does not own this job\n",
+  "stdout": ""
+}

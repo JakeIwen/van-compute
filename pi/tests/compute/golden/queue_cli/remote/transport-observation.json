@@ -1,0 +1,77 @@
+[
+  {
+    "argv": [
+      "worker",
+      "claim",
+      "--worker",
+      "golden-mac.00",
+      "--protocol-version",
+      "2"
+    ],
+    "stdin_base64": ""
+  },
+  {
+    "argv": [
+      "worker",
+      "stream",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--kind",
+      "input",
+      "--index",
+      "0",
+      "--lease-token",
+      "00000000000000000000000000000003"
+    ],
+    "stdin_base64": "",
+    "stdout_bytes": 29,
+    "stdout_sha256": "bb0d0b03d0fd05eef502b2dab21ebcffb99154d20dd0ce85cb862d444588d6c3"
+  },
+  {
+    "argv": [
+      "worker",
+      "stream",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--kind",
+      "source-bundle",
+      "--lease-token",
+      "00000000000000000000000000000003"
+    ],
+    "stdin_base64": "",
+    "stdout_bytes": 10240,
+    "stdout_sha256": "4751ef48b622876801ddfa26c0cd9bf4649b4a806eafdff0a17763a41772c16c"
+  },
+  {
+    "argv": [
+      "worker",
+      "put-result",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--path",
+      "summary.json",
+      "--lease-token",
+      "00000000000000000000000000000003"
+    ],
+    "stdin_base64": "ewogICJieXRlcyI6IDI3LAogICJyYXRpbyI6IDEuMjUKfQo="
+  },
+  {
+    "argv": [
+      "worker",
+      "finish",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--exit-code",
+      "0",
+      "--result-file",
+      "summary.json",
+      "--lease-token",
+      "00000000000000000000000000000003"
+    ],
+    "stdin_base64": ""
+  }
+]

@@ -1,0 +1,31 @@
+{
+  "execution": {
+    "exit_code": 70,
+    "finished_at": "2026-07-22T12:00:04+00:00",
+    "job_id": "20260722T120000Z-00000001",
+    "placement": "remote",
+    "schema_version": 1,
+    "task": "golden-file",
+    "timing": {
+      "analysis_seconds": 0.0,
+      "packaging_note": "validation, redaction, result enumeration, and directory archiving; excludes final telemetry serialization",
+      "packaging_seconds": 0.125,
+      "resource_admission_seconds": 0.125,
+      "result_upload_seconds_excluding_execution_json": 0.125,
+      "source_input_preparation_seconds": 0.375,
+      "worker_attempt_active_note": "from post-claim staging through non-telemetry result uploads; excludes final execution.json upload and queue finish",
+      "worker_attempt_active_seconds": 1.125
+    },
+    "worker": "golden-mac.00",
+    "worker_error": "fixture source unavailable"
+  },
+  "job": "20260722T120000Z-00000001",
+  "ok": false,
+  "results": [
+    "stderr.txt",
+    "stdout.txt",
+    "execution.json"
+  ],
+  "state": "failed",
+  "worker": "golden-mac.00"
+}

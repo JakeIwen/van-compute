@@ -1,0 +1,296 @@
+{
+  "tasks": [
+    {
+      "accepts_arguments": true,
+      "datasets": [],
+      "description": "Stream and summarize one saved candump log.",
+      "input_values": false,
+      "maximum_inputs": 1,
+      "minimum_inputs": 1,
+      "name": "can-capture-summary",
+      "origin": "built-in",
+      "outputs": [
+        "summary.json"
+      ]
+    },
+    {
+      "accepts_arguments": true,
+      "datasets": [],
+      "description": "Compare two can-capture-summary JSON reports.",
+      "input_values": false,
+      "maximum_inputs": 2,
+      "minimum_inputs": 2,
+      "name": "can-capture-compare",
+      "origin": "built-in",
+      "outputs": [
+        "comparison.json"
+      ]
+    },
+    {
+      "accepts_arguments": true,
+      "datasets": [],
+      "description": "Rank scalar fields across two or more saved candump logs.",
+      "input_values": true,
+      "maximum_inputs": 16,
+      "minimum_inputs": 2,
+      "name": "can-field-finder",
+      "origin": "built-in",
+      "outputs": []
+    },
+    {
+      "accepts_arguments": true,
+      "datasets": [],
+      "description": "Run only the offline analyze half of signal_correlate.py.",
+      "input_values": false,
+      "maximum_inputs": 32,
+      "minimum_inputs": 1,
+      "name": "signal-correlate-analyze",
+      "origin": "built-in",
+      "outputs": []
+    },
+    {
+      "accepts_arguments": true,
+      "argv_template": [
+        "-q",
+        "tests",
+        "-k",
+        "alfaobd_dat",
+        "{arguments}"
+      ],
+      "datasets": [],
+      "description": "Run portable selected offline obd-things tests (AlfaOBD DAT smoke tests by default).",
+      "input_values": false,
+      "maximum_inputs": 0,
+      "minimum_inputs": 0,
+      "name": "repo-tests",
+      "origin": "repository",
+      "outputs": [],
+      "profile": "repo-test"
+    },
+    {
+      "accepts_arguments": false,
+      "argv_template": [
+        "{source:tools/alfaobd_apk_db.py}",
+        "{input:0}",
+        "--output",
+        "{result:alfaobd.db}",
+        "--labels-output",
+        "{result:alfaobd5_en.txt}"
+      ],
+      "datasets": [],
+      "description": "Extract the AlfaOBD SQLite catalog and English labels from a submitted APK.",
+      "input_values": false,
+      "maximum_inputs": 1,
+      "minimum_inputs": 1,
+      "name": "alfaobd-apk-extract",
+      "origin": "repository",
+      "outputs": [
+        "alfaobd.db",
+        "alfaobd5_en.txt"
+      ],
+      "profile": "python-script"
+    },
+    {
+      "accepts_arguments": false,
+      "argv_template": [
+        "{source:tools/alfaobd_dat.py}",
+        "{input:0}",
+        "--json",
+        "{result:dat-report.json}"
+      ],
+      "datasets": [],
+      "description": "Inventory one saved AlfaOBD plot-series DAT file.",
+      "input_values": false,
+      "maximum_inputs": 1,
+      "minimum_inputs": 1,
+      "name": "alfaobd-dat-inventory",
+      "origin": "repository",
+      "outputs": [
+        "dat-report.json"
+      ],
+      "profile": "python-script"
+    },
+    {
+      "accepts_arguments": false,
+      "argv_template": [
+        "{source:tools/alfaobd_dat.py}",
+        "{input:0}",
+        "--baseline",
+        "{input:1}",
+        "--json",
+        "{result:dat-comparison.json}"
+      ],
+      "datasets": [],
+      "description": "Compare current and baseline AlfaOBD plot-series DAT files.",
+      "input_values": false,
+      "maximum_inputs": 2,
+      "minimum_inputs": 2,
+      "name": "alfaobd-dat-compare",
+      "origin": "repository",
+      "outputs": [
+        "dat-comparison.json"
+      ],
+      "profile": "can-log-batch"
+    },
+    {
+      "accepts_arguments": false,
+      "argv_template": [
+        "{source:tools/alfaobd_gauges.py}",
+        "{input:0}",
+        "--out-dir",
+        "{result:gauge-reports}"
+      ],
+      "datasets": [],
+      "description": "Inventory an exported AlfaOBD Gauges_Data archive.",
+      "input_values": false,
+      "maximum_inputs": 1,
+      "minimum_inputs": 1,
+      "name": "alfaobd-gauge-inventory",
+      "origin": "repository",
+      "outputs": [
+        "gauge-reports"
+      ],
+      "profile": "python-script"
+    },
+    {
+      "accepts_arguments": true,
+      "argv_template": [
+        "{source:tools/alfaobd_catalog.py}",
+        "{input:0}",
+        "{input:1}",
+        "{arguments}",
+        "--output",
+        "{result:catalog.json}"
+      ],
+      "datasets": [],
+      "description": "Export read-only AlfaOBD catalog evidence from a database and label file.",
+      "input_values": false,
+      "maximum_inputs": 2,
+      "minimum_inputs": 2,
+      "name": "alfaobd-catalog-export",
+      "origin": "repository",
+      "outputs": [
+        "catalog.json"
+      ],
+      "profile": "python-script"
+    },
+    {
+      "accepts_arguments": true,
+      "argv_template": [
+        "-json",
+        "{input:0}",
+        "{arguments}"
+      ],
+      "datasets": [],
+      "description": "Run one read-only SQL query against a submitted SQLite database.",
+      "input_values": false,
+      "maximum_inputs": 1,
+      "minimum_inputs": 1,
+      "name": "sqlite-query",
+      "origin": "repository",
+      "outputs": [],
+      "profile": "sqlite-readonly"
+    },
+    {
+      "accepts_arguments": true,
+      "argv_template": [
+        "--line-number",
+        "--smart-case",
+        "{arguments}",
+        "{dataset:oem-service-docs}"
+      ],
+      "datasets": [
+        "oem-service-docs"
+      ],
+      "description": "Search the configured read-only OEM service-document corpus.",
+      "input_values": false,
+      "maximum_inputs": 0,
+      "minimum_inputs": 0,
+      "name": "oem-corpus-search",
+      "origin": "repository",
+      "outputs": [],
+      "profile": "corpus-search"
+    },
+    {
+      "accepts_arguments": true,
+      "argv_template": [
+        "--output-dir",
+        "{result:jadx}",
+        "{arguments}",
+        "{input:0}"
+      ],
+      "datasets": [],
+      "description": "Decompile a submitted APK into a returned JADX archive.",
+      "input_values": false,
+      "maximum_inputs": 1,
+      "minimum_inputs": 1,
+      "name": "apk-decompile",
+      "origin": "repository",
+      "outputs": [
+        "jadx"
+      ],
+      "profile": "apk-analyze"
+    },
+    {
+      "accepts_arguments": false,
+      "argv_template": [
+        "{source:tools/candump_diagnostic_wire.py}",
+        "tcm",
+        "--allow-van-compute-result",
+        "--output",
+        "{result:tcm_wire.jsonl}",
+        "{inputs}"
+      ],
+      "datasets": [],
+      "description": "Extract exact physical TCM 22/62 exchanges from 1-512 chronological saved C-CAN chunks.",
+      "input_values": false,
+      "maximum_inputs": 512,
+      "minimum_inputs": 1,
+      "name": "candump-diagnostic-wire-tcm",
+      "origin": "repository",
+      "outputs": [
+        "tcm_wire.jsonl",
+        "tcm_wire.summary.json"
+      ],
+      "profile": "can-log-batch"
+    },
+    {
+      "accepts_arguments": true,
+      "argv_template": [
+        "{source:tools/can_timeseries_correlate.py}",
+        "--module",
+        "tcm",
+        "--wire",
+        "{input:0}",
+        "{arguments}",
+        "--match",
+        "nearest",
+        "--radius-ms",
+        "100",
+        "--minimum-samples",
+        "20",
+        "--minimum-coverage",
+        "0.5",
+        "--minimum-distinct",
+        "4",
+        "--top",
+        "100",
+        "--allow-van-compute-result",
+        "--output",
+        "{result:report.json}",
+        "{inputs:1}"
+      ],
+      "datasets": [],
+      "description": "Correlate one TCM wire DID stream against 1-512 chronological saved C-CAN chunks.",
+      "input_values": false,
+      "maximum_inputs": 513,
+      "minimum_inputs": 2,
+      "name": "can-timeseries-correlate-tcm",
+      "origin": "repository",
+      "outputs": [
+        "report.json"
+      ],
+      "profile": "can-log-batch"
+    }
+  ]
+}

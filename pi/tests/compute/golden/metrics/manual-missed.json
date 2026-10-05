@@ -1,0 +1,12 @@
+{
+  "cpu_seconds": 1.625,
+  "duration_seconds": 3.875,
+  "id": "20260722T120018Z-00000006",
+  "input_bytes": 27,
+  "label": "golden unoffloaded analysis",
+  "peak_rss_bytes": 16777216,
+  "profile": "python-script",
+  "reason": "worker-unavailable",
+  "recorded_at": "2026-07-22T12:00:19+00:00",
+  "schema_version": 1
+}

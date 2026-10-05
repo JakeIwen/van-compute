@@ -1,0 +1,8 @@
+{
+  "available": true,
+  "protocol_version": 2,
+  "seen_at": "2026-07-22T12:00:04+00:00",
+  "slots_busy": 0,
+  "slots_total": 10,
+  "worker": "golden-mac"
+}

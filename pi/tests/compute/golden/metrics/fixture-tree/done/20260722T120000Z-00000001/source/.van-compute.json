@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "argv": [
+        "{source:tools/offline.py}",
+        "{input:0}",
+        "--output",
+        "{result:report.json}",
+        "{arguments}"
+      ],
+      "description": "Deterministic offline protocol fixture.",
+      "maximum_inputs": 1,
+      "minimum_inputs": 1,
+      "name": "golden-file",
+      "outputs": [
+        "report.json"
+      ],
+      "profile": "python-script",
+      "source_paths": [
+        "tools/offline.py"
+      ]
+    },
+    {
+      "argv": [
+        "{source:tools/offline.py}",
+        "{input:0}",
+        "--output",
+        "{result:reports}",
+        "--directory",
+        "{arguments}"
+      ],
+      "description": "Deterministic offline protocol fixture.",
+      "maximum_inputs": 1,
+      "minimum_inputs": 1,
+      "name": "golden-directory",
+      "outputs": [
+        "reports"
+      ],
+      "profile": "python-script",
+      "source_paths": [
+        "tools/offline.py"
+      ]
+    }
+  ]
+}

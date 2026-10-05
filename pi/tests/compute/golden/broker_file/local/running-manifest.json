@@ -1,0 +1,59 @@
+{
+  "arguments": [],
+  "attempt": 1,
+  "description": "Deterministic offline protocol fixture.",
+  "execution": {
+    "argv": [
+      "{source:tools/offline.py}",
+      "{input:0}",
+      "--output",
+      "{result:report.json}",
+      "{arguments}"
+    ],
+    "datasets": [],
+    "family": "python",
+    "input_values": false,
+    "maximum_inputs": 1,
+    "minimum_inputs": 1,
+    "outputs": [
+      "report.json"
+    ],
+    "profile": "python-script"
+  },
+  "id": "20260722T120000Z-00000001",
+  "inputs": [
+    {
+      "ctime_ns": 1784721600000000000,
+      "device": 7,
+      "index": 0,
+      "inode": 1000,
+      "mtime_ns": 1784721600000000000,
+      "name": "capture.log",
+      "remote_path": "<TMP>/capture.log",
+      "sha256": "bb0d0b03d0fd05eef502b2dab21ebcffb99154d20dd0ce85cb862d444588d6c3",
+      "size": 29
+    }
+  ],
+  "lease_token": "00000000000000000000000000000002",
+  "placement": "pi-local",
+  "placement_reason": "remote-worker-lease-expired",
+  "schema_version": 1,
+  "source_root": "<TMP>/source",
+  "sources": [
+    {
+      "path": ".van-compute.json",
+      "sha256": "8b43f6a27bdc97b7a1520da898c9653eca0ed9859b765fc87939b6ade0cfe2c9",
+      "size": 983
+    },
+    {
+      "path": "tools/offline.py",
+      "sha256": "4eb97013fc4ad24fc748d1b7a1f8fcc6c571eab3931c6e891165fc2f3eb47d7f",
+      "size": 841
+    }
+  ],
+  "started_at": "2026-07-22T12:00:03+00:00",
+  "state": "running",
+  "submitted_at": "2026-07-22T12:00:01+00:00",
+  "task": "golden-file",
+  "worker": "vanpi-local.00"
+}

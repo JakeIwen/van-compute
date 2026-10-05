@@ -1,0 +1,125 @@
+[
+  {
+    "argv": [
+      "worker",
+      "claim",
+      "--worker",
+      "golden-mac.00",
+      "--protocol-version",
+      "2"
+    ],
+    "stdin_base64": ""
+  },
+  {
+    "argv": [
+      "worker",
+      "stream",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--kind",
+      "source-bundle",
+      "--lease-token",
+      "00000000000000000000000000000002"
+    ],
+    "stdin_base64": "",
+    "stdout_bytes": 10240,
+    "stdout_sha256": "0788edfbd6fe89cb6ef23833fb479358f02b66292217d34719cead0b7b368ee0"
+  },
+  {
+    "argv": [
+      "worker",
+      "stream",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--kind",
+      "input",
+      "--index",
+      "0",
+      "--lease-token",
+      "00000000000000000000000000000002"
+    ],
+    "stdin_base64": "",
+    "stdout_bytes": 29,
+    "stdout_sha256": "bb0d0b03d0fd05eef502b2dab21ebcffb99154d20dd0ce85cb862d444588d6c3"
+  },
+  {
+    "argv": [
+      "worker",
+      "put-result",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--path",
+      "report.json",
+      "--lease-token",
+      "00000000000000000000000000000002"
+    ],
+    "stdin_base64": "ewogICJieXRlcyI6IDI5LAogICJyYXRpbyI6IDEuMjUKfQo="
+  },
+  {
+    "argv": [
+      "worker",
+      "put-result",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--path",
+      "stderr.txt",
+      "--lease-token",
+      "00000000000000000000000000000002"
+    ],
+    "stdin_base64": ""
+  },
+  {
+    "argv": [
+      "worker",
+      "put-result",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--path",
+      "stdout.txt",
+      "--lease-token",
+      "00000000000000000000000000000002"
+    ],
+    "stdin_base64": "b2ZmbGluZSBhbmFseXNpcyBjb21wbGV0ZQpzb3VyY2U9e2pvYn0vc291cmNlCg=="
+  },
+  {
+    "argv": [
+      "worker",
+      "put-result",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--path",
+      "execution.json",
+      "--lease-token",
+      "00000000000000000000000000000002"
+    ],
+    "stdin_base64": "ewogICJjb21tYW5kIjogewogICAgImFyZ3VtZW50cyI6IFtdLAogICAgImFyZ3ZfdGVtcGxhdGUiOiBbCiAgICAgICJ7c291cmNlOnRvb2xzL29mZmxpbmUucHl9IiwKICAgICAgIntpbnB1dDowfSIsCiAgICAgICItLW91dHB1dCIsCiAgICAgICJ7cmVzdWx0OnJlcG9ydC5qc29ufSIsCiAgICAgICJ7YXJndW1lbnRzfSIKICAgIF0sCiAgICAiZGF0YXNldHMiOiBbXSwKICAgICJmYW1pbHkiOiAicHl0aG9uIiwKICAgICJraW5kIjogInJlcG8tdGFzayIsCiAgICAicHJvZmlsZSI6ICJweXRob24tc2NyaXB0IgogIH0sCiAgImR1cmF0aW9uX3Njb3BlIjogImFuYWx5c2lzIGNoaWxkIGV4ZWN1dGlvbiBwbHVzIGRlc2NlbmRhbnQgcHJvY2Vzcy1ncm91cCBjbGVhbnVwIiwKICAiZHVyYXRpb25fc2Vjb25kcyI6IDAuMTI1LAogICJleGl0X2NvZGUiOiAwLAogICJmaW5pc2hlZF9hdCI6ICIyMDI2LTA3LTIyVDEyOjAwOjA1KzAwOjAwIiwKICAiaW5wdXRfYnl0ZXMiOiAyOSwKICAiaW50ZXJydXB0ZWQiOiBmYWxzZSwKICAiam9iX2lkIjogIjIwMjYwNzIyVDEyMDAwMFotMDAwMDAwMDEiLAogICJwbGFjZW1lbnQiOiAicmVtb3RlIiwKICAicmVzb3VyY2VfbGltaXQiOiBudWxsLAogICJyZXNvdXJjZV9tb25pdG9yX2Vycm9yIjogbnVsbCwKICAicmVzb3VyY2VfdXNhZ2UiOiB7CiAgICAiYXZlcmFnZV9jcHVfcGVyY2VudCI6IDc1LjAsCiAgICAiY3B1X3NlY29uZHMiOiAwLjA5Mzc1LAogICAgImludm9sdW50YXJ5X2NvbnRleHRfc3dpdGNoZXMiOiA0LAogICAgIm1ham9yX3BhZ2VfZmF1bHRzIjogMiwKICAgICJtaW5pbXVtX2ZpbGVzeXN0ZW1fZnJlZV9ieXRlcyI6IDE3MTc5ODY5MTg0LAogICAgIm1pbm9yX3BhZ2VfZmF1bHRzIjogMTEsCiAgICAicGVha19wcm9jZXNzX2NvdW50IjogMiwKICAgICJwZWFrX3Byb2Nlc3NfZ3JvdXBfcnNzX2J5dGVzIjogMTI1ODI5MTIsCiAgICAicGVha19yc3NfYnl0ZXMiOiA4Mzg4NjA4LAogICAgInBlYWtfcnNzX25vdGUiOiAid2FpdDQgbWF4aW11bSByZXNpZGVudCBzZXQ7IGNvbmN1cnJlbnQgZGVzY2VuZGFudCBSU1MgaXMgbm90IHN1bW1lZCIsCiAgICAicHJvY2Vzc19ncm91cF93YXRjaGRvZ19pbnRlcnZhbF9zZWNvbmRzIjogMS4wLAogICAgInNjb3BlIjogIndhaXQ0IHJlc291cmNlIHVzYWdlIGZvciB0aGUgYW5hbHlzaXMgcHJvY2VzcyIsCiAgICAic3lzdGVtX2NwdV9zZWNvbmRzIjogMC4wMzEyNSwKICAgICJ1c2VyX2NwdV9zZWNvbmRzIjogMC4wNjI1LAogICAgInZvbHVudGFyeV9jb250ZXh0X3N3aXRjaGVzIjogMwogIH0sCiAgInNjaGVtYV92ZXJzaW9uIjogMSwKICAic291cmNlX2J5dGVzIjogMTgyNCwKICAic3RhcnRlZF9hdCI6ICIyMDI2LTA3LTIyVDEyOjAwOjA0KzAwOjAwIiwKICAidGFzayI6ICJnb2xkZW4tZmlsZSIsCiAgInRpbWVkX291dCI6IGZhbHNlLAogICJ0aW1pbmciOiB7CiAgICAiYW5hbHlzaXNfc2Vjb25kcyI6IDAuMTI1LAogICAgInBhY2thZ2luZ19ub3RlIjogInZhbGlkYXRpb24sIHJlZGFjdGlvbiwgcmVzdWx0IGVudW1lcmF0aW9uLCBhbmQgZGlyZWN0b3J5IGFyY2hpdmluZzsgZXhjbHVkZXMgZmluYWwgdGVsZW1ldHJ5IHNlcmlhbGl6YXRpb24iLAogICAgInBhY2thZ2luZ19zZWNvbmRzIjogMC4xMjUsCiAgICAicmVzb3VyY2VfYWRtaXNzaW9uX3NlY29uZHMiOiAwLjEyNSwKICAgICJyZXN1bHRfdXBsb2FkX3NlY29uZHNfZXhjbHVkaW5nX2V4ZWN1dGlvbl9qc29uIjogMC4xMjUsCiAgICAic291cmNlX2lucHV0X3ByZXBhcmF0aW9uX3NlY29uZHMiOiAwLjM3NSwKICAgICJ3b3JrZXJfYXR0ZW1wdF9hY3RpdmVfbm90ZSI6ICJmcm9tIHBvc3QtY2xhaW0gc3RhZ2luZyB0aHJvdWdoIG5vbi10ZWxlbWV0cnkgcmVzdWx0IHVwbG9hZHM7IGV4Y2x1ZGVzIGZpbmFsIGV4ZWN1dGlvbi5qc29uIHVwbG9hZCBhbmQgcXVldWUgZmluaXNoIiwKICAgICJ3b3JrZXJfYXR0ZW1wdF9hY3RpdmVfc2Vjb25kcyI6IDEuNjI1CiAgfSwKICAid29ya2VyIjogImdvbGRlbi1tYWMuMDAiCn0K"
+  },
+  {
+    "argv": [
+      "worker",
+      "finish",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--exit-code",
+      "0",
+      "--result-file",
+      "report.json",
+      "--result-file",
+      "stderr.txt",
+      "--result-file",
+      "stdout.txt",
+      "--result-file",
+      "execution.json",
+      "--lease-token",
+      "00000000000000000000000000000002"
+    ],
+    "stdin_base64": ""
+  }
+]
