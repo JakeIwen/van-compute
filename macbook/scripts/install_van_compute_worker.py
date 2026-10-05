@@ -796,7 +796,7 @@ for link in "$root/current" "$root/previous"; do
     test -L "$link" || { echo "A compute release link is unsafe: $link" >&2; exit 1; }
     resolved="$(/usr/bin/readlink -e "$link")"
     check_release_target "$root" "$resolved" || { echo "Invalid compute release target" >&2; exit 1; }
-    test -d "$resolved" && test ! -L "$resolved"
+    test -d "$resolved" && test ! -L "$resolved" || exit 1
   fi
 done
 runtime_lock="$root/runtime.lock"
@@ -837,11 +837,11 @@ validate_artifacts "$new"
 old_state="$(cli_state "$old")"
 new_state="$(cli_state "$new")"
 if test "$old_state" = gate; then
-  test -f "$old/.van-compute-upgrade-owner" && test -f "$old/.van_compute.py.pre-upgrade"
+  test -f "$old/.van-compute-upgrade-owner" && test -f "$old/.van_compute.py.pre-upgrade" || exit 1
   test "$new_state" != gate || { echo "Both compute layouts are gated" >&2; exit 1; }
   selected="$old"
 elif test "$new_state" = gate; then
-  test -f "$new/.van-compute-upgrade-owner" && test -f "$new/.van_compute.py.pre-upgrade"
+  test -f "$new/.van-compute-upgrade-owner" && test -f "$new/.van_compute.py.pre-upgrade" || exit 1
   test "$old_state" = missing || { echo "The new CLI is gated while the old CLI is live" >&2; exit 1; }
   selected="$new"
 elif test "$old_state" = normal && test "$new_state" = missing; then selected="$old"
@@ -856,7 +856,7 @@ for legacy in /home/pi/scripts/van_compute.py /home/pi/scripts/.van-compute-upgr
 done
 for state in queued running; do
   directory="$5/$state"
-  test -d "$directory" && test ! -L "$directory"
+  test -d "$directory" && test ! -L "$directory" || exit 1
   test -z "$(/usr/bin/find "$directory" -mindepth 1 -maxdepth 1 -print -quit)" || {
     echo "The Pi compute queue has pending or running work" >&2; exit 1;
   }
@@ -1308,7 +1308,7 @@ printf '%s\n' "$selected"
         self.remote.run(
             "create-stage",
             'set -eu\nstage="$1"\ncase "$stage" in /home/pi/.cache/van-compute-install.*) ;; *) exit 2;; esac\n'
-            'test ! -e "$stage" && test ! -L "$stage"\ninstall -d -m 700 "$stage" "$stage/release"\n',
+            'test ! -e "$stage" && test ! -L "$stage" || exit 1\ninstall -d -m 700 "$stage" "$stage/release"\n',
             [self.remote_stage],
         )
         self.state.remote_stage_created = True
@@ -1354,8 +1354,8 @@ set -eu
 stage="$1"
 expected="$2"
 release="$stage/release"
-test -d "$release" && test ! -L "$release"
-test -d "$release/van_compute" && test ! -L "$release/van_compute"
+test -d "$release" && test ! -L "$release" || exit 1
+test -d "$release/van_compute" && test ! -L "$release/van_compute" || exit 1
 test -z "$(/usr/bin/find "$release" -type l -print -quit)" || {
   echo "The staged Pi release contains a symlink" >&2; exit 1;
 }
@@ -1634,7 +1634,7 @@ test -x "$root/venv/bin/python3"
 install -d -m 700 "$root" "$root/releases" "$root/scripts" "$root/configs" "$root/venv"
 if test -e "$release" || test -L "$release"; then
   test -d "$release" && test ! -L "$release" || { echo "Existing release is unsafe: $release" >&2; exit 1; }
-  test -f "$release/source.sha256" && test ! -L "$release/source.sha256"
+  test -f "$release/source.sha256" && test ! -L "$release/source.sha256" || exit 1
   test "$(/bin/cat "$release/source.sha256")" = "$expected" || { echo "Existing release provenance mismatch" >&2; exit 1; }
   test -z "$(/usr/bin/find "$release" -type l -print -quit)" || { echo "Existing release contains a symlink" >&2; exit 1; }
   /usr/bin/python3 - "$release" "$staged" <<'PY'
@@ -1943,7 +1943,7 @@ for path in /home/pi/configs/van-compute-obd.example.json /home/pi/secrets/van-c
 done
 old_runtime=/home/pi/.local/share/van-compute
 if test -e "$old_runtime" || test -L "$old_runtime"; then
-  test -d "$old_runtime" && test ! -L "$old_runtime"
+  test -d "$old_runtime" && test ! -L "$old_runtime" || exit 1
   require_unmounted "$old_runtime" || exit 1
   unexpected="$(/usr/bin/find "$old_runtime" -mindepth 1 -maxdepth 1 ! -name venv ! -name runtime.lock -print -quit)"
   test -z "$unexpected" || { echo "Refusing unexpected old runtime entry: $unexpected" >&2; exit 1; }

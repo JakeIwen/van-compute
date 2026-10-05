@@ -660,7 +660,13 @@ class VanComputeDeploymentTests(unittest.TestCase):
     def test_legacy_retirement_preserves_frozen_copy_and_refuses_mount_uncertainty(
         self,
     ):
-        for mount_status in (32, 0, 1):
+        for mount_status, kind in (
+            (32, None),
+            (0, "directory"),
+            (1, "directory"),
+            (32, "file"),
+            (32, "symlink"),
+        ):
             with self.subTest(
                 mount_status=mount_status
             ), tempfile.TemporaryDirectory() as directory:
@@ -673,8 +679,16 @@ class VanComputeDeploymentTests(unittest.TestCase):
                 frozen.parent.mkdir(parents=True)
                 frozen.write_bytes(b"frozen rollback copy\n")
                 retired_runtime = fake_home / ".local/share/van-compute"
-                if mount_status != 32:
-                    retired_runtime.mkdir(parents=True)
+                if kind is not None:
+                    retired_runtime.parent.mkdir(parents=True)
+                    if kind == "file":
+                        retired_runtime.write_text("foreign file\n")
+                    elif kind == "symlink":
+                        retired_runtime.symlink_to(
+                            frozen.parent, target_is_directory=True
+                        )
+                    else:
+                        retired_runtime.mkdir()
                 cmdline = root / "cmdline"
                 cmdline.write_bytes(b"python3\0-m\0van_compute.broker\0")
                 removal_log = root / "remove-attempt"
@@ -710,7 +724,7 @@ rm() { printf attempted > "$removal_log"; return 77; }
                     check=False,
                 )
                 self.assertEqual(
-                    result.returncode, 0 if mount_status == 32 else 1, result.stderr
+                    result.returncode, 0 if kind is None else 1, result.stderr
                 )
                 self.assertFalse(
                     removal_log.exists(),
@@ -1362,6 +1376,34 @@ rm() { printf attempted > "$removal_log"; return 77; }
                 deployer.DeploymentError, "changed after planning"
             ):
                 installer.install_dataset(planned)
+
+    def test_existing_remote_stage_is_refused_before_install(self):
+        remote = FakeRemote(failures={"create-stage": "capture-only"})
+        with tempfile.TemporaryDirectory() as directory:
+            installer = self.make_installer(directory, remote=remote)
+            with self.assertRaisesRegex(deployer.DeploymentError, "capture-only"):
+                installer.stage_remote_release(self.source, Path(directory))
+            root = Path(directory)
+            stage = root / "van-compute-install.fixture"
+            stage.mkdir()
+            marker = stage / "keep"
+            marker.write_text("existing stage\n")
+            log = root / "install-called"
+            script = remote.scripts["create-stage"].replace(
+                "/home/pi/.cache/van-compute-install.",
+                str(root / "van-compute-install."),
+            )
+            fakes = 'log="$2"\ninstall() { printf attempted > "$log"; }\n'
+            result = subprocess.run(
+                ["/bin/sh", "-s", "--", str(stage), str(log)],
+                input=fakes + script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertFalse(log.exists())
+            self.assertEqual(marker.read_text(), "existing stage\n")
 
 
 if __name__ == "__main__":
