@@ -19,6 +19,7 @@ import plistlib
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -143,6 +144,7 @@ class DeploymentError(RuntimeError):
 class Options:
     if_needed: bool = False
     dry_run: bool = False
+    rebuild: bool = False
     heartbeat_timeout: int = 45
     submitter_timeout: int = 120
 
@@ -340,6 +342,7 @@ class Installer:
         self.source: SourceRelease | None = None
         self.prior_release: Path | None = None
         self.release_retention_ambiguous = False
+        self.rebuilt_release = False
 
     def say(self, message: str) -> None:
         print(message, file=self.stdout, flush=True)
@@ -436,7 +439,8 @@ class Installer:
                 raise DeploymentError(
                     f"staged deployment source contains a special entry: {path}"
                 )
-            actual.add(path.relative_to(app_root).as_posix())
+            if path.name != ".DS_Store":
+                actual.add(path.relative_to(app_root).as_posix())
         if actual != expected:
             raise DeploymentError(
                 "staged deployment source file set changed after planning"
@@ -519,11 +523,13 @@ class Installer:
             "dry_run": True,
             "mode": "coupled",
             "if_needed": self.options.if_needed,
+            "rebuild": self.options.rebuild,
+            "mac_build_layout": "<deployment24>-<build_uuid32> (legacy releases may be reused)",
             "source_root": str(self.paths.repo_root),
             "host": self.host,
             "worker": self.worker,
             "pi_release": f"{REMOTE_RELEASES}/{source.pi_version}",
-            "mac_release": str(self.paths.release_parent / source.mac_version),
+            "mac_release": str(self.paths.release_parent / f"{source.mac_version}-<build_uuid32>"),
             "source_sha256": source.source_fingerprint,
             "deployment_sha256": source.deployment_fingerprint,
             "local_operations": [
@@ -598,7 +604,7 @@ class Installer:
                 raise DeploymentError(
                     "installed LaunchAgent release paths are inconsistent"
                 )
-            self._release_identity(release)
+            self._release_identity(release, verify_runtime=False)
         except (
             DeploymentError,
             IndexError,
@@ -635,6 +641,8 @@ class Installer:
             ):
                 return False
             self._verify_release(installed_release, source)
+            if not self._runtime_healthy(installed_release):
+                return False
             if self._launch_state() is None:
                 return False
             script = (
@@ -644,6 +652,8 @@ set -eu
 root="$1"
 source_hash="$2"
 worker="$3"
+queue="$4"
+old="$5"
 test -f "$root/deployment.sha256"
 test ! -L "$root/deployment.sha256"
 test "$(/bin/cat "$root/deployment.sha256")" = "$source_hash"
@@ -652,6 +662,15 @@ current="$(/usr/bin/readlink -e "$root/current")"
 check_release_target "$root" "$current" || { echo "Invalid compute release target" >&2; exit 1; }
 test -f "$current/source.sha256"
 test "$(/bin/cat "$current/source.sha256")" = "$source_hash"
+for script_root in "$root/scripts" "$old"; do
+  owner_record="$script_root/.van-compute-upgrade-owner"
+  test ! -e "$owner_record" && test ! -L "$owner_record" || exit 1
+done
+PYTHONPATH="$current" PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -P -m van_compute.queue --root "$queue" maintenance status | /usr/bin/python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+raise SystemExit(payload.get("active") is not False)
+'
 /usr/bin/systemctl is-active --quiet van-compute-broker.service
 /usr/bin/systemctl cat van-compute-broker.service | /bin/grep -Fq "$root/current"
 "$root/scripts/van_compute.py" available | /usr/bin/python3 -c '
@@ -671,7 +690,13 @@ raise SystemExit(
             self.remote.run(
                 "current-deployment",
                 script,
-                [REMOTE_ROOT, source.source_fingerprint, self.worker],
+                [
+                    REMOTE_ROOT,
+                    source.source_fingerprint,
+                    self.worker,
+                    QUEUE_ROOT,
+                    OLD_COMPUTE_ROOT,
+                ],
             )
             return True
         except (
@@ -900,7 +925,7 @@ printf '%s\n' "$selected"
     def _write_manifest(self, root: Path) -> None:
         records: dict[str, dict[str, object]] = {}
         for path in sorted(root.rglob("*")):
-            if path == root / MANIFEST_FILE:
+            if path == root / MANIFEST_FILE or path.name == ".DS_Store":
                 continue
             details = path.lstat()
             if stat.S_ISLNK(details.st_mode):
@@ -922,10 +947,12 @@ printf '%s\n' "$selected"
         )
         os.chmod(root / MANIFEST_FILE, 0o600)
 
-    def _release_identity(self, root: Path) -> tuple[str, str]:
+    def _release_identity(
+        self, root: Path, *, verify_runtime: bool = True
+    ) -> tuple[str, str]:
         if (
             root.parent != self.paths.release_parent
-            or not re.fullmatch(r"[0-9a-f]{24}", root.name)
+            or not re.fullmatch(r"[0-9a-f]{24}(?:-[0-9a-f]{32})?", root.name)
             or root.is_symlink()
             or not root.is_dir()
         ):
@@ -938,7 +965,7 @@ printf '%s\n' "$selected"
             if not re.fullmatch(r"[0-9a-f]{64}", value):
                 raise DeploymentError(f"release marker is invalid: {path}")
             marker_values[marker] = value
-        if root.name != marker_values[DEPLOYMENT_HASH_FILE][:24]:
+        if root.name.split("-", 1)[0] != marker_values[DEPLOYMENT_HASH_FILE][:24]:
             raise DeploymentError(
                 f"release directory does not match its identity: {root}"
             )
@@ -961,6 +988,9 @@ printf '%s\n' "$selected"
             raise DeploymentError(
                 f"release provenance identity mismatch: {provenance_path}"
             )
+        build_id = root.name.split("-", 1)[1] if "-" in root.name else None
+        if provenance.get("build_id") != build_id:
+            raise DeploymentError(f"release build identity mismatch: {root}")
         manifest_path = root / MANIFEST_FILE
         self._regular_file(manifest_path, "release manifest")
         try:
@@ -972,8 +1002,20 @@ printf '%s\n' "$selected"
             ) from None
         if not isinstance(records, dict):
             raise DeploymentError(f"release manifest is invalid: {manifest_path}")
+        for relative in records:
+            name = Path(relative)
+            if not name.parts or name.is_absolute() or ".." in name.parts or name.as_posix() != relative:
+                raise DeploymentError(f"release manifest path is unsafe: {relative}")
+        records = {
+            relative: record for relative, record in records.items()
+            if Path(relative).name != ".DS_Store"
+            and (verify_runtime or Path(relative).parts[0] != "venv")
+        }
         actual: set[str] = set()
         for path in root.rglob("*"):
+            relative = path.relative_to(root)
+            if not verify_runtime and relative.parts[0] == "venv":
+                continue
             details = path.lstat()
             if stat.S_ISLNK(details.st_mode):
                 raise DeploymentError(f"release contains a symlink: {path}")
@@ -981,7 +1023,7 @@ printf '%s\n' "$selected"
                 continue
             if not stat.S_ISREG(details.st_mode):
                 raise DeploymentError(f"release contains a special entry: {path}")
-            if path != manifest_path:
+            if path != manifest_path and path.name != ".DS_Store":
                 actual.add(path.relative_to(root).as_posix())
         if actual != set(records):
             raise DeploymentError(f"release manifest file set mismatch: {root}")
@@ -998,8 +1040,10 @@ printf '%s\n' "$selected"
             marker_values[DEPLOYMENT_HASH_FILE],
         )
 
-    def _verify_release(self, root: Path, source: SourceRelease) -> None:
-        source_hash, deployment_hash = self._release_identity(root)
+    def _verify_release(
+        self, root: Path, source: SourceRelease, *, verify_runtime: bool = True
+    ) -> None:
+        source_hash, deployment_hash = self._release_identity(root, verify_runtime=verify_runtime)
         if (
             source_hash != source.source_fingerprint
             or deployment_hash != source.deployment_fingerprint
@@ -1157,92 +1201,99 @@ printf '%s\n' "$selected"
             ]
         )
 
+    def ensure_cache_directories(self) -> None:
+        for path in (self.paths.cache_root, *(self.paths.cache_root / name
+                                             for name in ("logs", "jobs", "ssh"))):
+            if path.is_symlink():
+                raise DeploymentError(f"cache directory is a symlink: {path}")
+            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(path, 0o700)
+
+    def _runtime_healthy(self, release: Path) -> bool:
+        python = release / "venv/bin/python"
+        if any(path.is_symlink() for path in (release / "venv", python.parent, python)):
+            return False
+        if not python.is_file() or not os.access(python, os.X_OK):
+            return False
+        try:
+            result = self.local.run(
+                [str(python), "-I", "-B", "-c",
+                 "import sys; assert sys.version_info >= (3, 11); "
+                 "import androguard,isotp,numpy,pytest"],
+                capture_output=True, check=False, timeout=15,
+            )
+            return result.returncode == 0
+        except DeploymentError:
+            return False
+
     def prepare_mac_release(self, source: SourceRelease) -> Path:
-        release = self.paths.release_parent / source.mac_version
-        if release.exists() or release.is_symlink():
-            self._verify_release(release, source)
-            self._validate_mac_release(release, source)
-            self.say(f"Verified existing immutable Mac release: {release}")
-            self.release = release
-            return release
+        self.ensure_cache_directories()
+        canonical = self.paths.release_parent / source.mac_version
+        candidate = canonical
+        # A frozen installer preserves its own dependency generation on rollback.
+        frozen = self.paths.repo_root.parent
+        choices = [frozen, self.prior_release]
+        for path in choices:
+            if path is None or path.parent != self.paths.release_parent:
+                continue
+            hashes = self._release_identity(path, verify_runtime=False)
+            if hashes == (source.source_fingerprint, source.deployment_fingerprint):
+                candidate = path
+                break
+        if candidate.exists() or candidate.is_symlink():
+            # Validate source/provenance before treating only runtime breakage as
+            # repairable. Never turn arbitrary source corruption into a rebuild.
+            self._verify_release(candidate, source, verify_runtime=False)
+            if not self.options.rebuild and self._runtime_healthy(candidate):
+                self._verify_release(candidate, source)
+                self._validate_mac_release(candidate, source)
+                self.say(f"Verified existing immutable Mac release: {candidate}")
+                self.release = candidate
+                return candidate
+            self.rebuilt_release = True
+            self.say(f"Building a replacement without modifying Mac release: {candidate}")
+        elif self.options.rebuild:
+            self.rebuilt_release = True
         self.say("Checking and provisioning local worker dependencies...")
         self._install_formulae()
         self.paths.release_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.paths.cache_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        for path in (
-            self.paths.release_parent,
-            self.paths.cache_root,
-            self.paths.cache_root / "logs",
-            self.paths.cache_root / "jobs",
-            self.paths.cache_root / "ssh",
-        ):
-            path.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(path, 0o700)
-        staging = Path(
-            tempfile.mkdtemp(prefix=".install.", dir=self.paths.release_parent)
+        if self.paths.release_parent.is_symlink():
+            raise DeploymentError("Mac release parent must not be a symlink")
+        os.chmod(self.paths.release_parent, 0o700)
+        build_id = uuid.UUID(str(self.uuid_factory())).hex
+        release = self.paths.release_parent / f"{source.mac_version}-{build_id}"
+        # Build at the final unique path: pip entrypoint shebangs embed it. The
+        # manifest is the completion marker; partial generations are never reused.
+        release.mkdir(mode=0o700)
+        self.say("Building an isolated Python environment...")
+        self.local.run([
+            "/opt/homebrew/bin/python3", "-m", "venv", "--copies", str(release / "venv"),
+        ])
+        self.local.run([
+            str(release / "venv/bin/python"), "-m", "pip", "install",
+            "--disable-pip-version-check", "--no-input",
+            "androguard", "can-isotp", "numpy", "pytest",
+        ])
+        self._copy_source_tree(release, source)
+        self._verify_staged_source(release / "app", source)
+        (release / "sandbox.sb").write_text(SANDBOX_PROFILE, encoding="utf-8")
+        os.chmod(release / "sandbox.sb", 0o600)
+        if not self._runtime_healthy(release):
+            raise DeploymentError(f"new Mac release interpreter validation failed: {release}")
+        self._validate_mac_release(release, source)
+        (release / SOURCE_HASH_FILE).write_text(source.source_fingerprint + "\n", encoding="utf-8")
+        (release / DEPLOYMENT_HASH_FILE).write_text(source.deployment_fingerprint + "\n", encoding="utf-8")
+        provenance = self.provenance(source, "mac-worker")
+        provenance["build_id"] = build_id
+        (release / PROVENANCE_FILE).write_text(
+            json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8",
         )
-        os.chmod(staging, 0o700)
-        try:
-            self.say("Building an isolated Python environment...")
-            self.local.run(
-                [
-                    "/opt/homebrew/bin/python3",
-                    "-m",
-                    "venv",
-                    "--copies",
-                    str(staging / "venv"),
-                ]
-            )
-            self.local.run(
-                [
-                    str(staging / "venv/bin/python"),
-                    "-m",
-                    "pip",
-                    "install",
-                    "--disable-pip-version-check",
-                    "--no-input",
-                    "androguard",
-                    "can-isotp",
-                    "numpy",
-                    "pytest",
-                ]
-            )
-            self._copy_source_tree(staging, source)
-            self._verify_staged_source(staging / "app", source)
-            (staging / "sandbox.sb").write_text(SANDBOX_PROFILE, encoding="utf-8")
-            os.chmod(staging / "sandbox.sb", 0o600)
-            self._validate_mac_release(staging, source)
-            (staging / SOURCE_HASH_FILE).write_text(
-                source.source_fingerprint + "\n", encoding="utf-8"
-            )
-            (staging / DEPLOYMENT_HASH_FILE).write_text(
-                source.deployment_fingerprint + "\n", encoding="utf-8"
-            )
-            (staging / PROVENANCE_FILE).write_text(
-                json.dumps(
-                    self.provenance(source, "mac-worker"), indent=2, sort_keys=True
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            for marker in (SOURCE_HASH_FILE, DEPLOYMENT_HASH_FILE, PROVENANCE_FILE):
-                os.chmod(staging / marker, 0o600)
-            self._write_manifest(staging)
-            try:
-                os.rename(staging, release)
-                staging = Path()
-            except FileExistsError:
-                self._verify_release(release, source)
-            self._verify_release(release, source)
-            self.release = release
-            return release
-        finally:
-            if (
-                staging
-                and staging.is_dir()
-                and staging.parent == self.paths.release_parent
-            ):
-                shutil.rmtree(staging)
+        for marker in (SOURCE_HASH_FILE, DEPLOYMENT_HASH_FILE, PROVENANCE_FILE):
+            os.chmod(release / marker, 0o600)
+        self._write_manifest(release)
+        self._verify_release(release, source)
+        self.release = release
+        return release
 
     def validate_dataset(self, path: Path) -> None:
         self._regular_file(path, "dataset configuration")
@@ -1319,7 +1370,8 @@ printf '%s\n' "$selected"
         try:
             package_target = pi_staging / "van_compute"
             shutil.copytree(
-                release / "app" / "van_compute", package_target, symlinks=False
+                release / "app" / "van_compute", package_target, symlinks=False,
+                ignore=shutil.ignore_patterns(".DS_Store"),
             )
             (pi_staging / SOURCE_HASH_FILE).write_text(
                 source.source_fingerprint + "\n", encoding="utf-8"
@@ -1353,6 +1405,8 @@ printf '%s\n' "$selected"
 set -eu
 stage="$1"
 expected="$2"
+root="$3"
+version="$4"
 release="$stage/release"
 test -d "$release" && test ! -L "$release" || exit 1
 test -d "$release/van_compute" && test ! -L "$release/van_compute" || exit 1
@@ -1396,11 +1450,76 @@ PYTHONPATH="$release" PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -P -m van_compu
 PYTHONPATH="$release" PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -P -m van_compute.frontend --help >/dev/null
 PYTHONPATH="$release" PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -P -m van_compute.broker --help >/dev/null
 sudo -n /usr/bin/systemd-analyze verify "$release/van_compute/configs/van-compute-broker.service" >/dev/null
+
+existing="$root/releases/$version"
+reuse_marker="$stage/reuse-existing-release"
+test ! -e "$reuse_marker" && test ! -L "$reuse_marker" || exit 1
+if test -e "$existing" || test -L "$existing"; then
+  test -d "$existing" && test ! -L "$existing" || { echo "Existing release is unsafe: $existing" >&2; exit 1; }
+  test -f "$existing/source.sha256" && test ! -L "$existing/source.sha256" || exit 1
+  test "$(/bin/cat "$existing/source.sha256")" = "$expected" || { echo "Existing release provenance mismatch" >&2; exit 1; }
+  /usr/bin/python3 - "$existing" "$release" <<'PY_EXISTING'
+import hashlib, json, pathlib, stat, sys
+root = pathlib.Path(sys.argv[1])
+staged = pathlib.Path(sys.argv[2])
+manifest = root / "manifest.json"
+records = json.loads(manifest.read_text())["files"]
+wanted = json.loads((staged / "manifest.json").read_text())["files"]
+
+def ignored_cache(path):
+    relative = path.relative_to(root)
+    return "__pycache__" in relative.parts or path.suffix in {".pyc", ".pyo"}
+
+actual = set()
+for path in root.rglob("*"):
+    mode = path.lstat().st_mode
+    if stat.S_ISLNK(mode):
+        raise SystemExit(f"existing release contains a symlink: {path}")
+    if stat.S_ISDIR(mode):
+        continue
+    if not stat.S_ISREG(mode):
+        raise SystemExit(f"existing release contains a special entry: {path}")
+    if path != manifest and not ignored_cache(path):
+        actual.add(path.relative_to(root).as_posix())
+if actual != set(records):
+    raise SystemExit("existing release manifest file set mismatch")
+for relative, record in records.items():
+    path = root / relative
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]
+        or stat.S_IMODE(path.stat().st_mode) != record["mode"]
+    ):
+        raise SystemExit(f"existing release verification failed: {relative}")
+if set(records) != set(wanted):
+    raise SystemExit("existing release does not match the planned source")
+for relative, record in records.items():
+    if relative != "provenance.json" and record != wanted[relative]:
+        raise SystemExit("existing release does not match the planned source")
+provenance = json.loads((root / "provenance.json").read_text())
+if (
+    set(provenance) != {"schema_version", "kind", "source_sha256", "source_root"}
+    or provenance["schema_version"] != 1
+    or provenance["kind"] != "pi-broker"
+    or provenance["source_sha256"] != (root / "source.sha256").read_text().strip()
+    or not isinstance(provenance["source_root"], str)
+):
+    raise SystemExit("existing release provenance is invalid")
+PY_EXISTING
+  : > "$reuse_marker"
+  /bin/chmod 600 "$reuse_marker"
+fi
 '''
         self.remote.run(
             "validate-stage",
             script,
-            [self.remote_stage, source.source_fingerprint],
+            [
+                self.remote_stage,
+                source.source_fingerprint,
+                REMOTE_ROOT,
+                source.pi_version,
+            ],
         )
 
     def provision_remote_runtime(self) -> None:
@@ -1620,11 +1739,11 @@ set -eu
 stage="$1"
 root="$2"
 version="$3"
-expected="$4"
-install_id="$5"
-old_root="$6"
+install_id="$4"
+old_root="$5"
 release="$root/releases/$version"
 staged="$stage/release"
+reuse_marker="$stage/reuse-existing-release"
 
 if /usr/bin/systemctl is-active --quiet van-compute-broker.service; then
   sudo -n systemctl stop van-compute-broker.service
@@ -1632,35 +1751,10 @@ fi
 test -x "$root/venv/bin/python3"
 "$root/venv/bin/python3" -c 'import isotp,numpy,pytest'
 install -d -m 700 "$root" "$root/releases" "$root/scripts" "$root/configs" "$root/venv"
-if test -e "$release" || test -L "$release"; then
-  test -d "$release" && test ! -L "$release" || { echo "Existing release is unsafe: $release" >&2; exit 1; }
-  test -f "$release/source.sha256" && test ! -L "$release/source.sha256" || exit 1
-  test "$(/bin/cat "$release/source.sha256")" = "$expected" || { echo "Existing release provenance mismatch" >&2; exit 1; }
-  test -z "$(/usr/bin/find "$release" -type l -print -quit)" || { echo "Existing release contains a symlink" >&2; exit 1; }
-  /usr/bin/python3 - "$release" "$staged" <<'PY'
-import hashlib,json,pathlib,stat,sys
-root=pathlib.Path(sys.argv[1]); manifest=root/'manifest.json'; records=json.loads(manifest.read_text())['files']
-actual=set()
-for p in root.rglob('*'):
- mode=p.lstat().st_mode
- if stat.S_ISLNK(mode): raise SystemExit(f'existing release contains a symlink: {p}')
- if stat.S_ISDIR(mode): continue
- if not stat.S_ISREG(mode): raise SystemExit(f'existing release contains a special entry: {p}')
- if p != manifest: actual.add(p.relative_to(root).as_posix())
-if actual != set(records): raise SystemExit('existing release manifest file set mismatch')
-for relative,record in records.items():
- p=root/relative
- if p.is_symlink() or not p.is_file() or hashlib.sha256(p.read_bytes()).hexdigest()!=record['sha256'] or stat.S_IMODE(p.stat().st_mode)!=record['mode']:
-  raise SystemExit(f'existing release verification failed: {relative}')
-wanted=json.loads((pathlib.Path(sys.argv[2])/'manifest.json').read_text())['files']
-def source_records(items):
- return {name: record for name,record in items.items() if name == 'source.sha256' or name.startswith('van_compute/')}
-if source_records(records) != source_records(wanted):
- raise SystemExit('existing release does not match the planned source')
-PY
+if test -f "$reuse_marker"; then
   /bin/rm -rf -- "$staged"
 else
-  mv "$staged" "$release"
+  mv -T "$staged" "$release"
 fi
 install -m 600 "$release/van_compute/configs/van-compute-obd.example.json" "$root/configs/van-compute-obd.example.json"
 install -m 600 "$release/van_compute/configs/van-compute-broker.service" "$root/configs/van-compute-broker.service"
@@ -1709,7 +1803,6 @@ fi
                 self.remote_stage,
                 REMOTE_ROOT,
                 source.pi_version,
-                source.source_fingerprint,
                 self.install_id,
                 OLD_COMPUTE_ROOT,
             ],
@@ -1790,6 +1883,7 @@ fi
         os.chmod(self.paths.target_plist, 0o600)
         domain = self._launch_domain()
         self.local.run(["/bin/launchctl", "bootout", domain], check=False)
+        self.local.run(["/bin/launchctl", "enable", domain])
         self.local.run(
             [
                 "/bin/launchctl",
@@ -2072,7 +2166,7 @@ case "$stage" in /home/pi/.cache/van-compute-install.*) /bin/rm -rf -- "$stage";
     def prune_local_releases(self, current: Path) -> None:
         # Reusing the active release is not a new cutover. Its prior rollback
         # release cannot be inferred from mtimes (failed stages may be newer).
-        if self.release_retention_ambiguous or self.prior_release == current:
+        if self.rebuilt_release or self.release_retention_ambiguous or self.prior_release == current:
             return
         protected = {current}
         if self.prior_release is not None:
@@ -2100,7 +2194,8 @@ case "$stage" in /home/pi/.cache/van-compute-install.*) /bin/rm -rf -- "$stage";
                 file=self.stdout,
             )
             return 0
-        if self.options.if_needed and self.deployment_current(source):
+        self.ensure_cache_directories()
+        if self.options.if_needed and not self.options.rebuild and self.deployment_current(source):
             self.say("van_compute deployment is current; skipping installer.")
             return 0
         if self.options.if_needed:
@@ -2179,19 +2274,43 @@ def parse_arguments(argv: Sequence[str] | None = None) -> Options:
         action="store_true",
         help="print the local plan without probing dependencies, launchd, or the Pi",
     )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="build a fresh immutable Mac environment; overrides --if-needed",
+    )
     arguments = parser.parse_args(argv)
     return Options(
         if_needed=arguments.if_needed,
         dry_run=arguments.dry_run,
+        rebuild=arguments.rebuild,
     )
 
-
 def main(argv: Sequence[str] | None = None) -> int:
+    previous_handlers: dict[int, object] = {}
+    interrupted = False
+
+    def interrupt(_signum: int, _frame: object) -> None:
+        nonlocal interrupted
+        if interrupted:
+            return
+        interrupted = True
+        raise KeyboardInterrupt
+
     try:
+        for signum in (signal.SIGHUP, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, interrupt)
         return Installer(parse_arguments(argv)).execute()
+    except KeyboardInterrupt:
+        print("van-compute installer: interrupted", file=sys.stderr)
+        return 130
     except DeploymentError as exc:
         print(f"van-compute installer: {exc}", file=sys.stderr)
         return 1
+    finally:
+        interrupted = True
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

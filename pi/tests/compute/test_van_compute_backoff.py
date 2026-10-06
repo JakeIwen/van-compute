@@ -5,10 +5,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
-from van_compute import worker
+from van_compute import broker, worker
 from van_compute.backoff import HostRetryGate, RetryCancelled
 
 
@@ -18,6 +19,20 @@ class Clock:
 
     def __call__(self):
         return self.now
+
+
+class FakeMultiplexer:
+    def __init__(self):
+        self.invalidations = 0
+        self.deadlines = []
+
+    def client_arguments(self, deadline=None):
+        self.deadlines.append(deadline)
+        return []
+
+    def invalidate(self, deadline=None):
+        self.invalidations += 1
+        self.deadlines.append(deadline)
 
 
 class BackoffTests(unittest.TestCase):
@@ -30,7 +45,7 @@ class BackoffTests(unittest.TestCase):
         gate.failed(concurrent)
         gate.reached(concurrent)
         self.assertEqual(gate.delay, 15)
-        for delay in (30, 60, 60, 60):
+        for delay in (30, 30, 30, 30):
             clock.now += gate.delay
             gate.failed(gate.acquire())
             self.assertEqual(gate.delay, delay)
@@ -40,10 +55,25 @@ class BackoffTests(unittest.TestCase):
         gate.failed(gate.acquire())
         self.assertEqual(gate.delay, 15)
 
-    def test_base_above_cap_never_shortens_configured_poll_interval(self):
+    def test_base_is_clamped_separately_below_remote_freshness_window(self):
         gate = HostRetryGate(base=300)
         gate.failed(gate.acquire())
-        self.assertEqual(gate.delay, 300)
+        self.assertEqual(gate.base, 30)
+        self.assertEqual(gate.cap, 30)
+        self.assertEqual(gate.delay, 30)
+        self.assertLess(gate.cap, broker.DEFAULT_REMOTE_MAX_AGE)
+        self.assertEqual(HostRetryGate(base=300, cap=300).cap, 30)
+
+        namespace = worker.build_parser().parse_args(["--poll-interval", "300"])
+        scheduler = worker.PersistentScheduler(
+            worker.WorkerConfig.from_namespace(namespace),
+            stop_event=threading.Event(),
+            remote_factory=lambda identity: worker.RemoteQueue(
+                "fake", "/fake/queue", identity
+            ),
+        )
+        self.assertEqual(scheduler.retry_gate.base, 30)
+        self.assertEqual(scheduler.retry_gate.cap, 30)
 
     def test_only_one_recovery_probe_and_wait_is_interruptible(self):
         clock = Clock()
@@ -126,7 +156,8 @@ class BackoffTests(unittest.TestCase):
                 remote.claim()
             remote.heartbeat()
             remote.finish("job", 0, [])
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 3)
+        self.assertIn("available", run.call_args_list[0].args[0][-1])
 
     def test_service_starts_without_eager_control_master_connections(self):
         with tempfile.TemporaryDirectory() as name:
@@ -200,6 +231,164 @@ class BackoffTests(unittest.TestCase):
                 self.assertFalse(thread.is_alive())
         self.assertEqual(errors, ["offline", "offline"])
         self.assertEqual(gate.delay, 15)
+
+    def test_long_recovered_transfer_does_not_block_heartbeats(self):
+        for transfer in ("upload", "stream"):
+            with self.subTest(transfer=transfer), tempfile.TemporaryDirectory() as name:
+                clock = Clock()
+                gate = HostRetryGate(clock=clock)
+                gate.failed(gate.acquire())
+                clock.now = gate.delay
+                long_remote = worker.RemoteQueue("fake", "/fake/queue", "mac.00")
+                capacity = worker.RemoteQueue("fake", "/fake/queue", "mac")
+                lease = worker.RemoteQueue("fake", "/fake/queue", "mac.01")
+                for remote in (long_remote, capacity, lease):
+                    remote.retry_gate = gate
+                transfer_started = threading.Event()
+                release_transfer = threading.Event()
+                errors = []
+
+                def transport(arguments, **kwargs):
+                    remote_command = arguments[-1]
+                    if " available" in remote_command:
+                        return subprocess.CompletedProcess(arguments, 0, b"", b"")
+                    if " put-result " in remote_command or " stream " in remote_command:
+                        transfer_started.set()
+                        if not release_transfer.wait(2):
+                            raise AssertionError("test transfer was not released")
+                        return subprocess.CompletedProcess(arguments, 0, b"{}", b"")
+                    if " heartbeat " in remote_command:
+                        return subprocess.CompletedProcess(arguments, 0, "{}", "")
+                    raise AssertionError(f"unexpected remote command: {remote_command}")
+
+                source = Path(name) / "result"
+                source.write_bytes(b"result")
+
+                def run_transfer():
+                    try:
+                        if transfer == "upload":
+                            long_remote.put_result("job", "result", source)
+                        else:
+                            long_remote.stream_to_file(
+                                ["worker", "stream", "job"], Path(name) / "download"
+                            )
+                    except Exception as exc:
+                        errors.append(exc)
+
+                with mock.patch.object(worker.subprocess, "run", side_effect=transport):
+                    thread = threading.Thread(target=run_transfer)
+                    thread.start()
+                    try:
+                        self.assertTrue(transfer_started.wait(1))
+                        capacity.heartbeat(slots_total=10, slots_busy=1)
+                        lease.heartbeat()
+                    finally:
+                        release_transfer.set()
+                        thread.join(2)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(gate.delay, 0)
+
+    def test_probe_control_and_transfer_timeouts_release_gate_and_cleanup(self):
+        cases = ("probe", "control", "transfer")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as name:
+                clock = Clock()
+                gate = HostRetryGate(clock=clock)
+                multiplexer = FakeMultiplexer()
+                remote = worker.RemoteQueue(
+                    "fake",
+                    "/fake/queue",
+                    "mac.00",
+                    multiplexer=multiplexer,
+                )
+                remote.retry_gate = gate
+                if case == "probe":
+                    gate.failed(gate.acquire())
+                    clock.now = gate.delay
+
+                expired = subprocess.TimeoutExpired("ssh", 1)
+                with mock.patch.object(
+                    worker.subprocess, "run", side_effect=expired
+                ) as run:
+                    with self.assertRaises(worker.TransportUnavailable):
+                        if case == "transfer":
+                            remote.stream_to_file(
+                                ["worker", "stream", "job"],
+                                Path(name) / "download",
+                            )
+                        else:
+                            remote.heartbeat()
+
+                self.assertEqual(multiplexer.invalidations, 1)
+                timeout = run.call_args.kwargs["timeout"]
+                if case == "probe":
+                    self.assertLessEqual(timeout, worker.RECOVERY_PROBE_TIMEOUT)
+                elif case == "control":
+                    self.assertLessEqual(timeout, worker.CONTROL_RPC_TIMEOUT)
+                else:
+                    self.assertGreater(timeout, worker.CONTROL_RPC_TIMEOUT)
+                    self.assertEqual(list(Path(name).iterdir()), [])
+                clock.now += gate.delay
+                generation, owns_probe = gate.acquire_attempt()
+                self.assertTrue(owns_probe)
+                gate.abandoned(generation)
+
+    def test_failure_after_successful_probe_reopens_current_generation(self):
+        remote, clock = self.remote()
+        remote.retry_gate.failed(remote.retry_gate.acquire())
+        clock.now = remote.retry_gate.delay
+        results = [
+            subprocess.CompletedProcess([], 0, b"", b""),
+            subprocess.CompletedProcess([], 255, "", "offline"),
+        ]
+        with mock.patch.object(worker.subprocess, "run", side_effect=results) as run:
+            with self.assertRaises(worker.TransportUnavailable):
+                remote.heartbeat()
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("available", run.call_args_list[0].args[0][-1])
+        self.assertIn("heartbeat", run.call_args_list[1].args[0][-1])
+        self.assertEqual(remote.retry_gate.delay, 15)
+
+    def test_control_master_lock_and_startup_obey_deadline_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as name:
+            multiplexer = worker.SSHMultiplexer(
+                "fake", Path(name) / "control.sock"
+            )
+            multiplexer._lock.acquire()
+            started = time.monotonic()
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    multiplexer.ensure(time.monotonic() + 0.02)
+            finally:
+                multiplexer._lock.release()
+            self.assertLess(time.monotonic() - started, 0.5)
+
+            class Process:
+                def __init__(self):
+                    self.stderr = io.BytesIO()
+                    self.terminated = False
+                    self.killed = False
+
+                def poll(self):
+                    return 0 if self.terminated or self.killed else None
+
+                def terminate(self):
+                    self.terminated = True
+
+                def wait(self, timeout=None):
+                    return 0
+
+                def kill(self):
+                    self.killed = True
+
+            process = Process()
+            with mock.patch.object(worker.subprocess, "Popen", return_value=process):
+                with self.assertRaises(worker.TransportUnavailable):
+                    multiplexer.ensure(time.monotonic() + 0.05)
+            self.assertTrue(process.terminated)
+            self.assertTrue(process.stderr.closed)
+            self.assertIsNone(multiplexer._process)
 
     def test_healthy_gate_does_not_change_existing_stop_behavior(self):
         gate = HostRetryGate()

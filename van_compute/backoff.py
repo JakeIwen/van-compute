@@ -20,12 +20,12 @@ class HostRetryGate:
     def __init__(
         self,
         base: float = 15.0,
-        cap: float = 60.0,
+        cap: float = 30.0,
         *,
         clock: Callable[[], float] = time.monotonic,
     ):
-        self.base = max(1.0, base)
-        self.cap = max(self.base, cap)
+        self.cap = min(30.0, max(1.0, cap))
+        self.base = min(max(1.0, base), self.cap)
         self.clock = clock
         self._condition = threading.Condition()
         self._generation = 0
@@ -38,13 +38,16 @@ class HostRetryGate:
         with self._condition:
             return self._delay
 
-    def acquire(self, stops: Sequence[threading.Event] = ()) -> int:
+    def acquire_attempt(
+        self, stops: Sequence[threading.Event] = ()
+    ) -> tuple[int, bool]:
+        """Return the current generation and whether this caller owns its probe."""
         with self._condition:
             while True:
                 # Healthy calls retain the original stop/drain semantics. Only
                 # the newly introduced outage wait adds cancellation points.
                 if not self._delay:
-                    return self._generation
+                    return self._generation, False
                 if any(event.is_set() for event in stops):
                     raise RetryCancelled(
                         "worker stopped while waiting for broker recovery"
@@ -52,9 +55,13 @@ class HostRetryGate:
                 remaining = self._retry_at - self.clock()
                 if remaining <= 0 and not self._probe:
                     self._probe = True
-                    return self._generation
+                    return self._generation, True
                 # Bounded wait observes stop/drain without depending on signal handlers.
                 self._condition.wait(min(0.1, remaining) if remaining > 0 else 0.1)
+
+    def acquire(self, stops: Sequence[threading.Event] = ()) -> int:
+        generation, _probe = self.acquire_attempt(stops)
+        return generation
 
     def failed(self, generation: int) -> None:
         with self._condition:

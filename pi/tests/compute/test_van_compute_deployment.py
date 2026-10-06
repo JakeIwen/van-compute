@@ -1,4 +1,5 @@
 import errno
+import importlib.util
 import io
 import json
 import os
@@ -143,6 +144,9 @@ class WorkflowInstaller(deployer.Installer):
     def deployment_current(self, _source):
         self.events.append("current")
         return False
+
+    def ensure_cache_directories(self):
+        pass  # Like the other filesystem phases, never write /fake in this harness.
 
     def preflight_local(self, _source):
         self.events.append("local-preflight")
@@ -293,6 +297,10 @@ class VanComputeDeploymentTests(unittest.TestCase):
         )
         if source.files:
             installer._copy_source_tree(release, source)
+        python = release / "venv/bin/python"
+        python.parent.mkdir(parents=True)
+        python.write_text("# interpreter executed only by FakeLocal\n", encoding="utf-8")
+        python.chmod(0o700)
         installer._write_manifest(release)
         return release
 
@@ -446,6 +454,50 @@ class VanComputeDeploymentTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 deployer.parse_arguments(["--pi-only"])
 
+    def test_main_maps_hup_and_term_to_cleanup_and_restores_handlers(self):
+        for triggering_signal in (deployer.signal.SIGHUP, deployer.signal.SIGTERM):
+            with self.subTest(triggering_signal=triggering_signal):
+                installer = WorkflowInstaller(deployer.Options(), self.source)
+                installed = {}
+                previous = {
+                    deployer.signal.SIGHUP: object(),
+                    deployer.signal.SIGTERM: object(),
+                }
+                signal_calls = []
+
+                def fake_signal(signum, handler):
+                    signal_calls.append((signum, handler))
+                    if len(signal_calls) <= 2:
+                        installed[signum] = handler
+                        return previous[signum]
+                    return installed[signum]
+
+                def interrupt_drain():
+                    installer.events.append("drain")
+                    installed[triggering_signal](triggering_signal, None)
+
+                installer.drain_worker = interrupt_drain
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(deployer, "Installer", return_value=installer),
+                    mock.patch.object(
+                        deployer.signal, "signal", side_effect=fake_signal
+                    ),
+                    mock.patch.object(deployer.sys, "stderr", stderr),
+                ):
+                    self.assertEqual(deployer.main([]), 130)
+
+                self.assertEqual(installer.events[-2:], ["cleanup", "lock-close"])
+                self.assertNotIn("gate", installer.events)
+                self.assertIn("installer: interrupted", stderr.getvalue())
+                self.assertEqual(
+                    signal_calls[2:],
+                    [
+                        (deployer.signal.SIGHUP, previous[deployer.signal.SIGHUP]),
+                        (deployer.signal.SIGTERM, previous[deployer.signal.SIGTERM]),
+                    ],
+                )
+
     def test_shell_entry_point_executes_python_dry_run(self):
         with tempfile.TemporaryDirectory() as directory:
             environment = os.environ.copy()
@@ -514,6 +566,119 @@ class VanComputeDeploymentTests(unittest.TestCase):
         self.assertEqual(installer.execute(), 0)
         self.assertEqual(installer.events, ["source"])
         self.assertIn("deployment is current", installer.out.getvalue())
+
+    def test_current_probe_rejects_maintenance_and_upgrade_owner_artifacts(self):
+        remote = FakeRemote()
+        local = FakeLocal(launch_states=["loaded\n"])
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory).resolve()
+            installer = self.make_installer(
+                directory, local=local, remote=remote
+            )
+            source = installer.build_source_release()
+            mac_release = self.create_owned_release(installer, source)
+            self.point_launchagent_at(installer, mac_release)
+            self.assertTrue(installer.deployment_current(source))
+
+            root = fixture / "pi" / "van_compute"
+            old = fixture / "pi" / "scripts" / "compute"
+            queue = fixture / "queue"
+            release = root / "releases" / source.pi_version
+            scripts = root / "scripts"
+            (release / "van_compute").mkdir(parents=True)
+            scripts.mkdir(parents=True)
+            old.mkdir(parents=True)
+            queue.mkdir()
+            (root / "current").symlink_to(
+                Path("releases") / source.pi_version, target_is_directory=True
+            )
+            (root / "deployment.sha256").write_text(
+                source.source_fingerprint + "\n", encoding="utf-8"
+            )
+            (release / "source.sha256").write_text(
+                source.source_fingerprint + "\n", encoding="utf-8"
+            )
+            (release / "van_compute" / "__init__.py").write_text(
+                "", encoding="utf-8"
+            )
+            (release / "van_compute" / "queue.py").write_text(
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                "root = Path(sys.argv[sys.argv.index('--root') + 1])\n"
+                "print(json.dumps({'active': (root / 'maintenance-active').exists()}))\n",
+                encoding="utf-8",
+            )
+            available = {
+                "workers": [
+                    {
+                        "worker": "m4mac",
+                        "age_seconds": 0,
+                        "slots_total": 10,
+                        "slots_busy": 0,
+                    }
+                ]
+            }
+            cli = scripts / "van_compute.py"
+            cli.write_text(
+                "#!/bin/sh\nprintf '%s\\n' "
+                + repr(json.dumps(available))
+                + "\n",
+                encoding="utf-8",
+            )
+            cli.chmod(0o700)
+
+            script = remote.scripts["current-deployment"]
+            script = script.replace("/usr/bin/systemctl", "systemctl")
+            script = script.replace("/usr/bin/readlink -e", "readlink_e")
+            script = script.replace(
+                "/bin/grep", shutil.which("grep") or "/usr/bin/grep"
+            )
+            script = script.replace(
+                "/usr/bin/python3 -P -m van_compute.queue",
+                sys.executable + " -m van_compute.queue",
+            )
+            fakes = r'''
+readlink_e() { /usr/bin/python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+systemctl() {
+  case "$1" in
+    is-active) return 0;;
+    cat) printf '%s/current\n' "$root";;
+    *) return 1;;
+  esac
+}
+'''
+
+            def probe():
+                return subprocess.run(
+                    [
+                        "/bin/sh",
+                        "-s",
+                        "--",
+                        str(root),
+                        source.source_fingerprint,
+                        "m4mac",
+                        str(queue),
+                        str(old),
+                    ],
+                    input=fakes + script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    cwd=fixture,
+                )
+
+            healthy = probe()
+            self.assertEqual(healthy.returncode, 0, healthy.stderr)
+            maintenance = queue / "maintenance-active"
+            maintenance.touch()
+            self.assertNotEqual(probe().returncode, 0)
+            maintenance.unlink()
+            for script_root in (scripts, old):
+                with self.subTest(script_root=script_root):
+                    owner = script_root / ".van-compute-upgrade-owner"
+                    owner.write_text("installer-owner\n", encoding="utf-8")
+                    self.assertNotEqual(probe().returncode, 0)
+                    owner.unlink()
 
     def test_stage_validation_failure_happens_before_drain_or_cutover(self):
         installer = WorkflowInstaller(deployer.Options(), self.source)
@@ -764,18 +929,31 @@ rm() { printf attempted > "$removal_log"; return 77; }
             finally:
                 fifo.unlink()
 
-    def test_remote_reuse_verifies_real_files_and_planned_source(self):
+    def test_remote_reuse_is_verified_before_cutover_and_ignores_bytecode(self):
         remote = FakeRemote()
         with tempfile.TemporaryDirectory() as directory:
             installer = self.make_installer(directory, remote=remote)
-            installer.cutover_remote(self.source)
-            code = remote.scripts["cutover"].split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+            installer.validate_remote_stage(self.source)
+            validation = remote.scripts["validate-stage"]
+            code = validation.split("<<'PY_EXISTING'\n", 1)[1].split(
+                "\nPY_EXISTING", 1
+            )[0]
             root = Path(directory)
             release = root / "release"
             (release / "van_compute").mkdir(parents=True)
             payload = release / "van_compute/worker.py"
             payload.write_text("# original\n")
             (release / "source.sha256").write_text("a" * 64)
+            (release / "provenance.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "kind": "pi-broker",
+                        "source_sha256": "a" * 64,
+                        "source_root": "/source/checkout",
+                    }
+                )
+            )
             installer._write_manifest(release)
             staged = root / "staged"
             shutil.copytree(release, staged)
@@ -787,6 +965,14 @@ rm() { printf attempted > "$removal_log"; return 77; }
                     exec(compile(code, "<remote-release-check>", "exec"), {})
 
             verify()
+            cache = release / "van_compute/__pycache__"
+            cache.mkdir()
+            (cache / "worker.cpython-39.pyc").write_bytes(b"runtime cache")
+            (release / "standalone.pyo").write_bytes(b"runtime cache")
+            verify()
+            shutil.rmtree(cache)
+            (release / "standalone.pyo").unlink()
+
             linked = release / "linked"
             linked.symlink_to(release / "van_compute", target_is_directory=True)
             with self.assertRaisesRegex(SystemExit, "symlink"):
@@ -802,6 +988,31 @@ rm() { printf attempted > "$removal_log"; return 77; }
             installer._write_manifest(release)
             with self.assertRaisesRegex(SystemExit, "planned source"):
                 verify()
+            payload.write_text("# original\n")
+            unexpected = release / "unexpected.txt"
+            unexpected.write_text("rewritten into manifest\n")
+            installer._write_manifest(release)
+            with self.assertRaisesRegex(SystemExit, "planned source"):
+                verify()
+
+            installer.cutover_remote(self.source)
+            cutover = remote.scripts["cutover"]
+            self.assertIn("reuse-existing-release", cutover)
+            self.assertNotIn("manifest.json", cutover)
+            self.assertNotIn("Existing release", cutover)
+
+        validation_call = next(
+            call for call in remote.calls if call[0] == "validate-stage"
+        )
+        self.assertEqual(
+            validation_call[1],
+            (
+                installer.remote_stage,
+                self.source.source_fingerprint,
+                deployer.REMOTE_ROOT,
+                self.source.pi_version,
+            ),
+        )
 
     def test_all_remote_release_links_require_one_immediate_24_hex_target(self):
         remote = FakeRemote(responses={"preflight": deployer.REMOTE_SCRIPTS + "\n"})
@@ -1054,6 +1265,7 @@ rm() { printf attempted > "$removal_log"; return 77; }
             self.source.source_fingerprint,
         )
 
+    @unittest.skipUnless(sys.version_info >= (3, 11), "Pi entrypoints require Python 3.11 -P")
     def test_package_entrypoints_resolve_only_the_installed_current_release(self):
         self.assertEqual(
             QUEUE_CLI.read_bytes().splitlines()[0], b"#!/usr/bin/python3 -P"
@@ -1089,6 +1301,7 @@ rm() { printf attempted > "$removal_log"; return 77; }
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("usage:", result.stdout)
 
+    @unittest.skipUnless(sys.version_info >= (3, 11), "Pi entrypoints require Python 3.11 -P")
     def test_upgrade_gate_blocks_both_public_entrypoints(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1157,6 +1370,10 @@ rm() { printf attempted > "$removal_log"; return 77; }
             [command_arguments(value) for value in dashboard["ExecStartPre"]],
         )
 
+    @unittest.skipUnless(
+        sys.version_info >= (3, 11) and importlib.util.find_spec("flask") is not None,
+        "Pi -P/dashboard smoke needs Python 3.11 and Flask (covered by compute venv suite)",
+    )
     def test_staged_dashboard_imports_only_the_compute_metrics_contract(self):
         plan = deploy_python.build_plan(REPOSITORY_ROOT, mode="stage")
         with tempfile.TemporaryDirectory() as directory:
@@ -1273,6 +1490,16 @@ rm() { printf attempted > "$removal_log"; return 77; }
                 deployer.os, "replace", side_effect=replace_on_same_filesystem
             ):
                 installer.install_launchagent(release, self.source)
+            launchctl = [
+                call[0]
+                for call in installer.local.calls
+                if call[0][:1] == ["/bin/launchctl"]
+            ]
+            self.assertEqual(
+                [command[1] for command in launchctl],
+                ["bootout", "enable", "bootstrap", "kickstart"],
+            )
+            self.assertEqual(launchctl[1][2], launchctl[2][2] + "/" + deployer.LABEL)
             self.assertEqual(
                 plistlib.loads(installer.paths.target_plist.read_bytes())["Label"],
                 deployer.LABEL,

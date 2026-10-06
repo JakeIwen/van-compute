@@ -120,15 +120,33 @@ provider-first package cutover has completed. The Step 1 dashboard imports
 `van_compute.metrics` from `/home/pi/van_compute/current`, while broad sync
 updates Python packages before it runs the compute installer. Therefore the
 first deployment must install and validate compute on both hosts before updating
-the dashboard consumer:
+the dashboard consumer. Broad sync now refuses **before any deployment writes**
+unless the canonical compute provider has matching source markers, readable and
+importable metrics, and no maintenance/upgrade-owner fence. It does not require
+a fresh Mac heartbeat or the new checkout's source hash. This guard preserves the
+supervised first cutover; it never launches the Mac installer automatically to
+repair a missing provider. Run the following only from the owner's Terminal in
+a clean reviewed checkout (do not reset or deploy the diverged owner checkout):
 
 ```zsh
-cd /Users/jacobr/dev/scripts
+( set -eu
+git -C /Users/jacobr/dev/scripts fetch origin
+DEPLOY=/Users/jacobr/dev/scripts/.claude/worktrees/compute-first-deploy
+git -C /Users/jacobr/dev/scripts worktree add --detach "$DEPLOY" origin/master
+cd "$DEPLOY"
+export VAN_COMPUTE_DATASET_CONFIG=/Users/jacobr/dev/scripts/macbook/secrets/van-compute-datasets.json
+test -r "$VAN_COMPUTE_DATASET_CONFIG"
 ./macbook/scripts/install_van_compute_worker.zsh --dry-run
+/opt/homebrew/bin/python3 pi/deploy_python.py --dry-run --update --service van-dashboard.service
 ./macbook/scripts/install_van_compute_worker.zsh
-python3 pi/deploy_python.py --update --service van-dashboard.service
-ssh pi@vanpi.lan 'set -eu; /usr/bin/systemctl is-active van-compute-broker.service; /usr/bin/systemctl is-active van-dashboard.service; /home/pi/van_compute/scripts/van_compute.py available; /usr/bin/test -r /home/pi/van_compute/current/van_compute/metrics.py'
+/opt/homebrew/bin/python3 pi/deploy_python.py --update --service van-dashboard.service
+ssh pi@vanpi.lan 'set -eu; /usr/bin/systemctl is-active van-compute-broker.service; /usr/bin/systemctl is-active van-dashboard.service; /home/pi/van_compute/scripts/van_compute.py maintenance status; /home/pi/van_compute/scripts/van_compute.py available; /usr/bin/test -r /home/pi/van_compute/current/van_compute/metrics.py'
+)
 ```
+
+Keep this reviewed worktree for recovery. Broad sync always reads the primary
+checkout, even when invoked from a worktree: do not use it until the owner has
+reconciled that checkout with these fixes without discarding unrelated work.
 
 After that supervised provider-first cutover, routine repository-wide updates
 remain supported:
@@ -163,7 +181,7 @@ Both sides retain immutable, content-addressed releases and provenance:
 
 ```text
 ~/Library/Application Support/van-compute/
-  releases/<24-hex-deployment-digest>/
+  releases/<deployment24>-<build_uuid32>/  # legacy 24-hex releases also accepted
     app/van_compute/...
     app/macbook/scripts/install_van_compute_worker.{py,zsh}
     app/macbook/launchagents/com.jacobr.van-compute-worker.plist
@@ -195,7 +213,10 @@ Both sides retain immutable, content-addressed releases and provenance:
 The LaunchAgent pins its interpreter and `PYTHONPATH` to one verified Mac
 release. The broker and dashboard import from the atomically switched Pi
 `current` link. Reusing an existing digest verifies every manifest file and its
-hash; a same-version repair leaves `previous` unchanged. The current Mac release
+hash **during staging, before draining/fencing or stopping the broker**; Python
+bytecode caches are deliberately ignored on reused Pi releases. Unknown files,
+changed source, links and special entries still fail closed. A same-version
+repair leaves `previous` unchanged. The current Mac release
 and one prior release are retained. Each Mac release carries the exact frozen
 installer, package, and plist source needed to deploy that version again.
 Ambiguous, mounted or unrecognized retention candidates are kept rather than
@@ -205,14 +226,32 @@ abandoned stage for the earlier rollback release.
 **Installer behavior decisions:** the Python port preserves coupled fencing,
 maintenance ownership, staging-before-drain and heartbeat-before-release. The
 package layout adds content-addressed source releases, integrity manifests and
-frozen installers. Unlike the former timestamp-only Mac installer, a repeated
-manual install verifies and reuses the same immutable environment instead of
-refreshing unpinned pip dependencies. It still performs the normal coupled
-checks; only `--if-needed` can skip the healthy deployment entirely. A fresh
-release still resolves currently available dependencies, so the source digest
-alone does not guarantee dependency reproducibility across machines. A future
-dependency refresh needs a new release identity, ideally a dependency lock;
-never mutate a retained rollback environment.
+frozen installers. Healthy matching Mac releases are reused rather than silently
+refreshing unpinned dependencies. Every live run recreates the private
+`~/Library/Caches/van-compute/{logs,jobs,ssh}` directories; `.DS_Store` files are
+ignored and never transferred. The pinned interpreter and required imports are
+smoke-tested even for `--if-needed`. Missing/broken interpreters or imports cause
+a new immutable sibling generation to be built and validated **before drain**;
+source/provenance corruption still fails closed. A new generation has a recorded
+build UUID and is built at its final path so venv entrypoint shebangs remain valid.
+Incomplete generations are never reused. Rebuild/repair leaves all existing
+releases untouched and skips pruning, preserving earlier rollback environments.
+
+To deliberately refresh dependencies, use the documented rebuild option from
+the owner's Terminal:
+
+```zsh
+./macbook/scripts/install_van_compute_worker.zsh --rebuild --dry-run
+./macbook/scripts/install_van_compute_worker.zsh --rebuild
+```
+
+`--rebuild` overrides `--if-needed`, but never bypasses the coupled staging,
+drain, fencing or heartbeat gates. Ordinary reruns prefer the installed healthy
+generation; a frozen installer prefers its own generation for dependency rollback.
+Only `--if-needed` skips a fully healthy, unfenced deployment. A fresh build still
+resolves currently available dependencies, so the stable desired-source digest
+alone does not guarantee dependency reproducibility across machines; a dependency
+lock remains future work.
 
 The retired protocol copy under `/home/pi/scripts/python-automation/` is frozen:
 leave it byte-unchanged, whether present or absent. Unlike the old shell
@@ -250,7 +289,11 @@ A failure before cutover restores the exact previous CLI and LaunchAgent in that
 order. Once package replacement begins, an incompatible previous worker is never
 restarted: the queue remains fenced in maintenance and the supported recovery is
 to rerun the same installer command until it validates the broker, worker, and
-fresh heartbeat.
+fresh heartbeat. `--if-needed` never skips active maintenance or an upgrade-owner
+record, even if both releases and the coordinator otherwise look healthy.
+SIGHUP and SIGTERM use the same cleanup path as Ctrl-C; installing the LaunchAgent
+explicitly enables it before bootstrap, recovering a job left disabled by an
+uncatchable interruption. SIGKILL cannot run cleanup: rerun the safe installer.
 
 ### Rollback and recovery commands
 
@@ -267,13 +310,14 @@ active, do not switch either release link or bootstrap the old worker manually.
 Resume the owned, fenced upgrade forward:
 
 ```zsh
-cd /Users/jacobr/dev/scripts
+cd /Users/jacobr/dev/scripts/.claude/worktrees/compute-first-deploy
 ./macbook/scripts/install_van_compute_worker.zsh
 ```
 
 After a deployment completed successfully and released maintenance, a deliberate
 rollback is a new coupled deployment through the prior installer. For a retained
-Python-deployer release, use its frozen source; this applies all normal drain,
+Python-deployer release **containing these recovery fixes**, use its frozen source;
+this applies all normal drain,
 fence, stage, cutover, provenance, and heartbeat checks:
 
 ```zsh
@@ -291,17 +335,21 @@ still requires the forward recovery command above.
 
 After a **completed** cutover, the tested fallback is to restore the verified
 Step 1 broker and worker implementations while retaining the new safe installer,
-package entrypoints, unit and metrics provider. From the reviewed, merged S1
-checkout, prepare a separate rollback worktree (creation refuses an existing
-path; the chained commands stop on failure):
+package entrypoints, unit and metrics provider. Pin the rollback base to the
+reviewed S1 commit `f32ce9e`, not the caller's `HEAD`. Copy the safe deployer from
+the **successfully deployed fixed Mac release** into that base; do not revive
+S1's pre-fix installer. Prepare a separate rollback worktree (creation refuses
+an existing path; the chained commands stop on failure):
 
 ```zsh
+SAFE_INSTALLER_RELEASE="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$HOME/Library/LaunchAgents/com.jacobr.van-compute-worker.plist" | /usr/bin/sed 's#/venv/bin/python$##')"
 ROLLBACK=/Users/jacobr/dev/scripts/.claude/worktrees/s1-step2-rollback
-git -C /Users/jacobr/dev/scripts worktree add --detach "$ROLLBACK" HEAD && git -C "$ROLLBACK" restore --source=c69a7a6 --worktree -- van_compute/broker.py van_compute/worker.py && /opt/homebrew/bin/python3 "$ROLLBACK/macbook/scripts/install_van_compute_worker.py" --dry-run
+test -x "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.py" && git -C /Users/jacobr/dev/scripts worktree add --detach "$ROLLBACK" f32ce9e && git -C "$ROLLBACK" restore --source=c69a7a6 --worktree -- van_compute/broker.py van_compute/worker.py && cp "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.py" "$ROLLBACK/macbook/scripts/install_van_compute_worker.py" && cp "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.zsh" "$ROLLBACK/macbook/scripts/install_van_compute_worker.zsh" && /opt/homebrew/bin/python3 "$ROLLBACK/macbook/scripts/install_van_compute_worker.py" --dry-run
 ```
 
-Review the intentional two-file source changes and dry-run, then roll back **both
-hosts together** through the unchanged drain/fence/health gates:
+Review the intentional broker/worker rollback and safe-installer overlay, then
+the dry-run; roll back **both hosts together** through the unchanged
+drain/fence/health gates:
 
 ```zsh
 /opt/homebrew/bin/python3 "$ROLLBACK/macbook/scripts/install_van_compute_worker.py"
@@ -589,11 +637,17 @@ fixtures must remain byte-identical.
 
 **Only approved runtime change — unreachable-host retry:** persistent Mac mode
 uses one thread-safe host-wide gate across all four SSH multiplexers, claims,
-heartbeats and transfers. Delays are poll_interval, 2*poll_interval, then capped
-at max(60 seconds, poll_interval): the defaults are 15, 30, 60, 60… without
-jitter. Concurrent failures from one generation count once; only one recovery
-probe runs after a cooldown. Successful communication resets the gate, even
-when the remote application rejects an operation or returns malformed JSON.
+heartbeats and transfers. Cooldowns are capped at 30 seconds, below the 45-second
+remote-freshness window; the base is clamped to 1–30 seconds independently of a
+larger poll interval. Defaults are 15, 30, 30… without jitter. Concurrent failures
+from one generation count once. One nonmutating `available` recovery probe runs
+after a cooldown with a 10-second total deadline (including ControlMaster setup,
+lock acquisition and cleanup). The gate opens before the actual operation, so a
+long upload or stream cannot monopolize recovery and starve job/capacity
+heartbeats. Control calls retain a 90-second deadline; bulk transfers have a
+separate one-hour deadline. Both include connection setup and bounded cleanup.
+Successful communication resets the gate, even when the remote application
+rejects an operation or returns malformed JSON.
 SSH status 255, transport timeout and connection-establishment failures back
 off; empty/maintenance claims and task/application failures do not.
 
