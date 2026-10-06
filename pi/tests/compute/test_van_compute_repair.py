@@ -104,13 +104,12 @@ class MacReleaseRepairTests(unittest.TestCase):
         drain.assert_not_called()
         self.assertEqual(self.snapshot(self.old), before)
         self.assertEqual(self.installer.remote.calls, [])
-        incomplete = next(path for path in self.installer.paths.release_parent.iterdir() if path != self.old)
-        self.assertFalse((incomplete / deployer.MANIFEST_FILE).exists())
-        with self.assertRaises(deployer.DeploymentError):
-            self.installer._release_identity(incomplete)
-        # A rerun gets a fresh unique generation instead of overwriting the partial.
+        self.assertEqual(set(self.installer.paths.release_parent.iterdir()), {self.old})
+        # A rerun gets a fresh unique generation after the failed one is removed.
         self.local.broken.add(str(self.old / 'venv/bin/python'))
-        self.assertNotEqual(self.installer.prepare_mac_release(self.source), incomplete)
+        rebuilt = self.installer.prepare_mac_release(self.source)
+        self.assertNotEqual(rebuilt, self.old)
+        self.installer._verify_release(rebuilt, self.source)
 
     def test_suffix_and_provenance_must_match(self):
         new = self.old.with_name(self.old.name + '-' + 'd' * 32)

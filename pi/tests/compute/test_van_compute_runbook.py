@@ -17,5 +17,21 @@ class ComputeRunbookTests(unittest.TestCase):
         self.assertTrue(command.endswith('--dry-run'))
 
 
+    def test_forward_recovery_uses_frozen_release_without_a_worktree(self):
+        repo = Path(__file__).resolve().parents[3]
+        text = (repo / 'pi/docs/compute/VAN_COMPUTE.md').read_text()
+        recovery = text.split('If a deployment reports', 1)[1].split(
+            'After a deployment completed successfully', 1)[0]
+        self.assertNotIn('compute-first-deploy', recovery)
+        self.assertIn(
+            '$RECOVERY_RELEASE/app/macbook/scripts/install_van_compute_worker.zsh',
+            recovery,
+        )
+        self.assertIn('"$RECOVERY_INSTALLER" --dry-run', recovery)
+        self.assertIn('"$RECOVERY_INSTALLER"\n', recovery)
+        self.assertIn('plist may still name the older release', recovery)
+        self.assertIn('system Python', recovery)
+
+
 if __name__ == '__main__':
     unittest.main()

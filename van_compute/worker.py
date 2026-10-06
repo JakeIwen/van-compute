@@ -54,6 +54,7 @@ DEFAULT_TIMEOUT = 3600
 CONTROL_RPC_TIMEOUT = 90.0
 RECOVERY_PROBE_TIMEOUT = 10.0
 BULK_TRANSFER_TIMEOUT = 3600.0
+CONTROL_MASTER_CHECK_TIMEOUT = 5.0
 TRANSPORT_CLEANUP_RESERVE = 1.0
 RECOVERY_BACKOFF_CAP = 30.0
 DEFAULT_MAX_RESULT_BYTES = protocol.MAX_RESULT_BYTES
@@ -207,10 +208,13 @@ class SSHMultiplexer:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=remaining_timeout(
-                deadline,
-                arguments,
-                reserve=TRANSPORT_CLEANUP_RESERVE,
+            timeout=min(
+                CONTROL_MASTER_CHECK_TIMEOUT,
+                remaining_timeout(
+                    deadline,
+                    arguments,
+                    reserve=TRANSPORT_CLEANUP_RESERVE,
+                ),
             ),
             check=False,
         )
@@ -223,36 +227,39 @@ class SSHMultiplexer:
             if self._check_locked(deadline):
                 return
             self._stop_locked(deadline)
-            self.control_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(self.control_path.parent, 0o700)
-            self.control_path.unlink(missing_ok=True)
-            self._process = subprocess.Popen(
-                self._master_arguments(),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-            startup_deadline = min(
-                deadline - TRANSPORT_CLEANUP_RESERVE,
-                time.monotonic() + self.connect_timeout + 5,
-            )
-            while time.monotonic() < startup_deadline:
-                if self._process.poll() is not None:
-                    detail = b""
-                    if self._process.stderr is not None:
-                        detail = self._process.stderr.read()
-                    raise TransportUnavailable(
-                        detail.decode("utf-8", "replace").strip()
-                        or "SSH ControlMaster exited before becoming ready"
+            try:
+                self.control_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                os.chmod(self.control_path.parent, 0o700)
+                self.control_path.unlink(missing_ok=True)
+                self._process = subprocess.Popen(
+                    self._master_arguments(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                startup_deadline = min(
+                    deadline - TRANSPORT_CLEANUP_RESERVE,
+                    time.monotonic() + self.connect_timeout + 5,
+                )
+                while time.monotonic() < startup_deadline:
+                    if self._process.poll() is not None:
+                        detail = b""
+                        if self._process.stderr is not None:
+                            detail = self._process.stderr.read()
+                        raise TransportUnavailable(
+                            detail.decode("utf-8", "replace").strip()
+                            or "SSH ControlMaster exited before becoming ready"
+                        )
+                    if self.control_path.exists() and self._check_locked(deadline):
+                        return
+                    time.sleep(
+                        min(0.05, max(0.0, startup_deadline - time.monotonic()))
                     )
-                if self.control_path.exists() and self._check_locked(deadline):
-                    return
-                time.sleep(min(0.05, max(0.0, startup_deadline - time.monotonic())))
-            self._stop_locked(deadline)
-            raise TransportUnavailable("timed out starting the SSH ControlMaster")
-        except BaseException:
-            self._stop_locked(deadline)
-            raise
+                self._stop_locked(deadline)
+                raise TransportUnavailable("timed out starting the SSH ControlMaster")
+            except BaseException:
+                self._stop_locked(deadline)
+                raise
         finally:
             self._lock.release()
 
@@ -265,6 +272,17 @@ class SSHMultiplexer:
         self._lock_for_deadline(deadline, "SSH ControlMaster invalidation lock")
         try:
             self._stop_locked(deadline)
+        finally:
+            self._lock.release()
+
+    def invalidate_if_unhealthy(self, deadline: float | None = None) -> bool:
+        deadline = deadline or time.monotonic() + RECOVERY_PROBE_TIMEOUT
+        self._lock_for_deadline(deadline, "SSH ControlMaster health-check lock")
+        try:
+            if self._check_locked(deadline):
+                return False
+            self._stop_locked(deadline)
+            return True
         finally:
             self._lock.release()
 
@@ -374,6 +392,19 @@ class RemoteQueue:
         except (OSError, subprocess.SubprocessError):
             pass
 
+    def _invalidate_transport_if_unhealthy(self, deadline: float) -> None:
+        if self.multiplexer is None:
+            return
+        check = getattr(self.multiplexer, "invalidate_if_unhealthy", None)
+        if check is None:
+            # Preserve compatibility for injected multiplexers without health checks.
+            self._invalidate_transport(deadline)
+            return
+        try:
+            check(deadline)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
     def _recovery_probe(self) -> None:
         deadline = time.monotonic() + RECOVERY_PROBE_TIMEOUT
         arguments = self._ssh_arguments("available", deadline=deadline)
@@ -391,7 +422,7 @@ class RemoteQueue:
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
-            self._invalidate_transport(deadline)
+            self._invalidate_transport_if_unhealthy(deadline)
             raise
         if result.returncode == 255:
             self._notice_ssh_failure(result.returncode, deadline)
@@ -435,12 +466,14 @@ class RemoteQueue:
         deadline = time.monotonic() + timeout
         try:
             yield deadline
-        except (TransportUnavailable, subprocess.TimeoutExpired, OSError) as exc:
+        except TransportUnavailable:
             if gate is not None:
                 gate.failed(generation)
-            self._invalidate_transport(deadline)
-            if isinstance(exc, TransportUnavailable):
-                raise
+            raise
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            if gate is not None:
+                gate.failed(generation)
+            self._invalidate_transport_if_unhealthy(deadline)
             raise TransportUnavailable(str(exc)) from exc
         except BaseException:
             if gate is not None:
@@ -508,6 +541,7 @@ class RemoteQueue:
                 check=False,
             )
             if result.returncode == 255:
+                self._notice_ssh_failure(result.returncode, deadline)
                 stderr = result.stderr
                 if isinstance(stderr, bytes):
                     stderr = stderr.decode("utf-8", "replace")
@@ -587,6 +621,7 @@ class RemoteQueue:
                         check=False,
                     )
                     if process.returncode == 255:
+                        self._notice_ssh_failure(process.returncode, deadline)
                         detail = process.stderr.decode("utf-8", "replace").strip()
                         raise TransportUnavailable(
                             detail or "stream failed with status 255"

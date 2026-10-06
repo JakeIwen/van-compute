@@ -125,8 +125,11 @@ unless the canonical compute provider has matching source markers, readable and
 importable metrics, and no maintenance/upgrade-owner fence. It does not require
 a fresh Mac heartbeat or the new checkout's source hash. This guard preserves the
 supervised first cutover; it never launches the Mac installer automatically to
-repair a missing provider. Run the following only from the owner's Terminal in
-a clean reviewed checkout (do not reset or deploy the diverged owner checkout):
+repair a missing provider. A scoped `deploy_python.py --update` selecting the
+dashboard (including the default all-services selection) runs the same provider
+check before transferring a package; dry-run remains entirely local. Run the
+following only from the owner's Terminal in a clean reviewed checkout (do not
+reset or deploy the diverged owner checkout):
 
 ```zsh
 ( set -eu
@@ -144,9 +147,11 @@ ssh pi@vanpi.lan 'set -eu; /usr/bin/systemctl is-active van-compute-broker.servi
 )
 ```
 
-Keep this reviewed worktree for recovery. Broad sync always reads the primary
-checkout, even when invoked from a worktree: do not use it until the owner has
-reconciled that checkout with these fixes without discarding unrelated work.
+Keep this reviewed worktree until the deployment completes. Afterward the
+installed release carries its own frozen installer for recovery, independent of
+this worktree. Broad sync always reads the primary checkout, even when invoked
+from a worktree: do not use it until the owner has reconciled that checkout with
+these fixes without discarding unrelated work.
 
 After that supervised provider-first cutover, routine repository-wide updates
 remain supported:
@@ -307,12 +312,33 @@ printf 'Mac: %s\nPi:  %s\n' "$PREVIOUS_MAC_RELEASE" "$PREVIOUS_PI_RELEASE"
 
 If a deployment reports that protocol replacement began or maintenance remains
 active, do not switch either release link or bootstrap the old worker manually.
-Resume the owned, fenced upgrade forward:
+Resume the owned, fenced upgrade forward using the frozen installer in the Mac
+release built for that deployment, not a disposable source worktree. If the
+LaunchAgent already pins that intended generation, obtain its path with:
 
 ```zsh
-cd /Users/jacobr/dev/scripts/.claude/worktrees/compute-first-deploy
-./macbook/scripts/install_van_compute_worker.zsh
+RECOVERY_PYTHON="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$HOME/Library/LaunchAgents/com.jacobr.van-compute-worker.plist")"
+RECOVERY_RELEASE="${RECOVERY_PYTHON%/venv/bin/python}"
+test "$RECOVERY_RELEASE" != "$RECOVERY_PYTHON"
 ```
+
+**Before LaunchAgent replacement, its plist may still name the older release.**
+In that case, set `RECOVERY_RELEASE` to the exact newly built generation for the
+interrupted deployment instead; check its `provenance.json` against the intended
+source. Never resume a post-cutover upgrade with that older installer. Preserve
+the original host/worker identity and dataset/isolation overrides. Then run:
+
+```zsh
+( set -eu
+RECOVERY_INSTALLER="$RECOVERY_RELEASE/app/macbook/scripts/install_van_compute_worker.zsh"
+test -x "$RECOVERY_INSTALLER"
+"$RECOVERY_INSTALLER" --dry-run
+"$RECOVERY_INSTALLER"
+)
+```
+
+The frozen `.zsh` entrypoint uses the system Python, so recovery also works when
+the release's private venv interpreter needs repair.
 
 After a deployment completed successfully and released maintenance, a deliberate
 rollback is a new coupled deployment through the prior installer. For a retained

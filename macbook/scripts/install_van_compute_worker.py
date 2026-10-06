@@ -220,6 +220,13 @@ class State:
     upgrade_public_root: str = ""
 
 
+@dataclass(frozen=True)
+class OwnedBuild:
+    path: Path
+    device: int
+    inode: int
+
+
 class LocalRunner:
     """Vector-only local command runner; injectable in tests."""
 
@@ -1226,6 +1233,161 @@ printf '%s\n' "$selected"
         except DeploymentError:
             return False
 
+    def _installed_release_reference(self) -> Path | None:
+        target = self.paths.target_plist
+        try:
+            details = target.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise DeploymentError(
+                f"installed LaunchAgent is unreadable: {target}: {exc}"
+            ) from None
+        if not stat.S_ISREG(details.st_mode):
+            raise DeploymentError(
+                f"installed LaunchAgent is not a regular non-symlink file: {target}"
+            )
+        try:
+            payload = plistlib.loads(target.read_bytes())
+            arguments = payload.get("ProgramArguments")
+            environment = payload.get("EnvironmentVariables")
+            if (
+                not isinstance(arguments, list)
+                or not all(isinstance(item, str) for item in arguments)
+                or arguments.count("van_compute.worker") != 1
+                or not isinstance(environment, dict)
+            ):
+                raise ValueError
+            module_index = arguments.index("van_compute.worker")
+            if module_index < 2 or arguments[module_index - 1] != "-m":
+                raise ValueError
+            python = Path(arguments[0])
+            release = python.parents[2]
+        except (
+            AttributeError,
+            IndexError,
+            OSError,
+            TypeError,
+            ValueError,
+            plistlib.InvalidFileException,
+        ):
+            raise DeploymentError(
+                f"installed LaunchAgent release reference is ambiguous: {target}"
+            ) from None
+        if (
+            release.parent != self.paths.release_parent
+            or not re.fullmatch(r"[0-9a-f]{24}(?:-[0-9a-f]{32})?", release.name)
+            or python != release / "venv/bin/python"
+            or environment.get("PYTHONPATH") != str(release / "app")
+        ):
+            raise DeploymentError(
+                f"installed LaunchAgent release reference is ambiguous: {target}"
+            )
+        return release
+
+    def _validate_failed_build_cleanup(self, owned: OwnedBuild) -> None:
+        root = owned.path
+        if (
+            root.parent != self.paths.release_parent
+            or not re.fullmatch(r"[0-9a-f]{24}-[0-9a-f]{32}", root.name)
+        ):
+            raise DeploymentError(f"failed build path is outside the release root: {root}")
+        try:
+            parent_details = root.parent.lstat()
+            root_details = root.lstat()
+        except OSError as exc:
+            raise DeploymentError(
+                f"failed build identity could not be revalidated: {root}: {exc}"
+            ) from None
+        if not stat.S_ISDIR(parent_details.st_mode) or stat.S_ISLNK(
+            parent_details.st_mode
+        ):
+            raise DeploymentError(f"Mac release parent became unsafe: {root.parent}")
+        if (
+            not stat.S_ISDIR(root_details.st_mode)
+            or stat.S_ISLNK(root_details.st_mode)
+            or (root_details.st_dev, root_details.st_ino)
+            != (owned.device, owned.inode)
+        ):
+            raise DeploymentError(f"failed build identity changed: {root}")
+        if self.release_retention_ambiguous or self.prior_release == root:
+            raise DeploymentError(f"failed build is protected from cleanup: {root}")
+        installed = self._installed_release_reference()
+        if installed == root:
+            raise DeploymentError(f"failed build is referenced by the LaunchAgent: {root}")
+        for path in (root, *root.rglob("*")):
+            details = path.lstat()
+            if stat.S_ISLNK(details.st_mode):
+                raise DeploymentError(f"failed build contains a symlink: {path}")
+            if not (stat.S_ISDIR(details.st_mode) or stat.S_ISREG(details.st_mode)):
+                raise DeploymentError(f"failed build contains a special entry: {path}")
+            if os.path.ismount(path):
+                raise DeploymentError(f"failed build contains a mount: {path}")
+
+    def _remove_failed_build(self, owned: OwnedBuild) -> None:
+        self._validate_failed_build_cleanup(owned)
+        shutil.rmtree(owned.path)
+
+    def _build_mac_release(self, source: SourceRelease) -> Path:
+        build_id = uuid.UUID(str(self.uuid_factory())).hex
+        release = self.paths.release_parent / f"{source.mac_version}-{build_id}"
+        # Build at the final unique path: pip entrypoint shebangs embed it. mkdir
+        # is exclusive, so only a directory created here can become owned here.
+        release.mkdir(mode=0o700)
+        details = release.lstat()
+        if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
+            raise DeploymentError(f"new Mac release directory is unsafe: {release}")
+        owned = OwnedBuild(release, details.st_dev, details.st_ino)
+        try:
+            self.say("Building an isolated Python environment...")
+            self.local.run([
+                "/opt/homebrew/bin/python3", "-m", "venv", "--copies", str(release / "venv"),
+            ])
+            self.local.run([
+                str(release / "venv/bin/python"), "-m", "pip", "install",
+                "--disable-pip-version-check", "--no-input",
+                "androguard", "can-isotp", "numpy", "pytest",
+            ])
+            self._copy_source_tree(release, source)
+            self._verify_staged_source(release / "app", source)
+            (release / "sandbox.sb").write_text(SANDBOX_PROFILE, encoding="utf-8")
+            os.chmod(release / "sandbox.sb", 0o600)
+            if not self._runtime_healthy(release):
+                raise DeploymentError(
+                    f"new Mac release interpreter validation failed: {release}"
+                )
+            self._validate_mac_release(release, source)
+            (release / SOURCE_HASH_FILE).write_text(
+                source.source_fingerprint + "\n", encoding="utf-8"
+            )
+            (release / DEPLOYMENT_HASH_FILE).write_text(
+                source.deployment_fingerprint + "\n", encoding="utf-8"
+            )
+            provenance = self.provenance(source, "mac-worker")
+            provenance["build_id"] = build_id
+            (release / PROVENANCE_FILE).write_text(
+                json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            for marker in (SOURCE_HASH_FILE, DEPLOYMENT_HASH_FILE, PROVENANCE_FILE):
+                os.chmod(release / marker, 0o600)
+            self._write_manifest(release)
+            self._verify_release(release, source)
+        except BaseException:
+            try:
+                self._remove_failed_build(owned)
+            except BaseException as cleanup_error:
+                try:
+                    self.warn(
+                        f"WARNING: failed Mac build was retained because cleanup was unsafe: "
+                        f"{release}: {cleanup_error}"
+                    )
+                except BaseException:
+                    pass
+            raise
+        self.release = release
+        return release
+
     def prepare_mac_release(self, source: SourceRelease) -> Path:
         self.ensure_cache_directories()
         canonical = self.paths.release_parent / source.mac_version
@@ -1260,40 +1422,7 @@ printf '%s\n' "$selected"
         if self.paths.release_parent.is_symlink():
             raise DeploymentError("Mac release parent must not be a symlink")
         os.chmod(self.paths.release_parent, 0o700)
-        build_id = uuid.UUID(str(self.uuid_factory())).hex
-        release = self.paths.release_parent / f"{source.mac_version}-{build_id}"
-        # Build at the final unique path: pip entrypoint shebangs embed it. The
-        # manifest is the completion marker; partial generations are never reused.
-        release.mkdir(mode=0o700)
-        self.say("Building an isolated Python environment...")
-        self.local.run([
-            "/opt/homebrew/bin/python3", "-m", "venv", "--copies", str(release / "venv"),
-        ])
-        self.local.run([
-            str(release / "venv/bin/python"), "-m", "pip", "install",
-            "--disable-pip-version-check", "--no-input",
-            "androguard", "can-isotp", "numpy", "pytest",
-        ])
-        self._copy_source_tree(release, source)
-        self._verify_staged_source(release / "app", source)
-        (release / "sandbox.sb").write_text(SANDBOX_PROFILE, encoding="utf-8")
-        os.chmod(release / "sandbox.sb", 0o600)
-        if not self._runtime_healthy(release):
-            raise DeploymentError(f"new Mac release interpreter validation failed: {release}")
-        self._validate_mac_release(release, source)
-        (release / SOURCE_HASH_FILE).write_text(source.source_fingerprint + "\n", encoding="utf-8")
-        (release / DEPLOYMENT_HASH_FILE).write_text(source.deployment_fingerprint + "\n", encoding="utf-8")
-        provenance = self.provenance(source, "mac-worker")
-        provenance["build_id"] = build_id
-        (release / PROVENANCE_FILE).write_text(
-            json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8",
-        )
-        for marker in (SOURCE_HASH_FILE, DEPLOYMENT_HASH_FILE, PROVENANCE_FILE):
-            os.chmod(release / marker, 0o600)
-        self._write_manifest(release)
-        self._verify_release(release, source)
-        self.release = release
-        return release
+        return self._build_mac_release(source)
 
     def validate_dataset(self, path: Path) -> None:
         self._regular_file(path, "dataset configuration")
@@ -2119,7 +2248,7 @@ case "$stage" in /home/pi/.cache/van-compute-install.*) /bin/rm -rf -- "$stage";
                 self.warn(
                     "The previous Mac worker remains disabled; rerun this installer."
                 )
-        if self.state.remote_stage_created:
+        if self.state.remote_stage_created and not self.state.cutover_started:
             try:
                 self.remove_remote_stage()
             except DeploymentError:
