@@ -14,6 +14,12 @@ class ComputeRunbookTests(unittest.TestCase):
         self.assertIn('restore --source=c69a7a6', command)
         self.assertIn('cp "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.py"', command)
         self.assertIn('cp "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.zsh"', command)
+        self.assertIn(
+            'cp -R "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/van_compute_installer"',
+            command,
+        )
+        self.assertIn('if test -d', command)
+        self.assertIn('legacy monolithic frozen installer', text)
         self.assertTrue(command.endswith('--dry-run'))
 
 

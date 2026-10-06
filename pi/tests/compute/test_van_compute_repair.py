@@ -7,8 +7,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from macbook.scripts import install_van_compute_worker as deployer
-from pi.tests.compute import test_van_compute_deployment as fixtures
+from macbook.scripts.van_compute_installer import cli as installer_cli
+from macbook.scripts.van_compute_installer.models import DeploymentError, Options
+from macbook.scripts.van_compute_installer.orchestrator import Installer
+from pi.tests.compute import van_compute_deployment_support as fixtures
 
 
 class ProvisioningLocal(fixtures.FakeLocal):
@@ -33,7 +35,7 @@ class MacReleaseRepairTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.directory = temporary.name
-        self.helpers = fixtures.VanComputeDeploymentTests()
+        self.helpers = fixtures.DeploymentFixtureMixin()
         self.local = ProvisioningLocal()
         self.installer = self.helpers.make_installer(self.directory, local=self.local)
         self.source = self.installer.build_source_release()
@@ -89,7 +91,7 @@ class MacReleaseRepairTests(unittest.TestCase):
         new = self.installer.prepare_mac_release(self.source)
         self.assertNotEqual(new, self.old)
         (self.old / 'app/van_compute/worker.py').write_text('# tampered\n')
-        with self.assertRaisesRegex(deployer.DeploymentError, 'hash mismatch'):
+        with self.assertRaisesRegex(DeploymentError, 'hash mismatch'):
             self.installer.prepare_mac_release(self.source)
 
     def test_failed_rebuild_never_drains_and_leaves_old_release_unchanged(self):
@@ -99,7 +101,7 @@ class MacReleaseRepairTests(unittest.TestCase):
              mock.patch.object(self.installer, 'acquire_lock_and_owner', return_value=fixtures.FakeLock([])), \
              mock.patch.object(self.installer, 'remote_preflight'), \
              mock.patch.object(self.installer, 'drain_worker') as drain:
-            with self.assertRaisesRegex(deployer.DeploymentError, 'new Mac release interpreter'):
+            with self.assertRaisesRegex(DeploymentError, 'new Mac release interpreter'):
                 self.installer.execute()
         drain.assert_not_called()
         self.assertEqual(self.snapshot(self.old), before)
@@ -114,18 +116,18 @@ class MacReleaseRepairTests(unittest.TestCase):
     def test_suffix_and_provenance_must_match(self):
         new = self.old.with_name(self.old.name + '-' + 'd' * 32)
         self.old.rename(new)
-        with self.assertRaisesRegex(deployer.DeploymentError, 'build identity mismatch'):
+        with self.assertRaisesRegex(DeploymentError, 'build identity mismatch'):
             self.installer._release_identity(new)
         malformed = new.with_name(self.source.mac_version + '-not-a-uuid')
         new.rename(malformed)
-        with self.assertRaisesRegex(deployer.DeploymentError, 'owned real directory'):
+        with self.assertRaisesRegex(DeploymentError, 'owned real directory'):
             self.installer._release_identity(malformed)
 
     def test_frozen_installer_prefers_its_own_generation(self):
-        self.installer.options = deployer.Options(rebuild=True)
+        self.installer.options = Options(rebuild=True)
         new = self.installer.prepare_mac_release(self.source)
-        frozen = deployer.Installer(
-            deployer.Options(), environment={}, home=self.installer.home,
+        frozen = Installer(
+            Options(), environment={}, home=self.installer.home,
             script=new / 'app/macbook/scripts/install_van_compute_worker.py',
             local=self.local, remote=fixtures.FakeRemote(), stdout=io.StringIO(), stderr=io.StringIO())
         frozen.prior_release = self.old
@@ -133,7 +135,7 @@ class MacReleaseRepairTests(unittest.TestCase):
             self.assertEqual(frozen.prepare_mac_release(frozen.build_source_release()), new)
 
     def test_rebuild_overrides_if_needed_and_dry_run_writes_nothing(self):
-        options = deployer.parse_arguments(['--if-needed', '--rebuild'])
+        options = installer_cli.parse_arguments(['--if-needed', '--rebuild'])
         workflow = fixtures.WorkflowInstaller(options, self.source)
         with mock.patch.object(workflow, 'deployment_current', return_value=True) as current:
             self.assertEqual(workflow.execute(), 0)
@@ -142,7 +144,7 @@ class MacReleaseRepairTests(unittest.TestCase):
         out = io.StringIO()
         dry = self.helpers.make_installer(
             Path(self.directory) / 'dry', stdout=out,
-            options=deployer.parse_arguments(['--if-needed', '--rebuild', '--dry-run']))
+            options=installer_cli.parse_arguments(['--if-needed', '--rebuild', '--dry-run']))
         dry.execute()
         self.assertTrue(json.loads(out.getvalue())['rebuild'])
         self.assertFalse(dry.paths.home.exists())
@@ -150,7 +152,7 @@ class MacReleaseRepairTests(unittest.TestCase):
         self.assertEqual(dry.remote.calls, [])
 
     def test_if_needed_recreates_caches_and_rejects_broken_runtime(self):
-        self.installer.options = deployer.Options(if_needed=True)
+        self.installer.options = Options(if_needed=True)
         self.local.launch_states = ['pid = 99']
         self.assertEqual(self.installer.execute(), 0)
         self.assertTrue((self.installer.paths.cache_root / 'logs').is_dir())

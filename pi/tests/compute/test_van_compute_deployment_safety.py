@@ -6,11 +6,15 @@ import unittest
 import uuid
 from unittest import mock
 
-from macbook.scripts import install_van_compute_worker as deployer
-from pi.tests.compute import test_van_compute_deployment as fixtures
+from macbook.scripts.van_compute_installer import cli as installer_cli
+from macbook.scripts.van_compute_installer import constants as installer_constants
+from macbook.scripts.van_compute_installer import mac as installer_mac
+from macbook.scripts.van_compute_installer.models import DeploymentError, Options
+from macbook.scripts.van_compute_installer.orchestrator import Installer
+from pi.tests.compute import van_compute_deployment_support as fixtures
 
 
-REAL_INSTALLER = deployer.Installer
+REAL_INSTALLER = Installer
 
 
 class BuildLocal(fixtures.FakeLocal):
@@ -51,7 +55,7 @@ class CutoverRemote(fixtures.FakeRemote):
 
 class CutoverWorkflow(fixtures.WorkflowInstaller):
     def __init__(self, source, remote):
-        super().__init__(deployer.Options(), source)
+        super().__init__(Options(), source)
         self.remote = remote
 
     def cutover_remote(self, source):
@@ -65,7 +69,7 @@ class CutoverWorkflow(fixtures.WorkflowInstaller):
 
 class FailedBuildCleanupTests(unittest.TestCase):
     def setUp(self):
-        self.helpers = fixtures.VanComputeDeploymentTests()
+        self.helpers = fixtures.DeploymentFixtureMixin()
 
     @staticmethod
     def snapshot(path):
@@ -97,7 +101,7 @@ class FailedBuildCleanupTests(unittest.TestCase):
             self.assertEqual(self.snapshot(path), before)
 
     def test_pip_failure_removes_only_the_owned_generation(self):
-        failure = deployer.DeploymentError('pip failed')
+        failure = DeploymentError('pip failed')
         with tempfile.TemporaryDirectory() as directory:
             local = BuildLocal(failure)
             installer = self.make_installer(directory, local)
@@ -105,7 +109,7 @@ class FailedBuildCleanupTests(unittest.TestCase):
             retained = self.create_retained_releases(installer)
             snapshots = {path: self.snapshot(path) for path in retained}
             with mock.patch.object(installer, '_install_formulae'):
-                with self.assertRaises(deployer.DeploymentError) as raised:
+                with self.assertRaises(DeploymentError) as raised:
                     installer.prepare_mac_release(source)
             self.assertIs(raised.exception, failure)
             self.assertEqual(set(installer.paths.release_parent.iterdir()), set(retained))
@@ -113,7 +117,7 @@ class FailedBuildCleanupTests(unittest.TestCase):
 
     def test_validation_failure_and_keyboard_interrupt_remove_owned_generation(self):
         failures = (
-            deployer.DeploymentError('validation failed'),
+            DeploymentError('validation failed'),
             KeyboardInterrupt(),
         )
         for failure in failures:
@@ -137,7 +141,7 @@ class FailedBuildCleanupTests(unittest.TestCase):
 
     def test_mount_or_symlink_uncertainty_retains_failed_generation(self):
         for hazard in ('mount', 'symlink'):
-            failure = deployer.DeploymentError('original build failure')
+            failure = DeploymentError('original build failure')
             with self.subTest(hazard=hazard), \
                  tempfile.TemporaryDirectory() as directory:
                 callback = None
@@ -155,9 +159,9 @@ class FailedBuildCleanupTests(unittest.TestCase):
                 mount_check = lambda path: hazard == 'mount' and Path(path) == expected
                 with mock.patch.object(installer, '_install_formulae'), \
                      mock.patch.object(
-                         deployer.os.path, 'ismount', side_effect=mount_check
+                         installer_mac.os.path, 'ismount', side_effect=mount_check
                      ):
-                    with self.assertRaises(deployer.DeploymentError) as raised:
+                    with self.assertRaises(DeploymentError) as raised:
                         installer.prepare_mac_release(source)
                 self.assertIs(raised.exception, failure)
                 self.assertTrue(expected.is_dir())
@@ -165,7 +169,7 @@ class FailedBuildCleanupTests(unittest.TestCase):
 
     def test_protected_or_ambiguous_launchagent_reference_retains_build(self):
         for protection in ('prior', 'installed', 'ambiguous'):
-            failure = deployer.DeploymentError('pip failed')
+            failure = DeploymentError('pip failed')
             with self.subTest(protection=protection), \
                  tempfile.TemporaryDirectory() as directory:
                 holder = {}
@@ -187,7 +191,7 @@ class FailedBuildCleanupTests(unittest.TestCase):
                         'not a plist\n', encoding='utf-8'
                     )
                 with mock.patch.object(installer, '_install_formulae'):
-                    with self.assertRaises(deployer.DeploymentError) as raised:
+                    with self.assertRaises(DeploymentError) as raised:
                         installer.prepare_mac_release(source)
                 self.assertIs(raised.exception, failure)
                 generations = list(installer.paths.release_parent.iterdir())
@@ -226,34 +230,34 @@ class FailedBuildCleanupTests(unittest.TestCase):
                  mock.patch.object(
                      installer,
                      'stage_remote_release',
-                     side_effect=deployer.DeploymentError('later deployment failure'),
+                     side_effect=DeploymentError('later deployment failure'),
                  ):
                 with self.assertRaisesRegex(
-                    deployer.DeploymentError, 'later deployment failure'
+                    DeploymentError, 'later deployment failure'
                 ):
                     installer.execute()
             self.assertIsNotNone(installer.release)
-            self.assertTrue((installer.release / deployer.MANIFEST_FILE).is_file())
+            self.assertTrue((installer.release / installer_constants.MANIFEST_FILE).is_file())
             installer._verify_release(installer.release, installer.source)
 
 
 class CutoverInterruptionTests(unittest.TestCase):
     def setUp(self):
-        helper = fixtures.VanComputeDeploymentTests()
+        helper = fixtures.DeploymentFixtureMixin()
         helper.setUp()
         self.source = helper.source
 
     def test_cutover_interruptions_keep_remote_stage_and_fences(self):
         for interruption in (
-            deployer.signal.SIGHUP,
-            deployer.signal.SIGTERM,
+            installer_cli.signal.SIGHUP,
+            installer_cli.signal.SIGTERM,
             'ctrl-c',
         ):
             with self.subTest(interruption=interruption):
                 installed = {}
                 previous = {
-                    deployer.signal.SIGHUP: object(),
-                    deployer.signal.SIGTERM: object(),
+                    installer_cli.signal.SIGHUP: object(),
+                    installer_cli.signal.SIGTERM: object(),
                 }
                 signal_calls = []
 
@@ -273,11 +277,11 @@ class CutoverInterruptionTests(unittest.TestCase):
                 installer = CutoverWorkflow(self.source, remote)
                 stderr = io.StringIO()
                 with mock.patch.object(
-                    deployer, 'Installer', return_value=installer
+                    installer_cli, 'Installer', return_value=installer
                 ), mock.patch.object(
-                    deployer.signal, 'signal', side_effect=fake_signal
-                ), mock.patch.object(deployer.sys, 'stderr', stderr):
-                    self.assertEqual(deployer.main([]), 130)
+                    installer_cli.signal, 'signal', side_effect=fake_signal
+                ), mock.patch.object(installer_cli.sys, 'stderr', stderr):
+                    self.assertEqual(installer_cli.main([]), 130)
 
                 names = [call[0] for call in remote.calls]
                 self.assertIn('cutover', names)
@@ -299,8 +303,8 @@ class CutoverInterruptionTests(unittest.TestCase):
                 self.assertEqual(
                     signal_calls[2:],
                     [
-                        (deployer.signal.SIGHUP, previous[deployer.signal.SIGHUP]),
-                        (deployer.signal.SIGTERM, previous[deployer.signal.SIGTERM]),
+                        (installer_cli.signal.SIGHUP, previous[installer_cli.signal.SIGHUP]),
+                        (installer_cli.signal.SIGTERM, previous[installer_cli.signal.SIGTERM]),
                     ],
                 )
 

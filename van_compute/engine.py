@@ -7,25 +7,21 @@ See docs in pi/docs/compute/VAN_COMPUTE.md for the preserved compatibility drift
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 import os
 from pathlib import Path
 import shutil
-import signal
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
-import time
 from typing import Callable, Mapping, Protocol, Sequence, TypeVar
 
 from van_compute import protocol
-
-
-class Host(Enum):
-    PI = "pi"
-    MAC = "mac"
+from van_compute.engine_process import (
+    Host, ProcessOutcome, process_group_exists, terminate_group,
+    wait4_nohang, wait_for_process,
+)
 
 
 class Sandbox(Protocol):
@@ -36,19 +32,6 @@ class Sandbox(Protocol):
         self, executable: str, family: str
     ) -> tuple[str, list[tuple[Path, str]]]: ...
     def wrap(self, command: Sequence[str]) -> list[str]: ...
-
-
-@dataclass(frozen=True)
-class ProcessOutcome:
-    exit_code: int
-    usage: object
-    timed_out: bool
-    interrupted: bool
-    resource_limit: str | None
-    resource_monitor_error: str | None
-    minimum_filesystem_free_bytes: int | None
-    peak_process_group_rss_bytes: int = 0
-    peak_process_count: int = 0
 
 
 T = TypeVar("T")
@@ -76,196 +59,6 @@ def run_child(
             start_new_session=True,
         )
         return supervise(process)
-
-
-def wait4_nohang(process: subprocess.Popen):
-    waited_pid, status, usage = os.wait4(process.pid, os.WNOHANG)
-    if waited_pid == 0:
-        return None
-    process.returncode = os.waitstatus_to_exitcode(status)
-    return process.returncode, usage
-
-
-def wait_for_process(
-    process: subprocess.Popen,
-    *,
-    host: Host,
-    error_type: type[RuntimeError],
-    timeout: int,
-    should_stop: Callable[[], bool],
-    work_path: Path | None,
-    minimum_free_bytes: int,
-    free_space_reader: Callable[[Path], int],
-    maximum_memory: int = 0,
-    maximum_processes: int = 0,
-    resource_reader: Callable[[int], tuple[int, int]] | None = None,
-    poll: Callable = wait4_nohang,
-    clock=time,
-) -> ProcessOutcome:
-    """Shared wait/reap/escalation; Pi final disk sample and Mac RSS stay distinct."""
-    deadline = clock.monotonic() + timeout
-    next_resource_poll = 0.0
-    timed_out = interrupted = False
-    resource_limit = resource_monitor_error = None
-    lowest_free_bytes = None
-    peak_group_rss = peak_processes = 0
-
-    def sample_free_space():
-        nonlocal lowest_free_bytes, resource_limit, resource_monitor_error
-        if work_path is None:
-            return
-        try:
-            free_bytes = free_space_reader(work_path)
-        except OSError as exc:
-            resource_monitor_error = f"free-space watchdog failed: {exc}"
-            return
-        lowest_free_bytes = (
-            free_bytes
-            if lowest_free_bytes is None
-            else min(lowest_free_bytes, free_bytes)
-        )
-        if free_bytes < minimum_free_bytes:
-            label = "execution safety threshold " if host is Host.PI else ""
-            resource_limit = (
-                f"filesystem free space fell below {label}{minimum_free_bytes} bytes"
-            )
-
-    def outcome(code, usage):
-        return ProcessOutcome(
-            code,
-            usage,
-            timed_out,
-            interrupted,
-            resource_limit,
-            resource_monitor_error,
-            lowest_free_bytes,
-            peak_group_rss,
-            peak_processes,
-        )
-
-    while True:
-        completed = poll(process)
-        if completed is not None:
-            if host is Host.PI:
-                sample_free_space()
-            return outcome(
-                (
-                    137
-                    if resource_limit
-                    else 125 if resource_monitor_error else completed[0]
-                ),
-                completed[1],
-            )
-        if should_stop():
-            interrupted = True
-            break
-        now = clock.monotonic()
-        if now >= deadline:
-            timed_out = True
-            break
-        if now >= next_resource_poll:
-            if host is Host.MAC:
-                assert resource_reader is not None
-                try:
-                    group_rss, process_count = resource_reader(process.pid)
-                except (OSError, subprocess.SubprocessError, error_type) as exc:
-                    resource_monitor_error = str(exc)
-                    break
-                peak_group_rss = max(peak_group_rss, group_rss)
-                peak_processes = max(peak_processes, process_count)
-                if group_rss > maximum_memory:
-                    resource_limit = (
-                        f"process-group RSS exceeded {maximum_memory} bytes"
-                    )
-                    break
-                if process_count > maximum_processes:
-                    resource_limit = f"process count exceeded {maximum_processes}"
-                    break
-            sample_free_space()
-            if resource_limit is not None or resource_monitor_error is not None:
-                break
-            next_resource_poll = now + (0.5 if host is Host.PI else 1.0)
-        clock.sleep(0.1)
-
-    limited = (
-        (resource_limit is not None or resource_monitor_error is not None)
-        if host is Host.PI
-        else bool(resource_limit or resource_monitor_error)
-    )
-    if limited:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        waited_pid, status, usage = os.wait4(process.pid, 0)
-        if waited_pid != process.pid:
-            label = "local analysis" if host is Host.PI else "analysis"
-            raise error_type(f"lost track of resource-limited {label} process")
-        process.returncode = os.waitstatus_to_exitcode(status)
-        return outcome(137 if resource_limit else 125, usage)
-
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    terminate_deadline = clock.monotonic() + 10
-    while clock.monotonic() < terminate_deadline:
-        completed = poll(process)
-        if completed is not None:
-            return outcome(124 if timed_out else 143, completed[1])
-        clock.sleep(0.1)
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    waited_pid, status, usage = os.wait4(process.pid, 0)
-    if waited_pid != process.pid:
-        label = "local analysis" if host is Host.PI else "analysis child"
-        raise error_type(f"lost track of {label} process")
-    process.returncode = os.waitstatus_to_exitcode(status)
-    return outcome(124 if timed_out else 143, usage)
-
-
-def process_group_exists(
-    group: int, *, host: Host, error_type: type[RuntimeError]
-) -> bool:
-    try:
-        os.killpg(group, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError as exc:
-        if host is Host.MAC:
-            return True
-        raise error_type(
-            f"cannot inspect analysis process group {group}: {exc}"
-        ) from None
-
-
-def terminate_group(
-    group: int,
-    *,
-    exists: Callable[[int], bool],
-    error_type: type[RuntimeError],
-    host: Host,
-    terminate_grace: float = 2.0,
-    kill_grace: float = 2.0,
-    clock=time,
-) -> bool:
-    if not exists(group):
-        return False
-    for sig, grace in ((signal.SIGTERM, terminate_grace), (signal.SIGKILL, kill_grace)):
-        try:
-            os.killpg(group, sig)
-        except ProcessLookupError:
-            return True
-        deadline = clock.monotonic() + grace
-        while clock.monotonic() < deadline:
-            if not exists(group):
-                return True
-            clock.sleep(0.05)
-    label = f" {group}" if host is Host.PI else ""
-    raise error_type(f"analysis process group{label} survived SIGKILL")
 
 
 def resource_usage(usage, wall_seconds: float) -> dict[str, object]:
@@ -365,6 +158,25 @@ def validate_declared_outputs(
         )
 
 
+def _check_output_tree(output, relative, maximum_bytes, host, error_type):
+    estimated = 4096
+    for count, entry in enumerate(output.rglob("*"), 1):
+        if host is Host.MAC and count > 100_000:
+            raise error_type(f"declared output has too many entries: {relative}")
+        if entry.is_symlink():
+            raise error_type(f"declared output contains a symlink: {relative}")
+        if entry.is_file():
+            estimated += entry.stat().st_size
+        elif not entry.is_dir():
+            raise error_type(f"declared output contains a special file: {relative}")
+        estimated += 4096
+        if estimated > maximum_bytes:
+            article = "the " if host is Host.MAC else ""
+            raise error_type(
+                f"declared output exceeds {article}result limit: {relative}"
+            )
+
+
 def package_output_directories(
     manifest: Mapping[str, object],
     result_root: Path,
@@ -379,22 +191,7 @@ def package_output_directories(
         output = real_declared_output(result_root, relative, error_type)
         if output is None or not output.is_dir():
             continue
-        estimated = 4096
-        for count, entry in enumerate(output.rglob("*"), 1):
-            if host is Host.MAC and count > 100_000:
-                raise error_type(f"declared output has too many entries: {relative}")
-            if entry.is_symlink():
-                raise error_type(f"declared output contains a symlink: {relative}")
-            if entry.is_file():
-                estimated += entry.stat().st_size
-            elif not entry.is_dir():
-                raise error_type(f"declared output contains a special file: {relative}")
-            estimated += 4096
-            if estimated > maximum_bytes:
-                article = "the " if host is Host.MAC else ""
-                raise error_type(
-                    f"declared output exceeds {article}result limit: {relative}"
-                )
+        _check_output_tree(output, relative, maximum_bytes, host, error_type)
         archive_relative = relative.with_name(relative.name + ".tar.gz")
         archive = result_root / archive_relative
         if host is Host.PI:
@@ -498,21 +295,7 @@ def result_files(
     return files
 
 
-def _bubblewrap_command(
-    executable: str,
-    command: Sequence[str],
-    *,
-    source_root: Path,
-    inputs_root: Path,
-    result_root: Path,
-    home_root: Path,
-    temporary_root: Path,
-    cache_root: Path,
-    job_id: str,
-    runtime_bindings: Sequence[tuple[Path, str]] = (),
-    error_type: type[RuntimeError],
-) -> list[str]:
-    """Build a fixed, no-network sandbox around one protocol command."""
+def _bubblewrap_runtime(executable, runtime_bindings, error_type):
     bwrap = Path(executable)
     if not bwrap.is_absolute() or not bwrap.is_file() or not os.access(bwrap, os.X_OK):
         raise error_type(f"bubblewrap is required for Pi fallback: {bwrap}")
@@ -568,72 +351,99 @@ def _bubblewrap_command(
         if not host.is_dir() or host.is_symlink():
             raise error_type(f"sandbox runtime is not a real directory: {host}")
         wrapped.extend(("--ro-bind", str(host), sandbox_path))
-    wrapped.extend(
-        (
-            "--ro-bind",
-            str(source_root),
-            "/job/source",
-            "--ro-bind",
-            str(inputs_root),
-            "/job/inputs",
-            "--bind",
-            str(result_root),
-            "/job/result",
-            "--bind",
-            str(home_root),
-            "/job/home",
-            "--bind",
-            str(temporary_root),
-            "/job/tmp",
-            "--bind",
-            str(cache_root),
-            "/job/cache",
-            "--chdir",
-            "/job/source",
-            "--clearenv",
-            "--setenv",
-            "HOME",
-            "/job/home",
-            "--setenv",
-            "TMPDIR",
-            "/job/tmp/",
-            "--setenv",
-            "XDG_CACHE_HOME",
-            "/job/cache",
-            "--setenv",
-            "XDG_CONFIG_HOME",
-            "/job/home/.config",
-            "--setenv",
-            "LANG",
-            "C.UTF-8",
-            "--setenv",
-            "LC_ALL",
-            "C.UTF-8",
-            "--setenv",
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "--setenv",
-            "PYTHONPATH",
-            "/job/source",
-            "--setenv",
-            "PYTHONNOUSERSITE",
-            "1",
-            "--setenv",
-            "PYTHONDONTWRITEBYTECODE",
-            "1",
-            "--setenv",
-            "PYTEST_ADDOPTS",
-            "-p no:cacheprovider",
-            "--setenv",
-            "VAN_COMPUTE_JOB_ID",
-            job_id,
-            "--setenv",
-            "VAN_COMPUTE_PLACEMENT",
-            "pi-local",
-            "--",
-            *command,
-        )
+    return wrapped
+
+
+def _bubblewrap_job_arguments(
+    source_root, inputs_root, result_root, home_root, temporary_root,
+    cache_root, job_id, command,
+):
+    return (
+        "--ro-bind",
+        str(source_root),
+        "/job/source",
+        "--ro-bind",
+        str(inputs_root),
+        "/job/inputs",
+        "--bind",
+        str(result_root),
+        "/job/result",
+        "--bind",
+        str(home_root),
+        "/job/home",
+        "--bind",
+        str(temporary_root),
+        "/job/tmp",
+        "--bind",
+        str(cache_root),
+        "/job/cache",
+        "--chdir",
+        "/job/source",
+        "--clearenv",
+        "--setenv",
+        "HOME",
+        "/job/home",
+        "--setenv",
+        "TMPDIR",
+        "/job/tmp/",
+        "--setenv",
+        "XDG_CACHE_HOME",
+        "/job/cache",
+        "--setenv",
+        "XDG_CONFIG_HOME",
+        "/job/home/.config",
+        "--setenv",
+        "LANG",
+        "C.UTF-8",
+        "--setenv",
+        "LC_ALL",
+        "C.UTF-8",
+        "--setenv",
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--setenv",
+        "PYTHONPATH",
+        "/job/source",
+        "--setenv",
+        "PYTHONNOUSERSITE",
+        "1",
+        "--setenv",
+        "PYTHONDONTWRITEBYTECODE",
+        "1",
+        "--setenv",
+        "PYTEST_ADDOPTS",
+        "-p no:cacheprovider",
+        "--setenv",
+        "VAN_COMPUTE_JOB_ID",
+        job_id,
+        "--setenv",
+        "VAN_COMPUTE_PLACEMENT",
+        "pi-local",
+        "--",
+        *command,
     )
+
+
+def _bubblewrap_command(
+    executable: str,
+    command: Sequence[str],
+    *,
+    source_root: Path,
+    inputs_root: Path,
+    result_root: Path,
+    home_root: Path,
+    temporary_root: Path,
+    cache_root: Path,
+    job_id: str,
+    runtime_bindings: Sequence[tuple[Path, str]] = (),
+    error_type: type[RuntimeError],
+) -> list[str]:
+    """Build a fixed, no-network sandbox around one protocol command."""
+    wrapped = _bubblewrap_runtime(executable, runtime_bindings, error_type)
+    wrapped.extend(_bubblewrap_job_arguments(
+        source_root, inputs_root, result_root, home_root, temporary_root,
+        cache_root, job_id, command,
+    ))
     return wrapped
 
 

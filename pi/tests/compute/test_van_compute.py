@@ -10,11 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from van_compute import worker
-from van_compute import queue
-from van_compute import config
-from van_compute import metrics
-from van_compute import protocol
+from van_compute import worker, queue, config, metrics, protocol
 
 
 SUMMARY_STUB = """#!/usr/bin/env python3

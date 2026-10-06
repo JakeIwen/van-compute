@@ -148,10 +148,11 @@ ssh pi@vanpi.lan 'set -eu; /usr/bin/systemctl is-active van-compute-broker.servi
 ```
 
 Keep this reviewed worktree until the deployment completes. Afterward the
-installed release carries its own frozen installer for recovery, independent of
-this worktree. Broad sync always reads the primary checkout, even when invoked
-from a worktree: do not use it until the owner has reconciled that checkout with
-these fixes without discarding unrelated work.
+installed release carries its own frozen installer CLI and sibling helper
+package for recovery, independent of this worktree. Broad sync always reads the
+primary checkout, even when invoked from a worktree: do not use it until the
+owner has reconciled that checkout with these fixes without discarding unrelated
+work.
 
 After that supervised provider-first cutover, routine repository-wide updates
 remain supported:
@@ -162,11 +163,12 @@ remain supported:
 
 After its normal Pi deployment succeeds, `sync_scripts.sh` invokes the
 compatibility entry point with `--if-needed`. A fingerprint covers both installer
-entry points, the LaunchAgent template, the allowlisted `van_compute/` sources,
-worker identity, connection target, dataset configuration, and isolation mode.
-Source inputs are immediate `.py` modules in `van_compute/` and `entrypoints/`,
-plus the broker unit and example policy in `configs/`; unrelated data, caches
-and private config files are not transferred. Copied bytes are verified against
+entry points, every named module in the installer helper package, the LaunchAgent
+template, the allowlisted `van_compute/` sources, worker identity, connection
+target, dataset configuration, and isolation mode. Source inputs are immediate
+`.py` modules in `van_compute/` and `entrypoints/`, plus the broker unit and
+example policy in `configs/`; unrelated data, caches and private config files are
+not transferred. Copied bytes are verified against
 the planned source digest, including when an existing release is reused.
 Matching local and Pi provenance plus healthy loaded services make the check exit
 immediately. A changed or unhealthy deployment runs the ordinary drain-first
@@ -364,13 +366,16 @@ Step 1 broker and worker implementations while retaining the new safe installer,
 package entrypoints, unit and metrics provider. Pin the rollback base to the
 reviewed S1 commit `f32ce9e`, not the caller's `HEAD`. Copy the safe deployer from
 the **successfully deployed fixed Mac release** into that base; do not revive
-S1's pre-fix installer. Prepare a separate rollback worktree (creation refuses
+S1's pre-fix installer. Current frozen installers include the sibling
+`van_compute_installer/` package and the overlay copies it with the CLI files;
+a legacy monolithic frozen installer has no helper directory and remains
+self-contained. Prepare a separate rollback worktree (creation refuses
 an existing path; the chained commands stop on failure):
 
 ```zsh
 SAFE_INSTALLER_RELEASE="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$HOME/Library/LaunchAgents/com.jacobr.van-compute-worker.plist" | /usr/bin/sed 's#/venv/bin/python$##')"
 ROLLBACK=/Users/jacobr/dev/scripts/.claude/worktrees/s1-step2-rollback
-test -x "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.py" && git -C /Users/jacobr/dev/scripts worktree add --detach "$ROLLBACK" f32ce9e && git -C "$ROLLBACK" restore --source=c69a7a6 --worktree -- van_compute/broker.py van_compute/worker.py && cp "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.py" "$ROLLBACK/macbook/scripts/install_van_compute_worker.py" && cp "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.zsh" "$ROLLBACK/macbook/scripts/install_van_compute_worker.zsh" && /opt/homebrew/bin/python3 "$ROLLBACK/macbook/scripts/install_van_compute_worker.py" --dry-run
+test -x "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.py" && git -C /Users/jacobr/dev/scripts worktree add --detach "$ROLLBACK" f32ce9e && git -C "$ROLLBACK" restore --source=c69a7a6 --worktree -- van_compute/broker.py van_compute/worker.py && cp "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.py" "$ROLLBACK/macbook/scripts/install_van_compute_worker.py" && cp "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.zsh" "$ROLLBACK/macbook/scripts/install_van_compute_worker.zsh" && { if test -d "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/van_compute_installer"; then cp -R "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/van_compute_installer" "$ROLLBACK/macbook/scripts/"; fi; } && /opt/homebrew/bin/python3 "$ROLLBACK/macbook/scripts/install_van_compute_worker.py" --dry-run
 ```
 
 Review the intentional broker/worker rollback and safe-installer overlay, then

@@ -1168,6 +1168,50 @@ def _record_local_execution_once(
     return queue.record_missed_offload(root, telemetry_record)
 
 
+def _local_analysis_command(
+    args: BrokerConfig, manifest, sandbox: engine.Sandbox, source_root,
+    input_paths, input_values, result_root,
+):
+    host_executables = {"python": args.python, "sqlite3": args.sqlite3}
+    profile = job_profile(manifest)
+    family = (
+        "python" if profile is None else protocol.PROFILE_FAMILIES[str(profile)]
+    )
+    executable = Path(host_executables[family])
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise BrokerError(
+            f"required {family} executable is unavailable: {executable}"
+        )
+    sandbox_binary, runtime_bindings = sandbox.executable(
+        str(executable), family
+    )
+    executables = dict(host_executables)
+    executables[family] = sandbox_binary
+    sandbox_python = (
+        sandbox_binary
+        if family == "python"
+        else sandbox.executable(args.python, "python")[0]
+    )
+    sandbox_source = sandbox.command_path(source_root, "source")
+    sandbox_inputs = [
+        sandbox.command_path(path, "inputs") for path in input_paths
+    ]
+    sandbox_result = sandbox.command_path(result_root, "result")
+    command = protocol.build_command(
+        str(manifest.get("task", "")),
+        python=sandbox_python,
+        source_root=sandbox_source,
+        input_paths=sandbox_inputs,
+        input_values=input_values,
+        result_root=sandbox_result,
+        arguments=manifest.get("arguments", []),
+        execution=manifest.get("execution"),
+        executables=executables,
+        datasets={},
+    )
+    return command, runtime_bindings
+
+
 def execute_claimed_job(
     args: BrokerConfig,
     root: Path,
@@ -1223,42 +1267,9 @@ def execute_claimed_job(
                 job_id,
                 BrokerError,
             )
-            host_executables = {"python": args.python, "sqlite3": args.sqlite3}
-            profile = job_profile(manifest)
-            family = (
-                "python" if profile is None else protocol.PROFILE_FAMILIES[str(profile)]
-            )
-            executable = Path(host_executables[family])
-            if not executable.is_file() or not os.access(executable, os.X_OK):
-                raise BrokerError(
-                    f"required {family} executable is unavailable: {executable}"
-                )
-            sandbox_binary, runtime_bindings = sandbox.executable(
-                str(executable), family
-            )
-            executables = dict(host_executables)
-            executables[family] = sandbox_binary
-            sandbox_python = (
-                sandbox_binary
-                if family == "python"
-                else sandbox.executable(args.python, "python")[0]
-            )
-            sandbox_source = sandbox.command_path(source_root, "source")
-            sandbox_inputs = [
-                sandbox.command_path(path, "inputs") for path in input_paths
-            ]
-            sandbox_result = sandbox.command_path(result_root, "result")
-            command = protocol.build_command(
-                str(manifest.get("task", "")),
-                python=sandbox_python,
-                source_root=sandbox_source,
-                input_paths=sandbox_inputs,
-                input_values=input_values,
-                result_root=sandbox_result,
-                arguments=manifest.get("arguments", []),
-                execution=manifest.get("execution"),
-                executables=executables,
-                datasets={},
+            command, runtime_bindings = _local_analysis_command(
+                args, manifest, sandbox, source_root, input_paths,
+                input_values, result_root,
             )
             sandboxed_command = bubblewrap_command(
                 args.bwrap,

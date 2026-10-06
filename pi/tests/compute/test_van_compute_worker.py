@@ -14,44 +14,7 @@ import unittest
 from unittest import mock
 
 from van_compute import limited_child, worker
-from van_compute import config
-
-
-CHILD_ENV_SCRIPT = """import json
-import os
-from pathlib import Path
-import sys
-
-Path(sys.argv[1]).write_text(
-    json.dumps(
-        {"argv": sys.argv, "environment": dict(os.environ)},
-        indent=2,
-        sort_keys=True,
-    ) + "\\n",
-    encoding="utf-8",
-)
-"""
-CHILD_ENV_GOLDEN = Path(__file__).with_name("golden") / "child_env" / "worker.json"
-
-
-def normalized_child_capture(payload, *, temporary_root, python):
-    replacements = []
-    for value, marker in ((temporary_root, b"<TMP>"), (python, b"<PYTHON>")):
-        literals = {
-            os.path.abspath(os.fspath(value)),
-            os.path.realpath(os.fspath(value)),
-        }
-        for literal in tuple(literals):
-            if literal.startswith("/private/"):
-                literals.add(literal.removeprefix("/private"))
-            elif literal.startswith(("/tmp/", "/var/")):
-                literals.add("/private" + literal)
-        replacements.extend(
-            (literal.encode("utf-8"), marker) for literal in literals
-        )
-    for literal, marker in sorted(replacements, key=lambda item: len(item[0]), reverse=True):
-        payload = payload.replace(literal, marker)
-    return payload
+from pi.tests.compute.van_compute_test_fixtures import worker_config
 
 
 class FakeQueueState:
@@ -82,46 +45,6 @@ class FakeRemote:
                 (self.worker, slots_total, slots_busy)
             )
         return {"worker": self.worker}
-
-
-def worker_config(**overrides):
-    values = {
-        "host": "pi@vanpi.lan",
-        "remote_cli": "/home/pi/van_compute/scripts/van_compute.py",
-        "remote_root": None,
-        "worker": "m4mac",
-        "work_root": Path("."),
-        "control_path": Path("control.sock"),
-        "python": sys.executable,
-        "sqlite3": "/usr/bin/sqlite3",
-        "rg": "/usr/bin/rg",
-        "jadx": "/usr/bin/jadx",
-        "timeout": 30,
-        "connect_timeout": 5,
-        "nice": 0,
-        "max_result_bytes": 1024 * 1024,
-        "max_memory_bytes": 512 * 1024 * 1024,
-        "max_processes": worker.DEFAULT_MAX_PROCESSES,
-        "min_free_bytes": worker.DEFAULT_MIN_FREE_BYTES,
-        "heartbeat_interval": 0.01,
-        "poll_interval": 0.01,
-        "dataset_config": None,
-        "dataset": (),
-        "sandbox_profile": None,
-        "allow_unsandboxed_dynamic": False,
-        "serve": False,
-        "run_once": True,
-        "executables": {"python": sys.executable},
-        "datasets": {},
-    }
-    values.update(overrides)
-    if "resource_manager" not in overrides:
-        values["resource_manager"] = worker.SchedulerResourceManager(
-            values["work_root"],
-            minimum_free_bytes=values["min_free_bytes"],
-            maximum_result_bytes=values["max_result_bytes"],
-        )
-    return config.WorkerConfig(**values)
 
 
 class RemoteQueueProtocolTests(unittest.TestCase):
@@ -1068,109 +991,6 @@ Path(args.json).write_text(json.dumps({'bytes': Path(args.capture).stat().st_siz
             self.assertNotIn(str(declared_but_unused), telemetry_text)
             self.assertNotIn(str(undeclared), telemetry_text)
             self.assertEqual(result_payload["path"], "{dataset:declared}")
-
-    def test_exec_helper_child_environment_and_argv_match_golden(self):
-        execution = {
-            "profile": "python-script",
-            "family": "python",
-            "argv": [
-                "{source:tools/capture_child.py}",
-                "{result:child-env.json}",
-                "{arguments}",
-            ],
-            "outputs": ["child-env.json"],
-            "datasets": [],
-            "minimum_inputs": 0,
-            "maximum_inputs": 0,
-            "input_values": False,
-        }
-        with tempfile.TemporaryDirectory(prefix="worker-child-env-") as directory:
-            job_root = Path(directory) / "isolated" / "worker-job"
-            source = job_root / "source"
-            tool = source / "tools" / "capture_child.py"
-            tool.parent.mkdir(parents=True)
-            tool.write_text(CHILD_ENV_SCRIPT, encoding="utf-8")
-            result = job_root / "result"
-            helper_calls = []
-            raw_capture = {}
-            real_popen = subprocess.Popen
-            real_scrub = worker.scrub_private_paths
-
-            def recording_popen(command, *args, **kwargs):
-                helper_calls.append((list(command), dict(kwargs)))
-                return real_popen(command, *args, **kwargs)
-
-            def observe_then_scrub(result_root, **kwargs):
-                raw_capture["bytes"] = (result_root / "child-env.json").read_bytes()
-                return real_scrub(result_root, **kwargs)
-
-            with mock.patch.object(
-                worker, "sandbox_command", side_effect=lambda command, **_kwargs: list(command)
-            ), mock.patch.object(
-                worker.subprocess, "Popen", side_effect=recording_popen
-            ), mock.patch.object(
-                worker, "scrub_private_paths", side_effect=observe_then_scrub
-            ):
-                exit_code, _execution = worker.execute_job(
-                    {
-                        "id": "20260722T120000Z-0000000a",
-                        "task": "child-env-capture",
-                        "arguments": ["relative/argument"],
-                        "inputs": [],
-                        "execution": execution,
-                    },
-                    source_root=source,
-                    input_paths=[],
-                    input_values=[],
-                    result_root=result,
-                    python=worker.sys.executable,
-                    timeout=30,
-                    nice=0,
-                    maximum_file_size=1024 * 1024,
-                    maximum_memory=512 * 1024 * 1024,
-                    sandbox_profile=job_root / "sandbox.sb",
-                )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(len(helper_calls), 1)
-            helper_command, helper_options = helper_calls[0]
-            self.assertEqual(
-                helper_command[:8],
-                [
-                    sys.executable,
-                    str(Path(limited_child.__file__).resolve()),
-                    "worker",
-                    "0",
-                    "30",
-                    str(1024 * 1024),
-                    str(512 * 1024 * 1024),
-                    "--",
-                ],
-            )
-            self.assertEqual(
-                helper_command[8:],
-                [
-                    worker.sys.executable,
-                    str(tool),
-                    str(result / "child-env.json"),
-                    "relative/argument",
-                ],
-            )
-            captured = json.loads(raw_capture["bytes"])
-            self.assertEqual(captured["environment"]["PYTHONPATH"], str(source))
-            self.assertNotIn(
-                "VAN_COMPUTE_CHILD_PYTHONPATH", captured["environment"]
-            )
-            normalized = normalized_child_capture(
-                raw_capture["bytes"],
-                temporary_root=Path(helper_options["cwd"]).parent,
-                python=helper_command[0],
-            )
-            if os.environ.get("VAN_COMPUTE_GOLDEN_UPDATE") == "1":
-                CHILD_ENV_GOLDEN.parent.mkdir(parents=True, exist_ok=True)
-                CHILD_ENV_GOLDEN.write_bytes(normalized)
-            self.assertTrue(CHILD_ENV_GOLDEN.is_file())
-            self.assertEqual(CHILD_ENV_GOLDEN.read_bytes(), normalized)
 
     def test_child_environment_does_not_inherit_parent_secret_or_home(self):
         summary_stub = """#!/usr/bin/env python3

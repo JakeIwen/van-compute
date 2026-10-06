@@ -2116,63 +2116,91 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validated_runtime_config(args) -> WorkerConfig:
+    if not 1 <= args.timeout <= 24 * 60 * 60:
+        raise WorkerError("--timeout must be from 1 second through 24 hours")
+    if not 0 <= args.nice <= 19:
+        raise WorkerError("--nice must be from 0 through 19")
+    if not 1024 <= args.max_result_bytes <= protocol.MAX_RESULT_BYTES:
+        raise WorkerError("--max-result-bytes must be from 1 KiB through 128 MiB")
+    if not 256 * 1024 * 1024 <= args.max_memory_bytes <= 64 * 1024 * 1024 * 1024:
+        raise WorkerError("--max-memory-bytes must be from 256 MiB through 64 GiB")
+    if not 1 <= args.max_processes <= 4096:
+        raise WorkerError("--max-processes must be from 1 through 4096")
+    if not 1024 * 1024 * 1024 <= args.min_free_bytes <= 10 * 1024**4:
+        raise WorkerError("--min-free-bytes must be from 1 GiB through 10 TiB")
+    if not 1 <= args.heartbeat_interval <= 40:
+        raise WorkerError("--heartbeat-interval must be from 1 through 40 seconds")
+    if not 1 <= args.poll_interval <= 300:
+        raise WorkerError("--poll-interval must be from 1 through 300 seconds")
+    if not DATASET_NAME_RE.fullmatch(args.worker) or len(args.worker) > 60:
+        raise WorkerError(
+            "--worker must be a safe name no longer than 60 characters"
+        )
+    executables = {
+        "python": args.python,
+        "sqlite3": args.sqlite3,
+        "rg": args.rg,
+        "jadx": args.jadx,
+    }
+    for family, executable in executables.items():
+        path = Path(executable)
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise WorkerError(f"{family} executable does not exist: {executable}")
+    datasets = load_datasets(args.dataset_config, args.dataset)
+    if (
+        args.sandbox_profile is not None
+        and not args.sandbox_profile.expanduser().is_file()
+    ):
+        raise WorkerError(f"sandbox profile does not exist: {args.sandbox_profile}")
+    work_root = args.work_root.expanduser().resolve()
+    work_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(work_root, 0o700)
+    resource_manager = SchedulerResourceManager(
+        work_root,
+        minimum_free_bytes=args.min_free_bytes,
+        maximum_result_bytes=args.max_result_bytes,
+    )
+    return WorkerConfig.from_namespace(
+        args,
+        work_root=work_root,
+        executables=executables,
+        datasets=datasets,
+        resource_manager=resource_manager,
+    )
+
+
+def _scheduler_signal_handlers(stop_event, drain_event):
+    def request_stop(signum: int, _frame: object) -> None:
+        print(
+            f"van-compute-worker: received signal {signum}; stopping jobs cleanly",
+            file=sys.stderr,
+            flush=True,
+        )
+        stop_event.set()
+
+    def request_drain(signum: int, _frame: object) -> None:
+        print(
+            f"van-compute-worker: received signal {signum}; draining without new claims",
+            file=sys.stderr,
+            flush=True,
+        )
+        drain_event.set()
+
+    return {
+        signal.SIGTERM: signal.signal(signal.SIGTERM, request_stop),
+        signal.SIGINT: signal.signal(signal.SIGINT, request_stop),
+        signal.SIGUSR1: signal.signal(signal.SIGUSR1, request_drain),
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw_arguments = list(argv) if argv is not None else sys.argv[1:]
     os.umask(0o077)
     parser = build_parser()
     args = parser.parse_args(raw_arguments)
     try:
-        if not 1 <= args.timeout <= 24 * 60 * 60:
-            raise WorkerError("--timeout must be from 1 second through 24 hours")
-        if not 0 <= args.nice <= 19:
-            raise WorkerError("--nice must be from 0 through 19")
-        if not 1024 <= args.max_result_bytes <= protocol.MAX_RESULT_BYTES:
-            raise WorkerError("--max-result-bytes must be from 1 KiB through 128 MiB")
-        if not 256 * 1024 * 1024 <= args.max_memory_bytes <= 64 * 1024 * 1024 * 1024:
-            raise WorkerError("--max-memory-bytes must be from 256 MiB through 64 GiB")
-        if not 1 <= args.max_processes <= 4096:
-            raise WorkerError("--max-processes must be from 1 through 4096")
-        if not 1024 * 1024 * 1024 <= args.min_free_bytes <= 10 * 1024**4:
-            raise WorkerError("--min-free-bytes must be from 1 GiB through 10 TiB")
-        if not 1 <= args.heartbeat_interval <= 40:
-            raise WorkerError("--heartbeat-interval must be from 1 through 40 seconds")
-        if not 1 <= args.poll_interval <= 300:
-            raise WorkerError("--poll-interval must be from 1 through 300 seconds")
-        if not DATASET_NAME_RE.fullmatch(args.worker) or len(args.worker) > 60:
-            raise WorkerError(
-                "--worker must be a safe name no longer than 60 characters"
-            )
-        executables = {
-            "python": args.python,
-            "sqlite3": args.sqlite3,
-            "rg": args.rg,
-            "jadx": args.jadx,
-        }
-        for family, executable in executables.items():
-            path = Path(executable)
-            if not path.is_file() or not os.access(path, os.X_OK):
-                raise WorkerError(f"{family} executable does not exist: {executable}")
-        datasets = load_datasets(args.dataset_config, args.dataset)
-        if (
-            args.sandbox_profile is not None
-            and not args.sandbox_profile.expanduser().is_file()
-        ):
-            raise WorkerError(f"sandbox profile does not exist: {args.sandbox_profile}")
-        work_root = args.work_root.expanduser().resolve()
-        work_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(work_root, 0o700)
-        resource_manager = SchedulerResourceManager(
-            work_root,
-            minimum_free_bytes=args.min_free_bytes,
-            maximum_result_bytes=args.max_result_bytes,
-        )
-        runtime_config = WorkerConfig.from_namespace(
-            args,
-            work_root=work_root,
-            executables=executables,
-            datasets=datasets,
-            resource_manager=resource_manager,
-        )
+        runtime_config = _validated_runtime_config(args)
         if not runtime_config.serve:
             payload = run_once(runtime_config)
             print(json.dumps(payload, indent=2, sort_keys=True))
@@ -2193,27 +2221,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             stop_event = threading.Event()
             drain_event = threading.Event()
 
-            def request_stop(signum: int, _frame: object) -> None:
-                print(
-                    f"van-compute-worker: received signal {signum}; stopping jobs cleanly",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                stop_event.set()
-
-            def request_drain(signum: int, _frame: object) -> None:
-                print(
-                    f"van-compute-worker: received signal {signum}; draining without new claims",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                drain_event.set()
-
-            previous_handlers = {
-                signal.SIGTERM: signal.signal(signal.SIGTERM, request_stop),
-                signal.SIGINT: signal.signal(signal.SIGINT, request_stop),
-                signal.SIGUSR1: signal.signal(signal.SIGUSR1, request_drain),
-            }
+            previous_handlers = _scheduler_signal_handlers(stop_event, drain_event)
             multiplexers = [
                 SSHMultiplexer(
                     runtime_config.host,

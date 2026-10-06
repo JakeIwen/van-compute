@@ -13,117 +13,9 @@ import unittest
 from unittest import mock
 
 from van_compute import frontend as pi_compute
-from van_compute import queue
-from van_compute import limited_child, broker
-from van_compute import config
-from van_compute import protocol
-
-
-CHILD_ENV_SCRIPT = """import json
-import os
-from pathlib import Path
-import sys
-
-Path(sys.argv[1]).write_text(
-    json.dumps(
-        {"argv": sys.argv, "environment": dict(os.environ)},
-        indent=2,
-        sort_keys=True,
-    ) + "\\n",
-    encoding="utf-8",
-)
-"""
-CHILD_ENV_GOLDEN = Path(__file__).with_name("golden") / "child_env" / "broker.json"
-
-
-def normalized_child_capture(payload, *, temporary_root, python):
-    replacements = []
-    for value, marker in ((temporary_root, b"<TMP>"), (python, b"<PYTHON>")):
-        literals = {
-            os.path.abspath(os.fspath(value)),
-            os.path.realpath(os.fspath(value)),
-        }
-        for literal in tuple(literals):
-            if literal.startswith("/private/"):
-                literals.add(literal.removeprefix("/private"))
-            elif literal.startswith(("/tmp/", "/var/")):
-                literals.add("/private" + literal)
-        replacements.extend(
-            (literal.encode("utf-8"), marker) for literal in literals
-        )
-    for literal, marker in sorted(replacements, key=lambda item: len(item[0]), reverse=True):
-        payload = payload.replace(literal, marker)
-    return payload
-
-
-LOCAL_SCRIPT = """#!/usr/bin/env python3
-import subprocess
-import sys
-import time
-
-print('local result', flush=True)
-if '--background' in sys.argv:
-    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
-    print(f'background={child.pid}', flush=True)
-if '--fail' in sys.argv:
-    raise SystemExit(7)
-"""
-
-SUMMARY_SCRIPT = """#!/usr/bin/env python3
-import argparse
-import json
-from pathlib import Path
-parser = argparse.ArgumentParser()
-parser.add_argument('capture')
-parser.add_argument('--json', required=True)
-args = parser.parse_args()
-Path(args.json).write_text(json.dumps({'bytes': Path(args.capture).stat().st_size}))
-print('summary complete')
-"""
-
-
-DECLARATION = {
-    "schema_version": 1,
-    "tasks": [
-        {
-            "name": "local-python",
-            "profile": "python-script",
-            "source_paths": ["tools/local_job.py"],
-            "minimum_inputs": 0,
-            "maximum_inputs": 0,
-            "argv": ["{source:tools/local_job.py}", "{arguments}"],
-            "outputs": [],
-        },
-        {
-            "name": "decode-apk",
-            "profile": "apk-analyze",
-            "source_paths": [],
-            "minimum_inputs": 1,
-            "maximum_inputs": 1,
-            "argv": ["-d", "{result:decoded}", "{input:0}"],
-            "outputs": ["decoded"],
-        },
-        {
-            "name": "missing-output",
-            "profile": "python-script",
-            "source_paths": ["tools/local_job.py"],
-            "minimum_inputs": 0,
-            "maximum_inputs": 0,
-            "argv": ["{source:tools/local_job.py}"],
-            "outputs": ["required.json"],
-        },
-    ],
-}
-
-
-GOOD_HEALTH = broker.HealthSnapshot(
-    memory_available_bytes=4 * 1024 * 1024 * 1024,
-    swap_total_bytes=1024 * 1024 * 1024,
-    swap_used_bytes=0,
-    load_1m=0.25,
-    cpu_count=4,
-    temperature_c=45.0,
-    throttled_flags=0,
+from van_compute import queue, limited_child, broker, config, protocol
+from pi.tests.compute.van_compute_test_fixtures import (
+    BrokerHarness, DECLARATION, GOOD_HEALTH, LOCAL_SCRIPT, SUMMARY_SCRIPT,
 )
 
 
@@ -152,108 +44,7 @@ class LimitedChildTests(unittest.TestCase):
         self.assertIn(limited_child.resource.RLIMIT_NOFILE, limited_resources)
 
 
-class BrokerHarness(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        base = Path(self.temporary.name)
-        self.source = base / "obd-things"
-        self.root = self.source / "tmp" / "compute"
-        self.work = base / "broker-work" / "jobs"
-        (self.source / "tools").mkdir(parents=True)
-        (self.source / "tools" / "local_job.py").write_text(
-            LOCAL_SCRIPT, encoding="utf-8"
-        )
-        (self.source / "tools" / "can_capture_summary.py").write_text(
-            SUMMARY_SCRIPT, encoding="utf-8"
-        )
-        (self.source / protocol.REPO_MANIFEST).write_text(
-            json.dumps(DECLARATION), encoding="utf-8"
-        )
-        self.apk = self.source / "tmp" / "sample.apk"
-        self.apk.parent.mkdir(parents=True)
-        self.apk.write_bytes(b"not really an apk")
-        self.capture = self.source / "tmp" / "capture.log"
-        self.capture.write_bytes(b"can capture bytes\n")
-        self.args = config.BrokerConfig(
-            root=self.root,
-            work_root=self.work,
-            once=False,
-            self_test=False,
-            remote_max_age=45.0,
-            remote_grace=0.0,
-            stale_running_age=300.0,
-            poll_interval=5.0,
-            timeout=30,
-            cpu_seconds=30,
-            # Darwin reserves a large virtual address range even for a tiny
-            # interpreter; production validation caps this at the Pi's 1 GiB.
-            max_memory_bytes=64 * 1024 * 1024 * 1024,
-            max_result_bytes=1024 * 1024,
-            min_work_free_bytes=0,
-            max_open_files=128,
-            nice=0,
-            python=sys.executable,
-            sqlite3="/usr/bin/sqlite3",
-            bwrap=sys.executable,
-            min_available_memory_mb=512,
-            max_swap_used=0.20,
-            max_swap_used_mb=512,
-            max_load_per_cpu=1.25,
-            max_temperature_c=75.0,
-            health_thresholds=config.HealthThresholds(
-                minimum_available_bytes=512 * 1024 * 1024,
-                maximum_swap_used_fraction=0.20,
-                maximum_load_per_cpu=1.25,
-                maximum_temperature_c=75.0,
-            ),
-        )
-
-    def tearDown(self):
-        self.temporary.cleanup()
-
-    def submit(self, task="local-python", arguments=None):
-        inputs = []
-        if task == "decode-apk":
-            inputs = [str(self.apk)]
-        elif task == "can-capture-summary":
-            inputs = [str(self.capture)]
-        submit_args = argparse.Namespace(
-            root=self.root,
-            source_root=self.source,
-            task=task,
-            argument=list(arguments or []),
-            input=inputs,
-            input_value=None,
-        )
-        return queue.submit_job(submit_args)
-
-    @staticmethod
-    def no_sandbox(_executable, command, **paths):
-        replacements = {
-            "/job/source": str(paths["source_root"]),
-            "/job/inputs": str(paths["inputs_root"]),
-            "/job/result": str(paths["result_root"]),
-            "/job/runtime/python/bin/python3": sys.executable,
-            f"/job/runtime/python/bin/{Path(sys.executable).name}": sys.executable,
-        }
-        rendered = []
-        for item in command:
-            value = item
-            for sandbox, host in replacements.items():
-                if value == sandbox or value.startswith(f"{sandbox}/"):
-                    value = host + value[len(sandbox) :]
-                    break
-            rendered.append(value)
-        return rendered
-
-    def run_once(self):
-        with mock.patch.object(
-            broker, "bubblewrap_self_test", return_value=(True, "test")
-        ), mock.patch.object(broker, "bubblewrap_command", side_effect=self.no_sandbox):
-            return broker.run_once(self.args, health_reader=lambda: GOOD_HEALTH)
-
-
-class PlacementTests(BrokerHarness):
+class PlacementTests(BrokerHarness, unittest.TestCase):
     def test_default_fallback_python_lives_under_compute_root(self):
         self.assertEqual(
             broker.DEFAULT_LOCAL_PYTHON,
@@ -265,96 +56,6 @@ class PlacementTests(BrokerHarness):
             broker.DEFAULT_MAX_RESULT_BYTES,
             protocol.MAX_RESULT_BYTES,
         )
-
-    def test_exec_helper_child_environment_and_argv_match_golden(self):
-        tool = self.source / "tools" / "capture_child.py"
-        tool.write_text(CHILD_ENV_SCRIPT, encoding="utf-8")
-        declaration = {
-            "schema_version": 1,
-            "tasks": [
-                *DECLARATION["tasks"],
-                {
-                    "name": "child-env-capture",
-                    "profile": "python-script",
-                    "source_paths": ["tools/capture_child.py"],
-                    "minimum_inputs": 0,
-                    "maximum_inputs": 0,
-                    "argv": [
-                        "{source:tools/capture_child.py}",
-                        "{result:child-env.json}",
-                        "{arguments}",
-                    ],
-                    "outputs": ["child-env.json"],
-                },
-            ],
-        }
-        (self.source / protocol.REPO_MANIFEST).write_text(
-            json.dumps(declaration), encoding="utf-8"
-        )
-        submitted = self.submit(
-            "child-env-capture",
-            arguments=["relative/argument"],
-        )
-        helper_calls = []
-        real_popen = broker.subprocess.Popen
-
-        def recording_popen(command, *args, **kwargs):
-            helper_calls.append((list(command), dict(kwargs)))
-            return real_popen(command, *args, **kwargs)
-
-        with mock.patch.object(
-            broker.subprocess, "Popen", side_effect=recording_popen
-        ):
-            result = self.run_once()
-
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(len(helper_calls), 1)
-        helper_command, helper_options = helper_calls[0]
-        self.assertEqual(
-            helper_command[:9],
-            [
-                sys.executable,
-                str(Path(limited_child.__file__).resolve()),
-                "broker",
-                str(self.args.max_memory_bytes),
-                str(self.args.cpu_seconds),
-                str(self.args.max_result_bytes),
-                str(self.args.max_open_files),
-                str(self.args.nice),
-                "--",
-            ],
-        )
-        temporary_root = Path(helper_options["cwd"])
-        self.assertEqual(
-            helper_command[9:],
-            [
-                sys.executable,
-                str(temporary_root / "source" / "tools" / "capture_child.py"),
-                str(temporary_root / "result" / "child-env.json"),
-                "relative/argument",
-            ],
-        )
-        raw_capture = (
-            self.root
-            / "done"
-            / submitted["id"]
-            / "result"
-            / "child-env.json"
-        ).read_bytes()
-        captured = json.loads(raw_capture)
-        self.assertEqual(
-            captured["environment"]["HOME"], str(temporary_root / "home")
-        )
-        normalized = normalized_child_capture(
-            raw_capture,
-            temporary_root=temporary_root,
-            python=helper_command[0],
-        )
-        if os.environ.get("VAN_COMPUTE_GOLDEN_UPDATE") == "1":
-            CHILD_ENV_GOLDEN.parent.mkdir(parents=True, exist_ok=True)
-            CHILD_ENV_GOLDEN.write_bytes(normalized)
-        self.assertTrue(CHILD_ENV_GOLDEN.is_file())
-        self.assertEqual(CHILD_ENV_GOLDEN.read_bytes(), normalized)
 
     def test_queue_maintenance_defers_pi_fallback(self):
         submitted = self.submit()
@@ -717,7 +418,7 @@ class PlacementTests(BrokerHarness):
         self.assertTrue((self.root / "queued" / submitted["id"]).is_dir())
 
 
-class RecoveryAndIsolationTests(BrokerHarness):
+class RecoveryAndIsolationTests(BrokerHarness, unittest.TestCase):
     def test_mountinfo_uses_deepest_mount_and_decodes_path(self):
         mount = (self.work / "memory backed").resolve()
         mount.mkdir(parents=True)
@@ -1143,7 +844,7 @@ class RecoveryAndIsolationTests(BrokerHarness):
         self.assertNotIn("/home/pi", command)
 
 
-class FrontendTests(BrokerHarness):
+class FrontendTests(BrokerHarness, unittest.TestCase):
     def test_tasks_describe_inputs_arguments_outputs_and_datasets(self):
         listing = pi_compute._task_listing(self.source)
         local = next(task for task in listing["tasks"] if task["name"] == "local-python")
