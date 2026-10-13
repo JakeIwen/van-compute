@@ -1,12 +1,14 @@
 import argparse
+import datetime as dt
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from unittest import mock
 
-from van_compute import broker, config, protocol, queue
+from van_compute import broker, config, protocol, queue, upgrade_gate
 from van_compute import worker
 
 
@@ -162,6 +164,101 @@ GOOD_HEALTH = broker.HealthSnapshot(
     temperature_c=45.0,
     throttled_flags=0,
 )
+
+
+class RetentionHarness:
+    NOW = dt.datetime(2026, 10, 13, 12, 0, tzinfo=dt.timezone.utc)
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        base = Path(self.temporary.name)
+        self.git_home = base / "git-home"
+        self.git_home.mkdir()
+        self.git_environment = {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "HOME": str(self.git_home),
+            "XDG_CONFIG_HOME": str(self.git_home / ".config"),
+        }
+        self.git_environment_patch = mock.patch.dict(os.environ, self.git_environment)
+        self.git_environment_patch.start()
+        self.source = base / "obd-things"
+        self.source.mkdir()
+        self.script_root = base / "compute-scripts"
+        self.script_root.mkdir()
+        (self.script_root / "van_compute.py").write_text(
+            "#!/usr/bin/env python3\nNORMAL_QUEUE_CLI = True\n",
+            encoding="utf-8",
+        )
+        self.script_root_patch = mock.patch.object(
+            upgrade_gate,
+            "DEFAULT_SCRIPT_ROOT",
+            self.script_root,
+        )
+        self.submitter_count_patch = mock.patch.object(
+            upgrade_gate,
+            "active_submitter_count",
+            return_value=0,
+        )
+        self.script_root_patch.start()
+        self.submitter_count_patch.start()
+        self.git("init", "-q")
+        (self.source / ".gitignore").write_text("tmp/\n*.ignored\n", encoding="utf-8")
+        (self.source / "README.md").write_text("fixture\n", encoding="utf-8")
+        self.git("add", ".gitignore", "README.md")
+        self.root = queue.safe_root(self.source / "tmp" / "compute")
+        self._serial = 0
+
+    def tearDown(self):
+        self.submitter_count_patch.stop()
+        self.script_root_patch.stop()
+        self.git_environment_patch.stop()
+        self.temporary.cleanup()
+
+    def git(self, *arguments):
+        environment = os.environ.copy()
+        environment.update(self.git_environment)
+        subprocess.run(
+            ["git", "-C", str(self.source), *arguments],
+            check=True,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def add_job(
+        self,
+        state,
+        *,
+        age_days=90,
+        age_seconds=0,
+        references=(),
+        with_finished_at=True,
+    ):
+        self._serial += 1
+        job_id = f"20260101T000000Z-{self._serial:08x}"
+        path = self.root / state / job_id
+        (path / "result").mkdir(parents=True)
+        (path / "result" / "payload.bin").write_bytes(b"payload")
+        manifest = {
+            "schema_version": 1,
+            "id": job_id,
+            "state": state,
+            "inputs": [{"job_id": item} for item in references],
+        }
+        if with_finished_at:
+            finished = self.NOW - dt.timedelta(days=age_days, seconds=age_seconds)
+            manifest["finished_at"] = finished.isoformat()
+        queue.atomic_json(path / "manifest.json", manifest)
+        return job_id
+
+    def cite(self, relative, text, *, tracked=True):
+        path = self.source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        if tracked:
+            self.git("add", "-f", relative)
+        return path
 
 
 class BrokerHarness:

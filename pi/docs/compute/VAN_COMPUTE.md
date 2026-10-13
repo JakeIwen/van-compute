@@ -533,6 +533,69 @@ verified bundle rather than one SSH process per file. Repository source
 snapshots are capped at 10,000 files and 256 MiB; large captures, APKs, and
 corpora belong in `--input` files or private dataset aliases instead.
 
+## Completed-job retention
+
+The hidden operator command on the queue CLI is dry-run by default:
+
+```bash
+/home/pi/van_compute/scripts/van_compute.py prune
+/home/pi/van_compute/scripts/van_compute.py prune \
+  --citations-root /home/pi/dev/obd-things \
+  --now 2026-10-13T12:00:00+00:00
+```
+
+It reports counts and logical bytes for protected, young, skipped and eligible
+entries, and lists every eligible job ID. `--now` is a test/audit override; omit
+it for the real clock. The citation root defaults to
+`/home/pi/dev/obd-things`. The scan uses Git's tracked files plus
+untracked-but-not-ignored files, excluding the checkout's top-level `tmp/`.
+Job IDs in each listed relative filename and in file contents count, whether
+bare or embedded in a path. A cited job protects every job ID transitively
+referenced by its manifest. References in every readable `queued/` and
+`running/` manifest seed the same closure, so active work keeps completed input
+jobs. Pruning refuses an unreadable or invalid active manifest rather than
+assuming it has no dependencies. It accepts the queue's recoverable claim
+transition: a `queued/` directory may already have persisted `state: running`
+before its atomic move into `running/`.
+
+Successful jobs remain for 60 days and failed jobs for 31 days, based only on
+`manifest.json`'s timezone-aware `finished_at`. Missing, unreadable or invalid
+metadata is skipped rather than guessed. Only direct, same-filesystem, real
+job directories under `done/` and `failed/` can become eligible. Active copies,
+unsafe names or file types, symlinked jobs and trees at or above mount points
+are never removed.
+
+After reviewing the dry-run, apply the same plan explicitly:
+
+```bash
+/home/pi/van_compute/scripts/van_compute.py prune --apply
+```
+
+Apply first acquires the installer's canonical public-CLI submission gate and
+waits for already-running submitters to drain. It then holds `.queue.lock`, takes
+one citation snapshot before inventory and a second immediately before deletion,
+and protects the union plus both snapshots' transitive closure. The gate remains
+installed for the entire apply phase and is restored afterward, so a submission
+cannot finish fingerprinting inputs after those inputs were pruned. Restoration
+also covers an acquisition that fails or is interrupted after publishing the gate;
+it touches only artifacts recorded under that run's unique owner. A citation
+added during a prune may reach the second scan, but only a citation written
+before the prune begins is guaranteed to protect a job. Each eligible directory's
+device and inode are bound to its decision and compared again on the no-follow
+opened directory before any entry is removed. Manifests are parsed from the same
+verified nonblocking, no-follow descriptor used to read them; retention never
+reopens a validated manifest path. Apply also refuses active maintenance and
+canonical upgrade-owner/gate fences, and fails without deleting if the Git
+checkout, citation scan, submission drain or manifest validation cannot be
+completed. `pi_compute.py` does not expose pruning; retention is an operator
+action, not an agent-facing task.
+
+The lexical scanner does not decode UTF-16/UTF-32 text or JSON `\\u` escapes.
+A same-device bind mount introduced during deletion remains a residual race;
+ordinary and pre-existing bind mounts are rejected by the mount snapshots and
+no-cross-device walk. Result streaming's pre-existing path re-open behavior is
+separate from retention and unchanged.
+
 ## Dashboard and measurement
 
 The dashboard separates completed Mac work from eligible work that actually

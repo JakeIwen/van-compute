@@ -2,7 +2,7 @@
 
 ## Repository map
 
-- `van_compute/`: protocol, queue, broker, worker, metrics, typed runtime configuration, and shared child/result engine.
+- `van_compute/`: protocol, queue, broker, worker, metrics, typed runtime configuration, and shared child/result engine; `retention.py` owns completed-job pruning and `retention_citations.py` owns Git working-tree citation discovery.
 - `macbook/scripts/install_van_compute_worker.zsh` and `.py`: stable installer entry points.
 - `macbook/scripts/van_compute_installer/`: coupled Mac/Pi installer implementation.
 - `macbook/launchagents/`: worker LaunchAgent template.

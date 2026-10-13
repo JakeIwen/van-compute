@@ -1109,6 +1109,14 @@ def wait_for_job(root: Path, job_id: str, timeout: float, interval: float = 1.0)
         time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
 
 
+def _retention_commands():
+    if __name__ == "__main__":
+        sys.modules.setdefault("van_compute.queue", sys.modules[__name__])
+    from van_compute import retention
+
+    return retention
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1164,6 +1172,7 @@ def build_parser() -> argparse.ArgumentParser:
     result_parser.add_argument("job_id")
     result_parser.add_argument("path")
 
+    _retention_commands().add_prune_parser(subparsers)
     maintenance = subparsers.add_parser("maintenance", help=argparse.SUPPRESS)
     maintenance.add_argument("action", choices=("enter", "exit", "status"))
     maintenance.add_argument("--owner")
@@ -1290,6 +1299,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "result":
             stream_result(root, args.job_id, args.path, sys.stdout.buffer)
             return 0
+        if args.command == "prune":
+            return _retention_commands().run_prune_command(root, args, print_json)
         if args.command == "maintenance":
             if args.action == "status":
                 if args.owner is not None:

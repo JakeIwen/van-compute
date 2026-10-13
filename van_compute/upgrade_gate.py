@@ -182,6 +182,34 @@ def _paths(script_root: Path) -> tuple[Path, Path, Path]:
     )
 
 
+def upgrade_status(script_root: Path | None = None) -> dict[str, object] | None:
+    """Return the canonical installed upgrade owner/gate status, if active."""
+    script_root = DEFAULT_SCRIPT_ROOT if script_root is None else script_root
+    try:
+        details = script_root.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(f"cannot inspect script root: {exc}") from None
+    if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+        raise RuntimeError(f"script root is not a real directory: {script_root}")
+
+    target, _backup, owner_record = _paths(script_root)
+    owner: str | None = None
+    if _optional_regular_file(owner_record, "upgrade owner record"):
+        try:
+            owner = _read_bytes(owner_record, "upgrade owner record").decode().strip()
+        except UnicodeDecodeError:
+            raise RuntimeError("upgrade owner record is invalid") from None
+        _validate_owner(owner)
+    gate_active = (
+        _optional_regular_file(target, "public queue CLI") and _is_gate(target)
+    )
+    if owner is None and not gate_active:
+        return None
+    return {"active": True, "gate": gate_active, "owner": owner}
+
+
 def _require_owner(owner_record: Path, owner: str) -> None:
     if not _optional_regular_file(owner_record, "upgrade owner record"):
         raise RuntimeError("upgrade owner record is missing")
