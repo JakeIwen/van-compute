@@ -25,7 +25,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from typing import BinaryIO, Iterator, Sequence
+from typing import BinaryIO, Iterator, Sequence, TextIO
 
 
 from van_compute import protocol
@@ -85,15 +85,22 @@ def atomic_json(path: Path, payload: object, mode: int = 0o600) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def load_json(path: Path) -> dict[str, object]:
+def load_json_stream(handle: TextIO, path: Path) -> dict[str, object]:
     try:
-        with path.open(encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
+        payload = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise QueueError(f"cannot read {path}: {exc}") from None
     if not isinstance(payload, dict):
         raise QueueError(f"{path} does not contain a JSON object")
     return payload
+
+
+def load_json(path: Path) -> dict[str, object]:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return load_json_stream(handle, path)
+    except OSError as exc:
+        raise QueueError(f"cannot read {path}: {exc}") from None
 
 
 def safe_root(path: Path) -> Path:
