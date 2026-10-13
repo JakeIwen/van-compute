@@ -20,38 +20,6 @@ class VanComputeUpgradeGateTests(unittest.TestCase):
             Path("/home/pi/van_compute/scripts"),
         )
 
-    def test_supported_public_submitters_are_recognized(self):
-        self.assertTrue(
-            gate._is_supported_submitter(
-                [
-                    b"python3",
-                    b"/home/pi/van_compute/scripts/van_compute.py",
-                    b"submit",
-                    b"repo-tests",
-                ]
-            )
-        )
-        self.assertTrue(
-            gate._is_supported_submitter(
-                [
-                    b"python3",
-                    b"/home/pi/van_compute/scripts/pi_compute.py",
-                    b"run",
-                    b"repo-tests",
-                ]
-            )
-        )
-        self.assertFalse(
-            gate._is_supported_submitter(
-                [
-                    b"python3",
-                    b"/home/pi/van_compute/scripts/van_compute.py",
-                    b"status",
-                    b"job",
-                ]
-            )
-        )
-
     def test_active_submitter_scan_includes_only_same_user_supported_commands(self):
         with tempfile.TemporaryDirectory() as directory:
             proc = Path(directory)

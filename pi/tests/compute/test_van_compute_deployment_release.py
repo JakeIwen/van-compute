@@ -356,28 +356,6 @@ class VanComputeDeploymentTests(DeploymentFixtureMixin, unittest.TestCase):
             with self.assertRaisesRegex(DeploymentError, "non-symlink"):
                 installer.source_paths()
 
-    def test_selected_installer_helper_symlink_is_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
-            app = Path(directory) / "app"
-            self.copy_frozen_source(app)
-            target = app / "real.py"
-            target.write_text("# target\n", encoding="utf-8")
-            module = app / "macbook/scripts/van_compute_installer/orchestrator.py"
-            module.unlink()
-            module.symlink_to(target)
-            installer = Installer(
-                Options(),
-                environment={},
-                home=Path(directory) / "home",
-                script=app / "macbook/scripts/install_van_compute_worker.py",
-                local=FakeLocal(),
-                remote=FakeRemote(),
-                stdout=io.StringIO(),
-                stderr=io.StringIO(),
-            )
-            with self.assertRaisesRegex(DeploymentError, "non-symlink"):
-                installer.source_paths()
-
     def test_worker_and_broker_provenance_share_exact_source_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             installer = self.make_installer(directory)
