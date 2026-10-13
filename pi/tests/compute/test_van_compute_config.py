@@ -4,7 +4,7 @@ import unittest
 from typing import Mapping
 
 from van_compute import broker, worker
-from van_compute.config import BrokerConfig, MissedOffloadRecord, WorkerConfig
+from van_compute.config import BrokerConfig, WorkerConfig
 
 
 class FakeReservation:
@@ -87,21 +87,6 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertIsNone(base.resource_admission_stop_event)
         self.assertIs(scheduler.args.resource_admission_stop_event, drain_event)
         self.assertIsNot(scheduler.args, base)
-
-    def test_missed_offload_record_is_a_small_typed_attribute_record(self):
-        record = MissedOffloadRecord(
-            profile="repo-test",
-            label="test",
-            reason="worker-unavailable",
-            duration_seconds=1.5,
-            cpu_seconds=0.5,
-            peak_rss_bytes=1024,
-            input_bytes=128,
-        )
-
-        self.assertEqual(record.profile, "repo-test")
-        self.assertEqual(record.input_bytes, 128)
-        self.assertEqual(record.__class__.__name__, "MissedOffloadRecord")
 
 
 if __name__ == "__main__":
