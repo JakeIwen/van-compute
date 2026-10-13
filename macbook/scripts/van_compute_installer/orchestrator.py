@@ -107,7 +107,8 @@ class Installer(
                 "Dashboard: perform its separate package update after this first compute cutover; see pi/docs/compute/VAN_COMPUTE.md."
             )
             self.say(
-                "Repository-wide updates remain available through: ./pi/sync_scripts.sh"
+                "Repository-wide updates remain available through the scripts checkout's "
+                "pi/sync_scripts.sh (default ~/dev/scripts)."
             )
             return 0
         finally:
