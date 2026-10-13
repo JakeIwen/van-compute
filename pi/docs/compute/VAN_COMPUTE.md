@@ -1,6 +1,6 @@
 # Van compute broker
 
-[Pi documentation index](../../README.md)
+[Repository README](../../../README.md)
 
 `pi_compute.py` is the single agent-facing entry point for CPU- or memory-heavy
 offline work. Agents enqueue a named task and never decide whether the Mac is
@@ -125,43 +125,55 @@ unless the canonical compute provider has matching source markers, readable and
 importable metrics, and no maintenance/upgrade-owner fence. It does not require
 a fresh Mac heartbeat or the new checkout's source hash. This guard preserves the
 supervised first cutover; it never launches the Mac installer automatically to
-repair a missing provider. A scoped `deploy_python.py --update` selecting the
+repair a missing provider. A scoped `deploy_python.py --update` from the sibling
+`scripts` checkout selecting the
 dashboard (including the default all-services selection) runs the same provider
-check before transferring a package; dry-run remains entirely local. Run the
-following only from the owner's Terminal in a clean reviewed checkout (do not
-reset or deploy the diverged owner checkout):
+check before transferring a package; dry-run remains entirely local. Before
+starting, set `COMPUTE_REV` and `SCRIPTS_REV` in the owner's Terminal to the
+full commit IDs whose diffs were reviewed. The recipe creates clean detached
+worktrees for both deployment owners and keeps the package update scoped to the
+dashboard service:
 
 ```zsh
 ( set -eu
-git -C /Users/jacobr/dev/scripts fetch origin
-DEPLOY=/Users/jacobr/dev/scripts/.claude/worktrees/compute-first-deploy
-git -C /Users/jacobr/dev/scripts worktree add --detach "$DEPLOY" origin/master
-cd "$DEPLOY"
-export VAN_COMPUTE_DATASET_CONFIG=/Users/jacobr/dev/scripts/macbook/secrets/van-compute-datasets.json
+: "${COMPUTE_REV:?set COMPUTE_REV to the reviewed van-compute commit ID}"
+: "${SCRIPTS_REV:?set SCRIPTS_REV to the reviewed scripts commit ID}"
+COMPUTE=/Users/jacobr/dev/van-compute
+SCRIPTS=/Users/jacobr/dev/scripts
+COMPUTE_DEPLOY="$COMPUTE/.claude/worktrees/compute-first-deploy"
+SCRIPTS_DEPLOY="$SCRIPTS/.claude/worktrees/compute-first-deploy"
+git -C "$COMPUTE" worktree add --detach "$COMPUTE_DEPLOY" "$COMPUTE_REV"
+git -C "$SCRIPTS" worktree add --detach "$SCRIPTS_DEPLOY" "$SCRIPTS_REV"
+test "$(git -C "$COMPUTE_DEPLOY" rev-parse HEAD)" = "$COMPUTE_REV"
+test "$(git -C "$SCRIPTS_DEPLOY" rev-parse HEAD)" = "$SCRIPTS_REV"
+test -z "$(git -C "$COMPUTE_DEPLOY" status --porcelain --untracked-files=all)"
+test -z "$(git -C "$SCRIPTS_DEPLOY" status --porcelain --untracked-files=all)"
+cd "$COMPUTE_DEPLOY"
+export VAN_COMPUTE_DATASET_CONFIG=/Users/jacobr/dev/van-compute/macbook/secrets/van-compute-datasets.json
 test -r "$VAN_COMPUTE_DATASET_CONFIG"
 ./macbook/scripts/install_van_compute_worker.zsh --dry-run
-/opt/homebrew/bin/python3 pi/deploy_python.py --dry-run --update --service van-dashboard.service
+/opt/homebrew/bin/python3 "$SCRIPTS_DEPLOY/pi/deploy_python.py" --dry-run --update --service van-dashboard.service
 ./macbook/scripts/install_van_compute_worker.zsh
-/opt/homebrew/bin/python3 pi/deploy_python.py --update --service van-dashboard.service
+/opt/homebrew/bin/python3 "$SCRIPTS_DEPLOY/pi/deploy_python.py" --update --service van-dashboard.service
 ssh pi@vanpi.lan 'set -eu; /usr/bin/systemctl is-active van-compute-broker.service; /usr/bin/systemctl is-active van-dashboard.service; /home/pi/van_compute/scripts/van_compute.py maintenance status; /home/pi/van_compute/scripts/van_compute.py available; /usr/bin/test -r /home/pi/van_compute/current/van_compute/metrics.py'
 )
 ```
 
-Keep this reviewed worktree until the deployment completes. Afterward the
+Keep both reviewed worktrees until the deployment completes. Afterward the
 installed release carries its own frozen installer CLI and sibling helper
-package for recovery, independent of this worktree. Broad sync always reads the
-primary checkout, even when invoked from a worktree: do not use it until the
-owner has reconciled that checkout with these fixes without discarding unrelated
+package for recovery, independent of the compute worktree. Broad sync always reads the
+primary `scripts` checkout and the configured `van-compute` checkout: do not use
+it until the owner has reconciled both checkouts without discarding unrelated
 work.
 
 After that supervised provider-first cutover, routine repository-wide updates
 remain supported:
 
 ```zsh
-./pi/sync_scripts.sh
+/Users/jacobr/dev/scripts/pi/sync_scripts.sh
 ```
 
-After its normal Pi deployment succeeds, `sync_scripts.sh` invokes the
+After its normal Pi deployment succeeds, the monorepo's `sync_scripts.sh` invokes the
 compatibility entry point with `--if-needed`. A fingerprint covers both installer
 entry points, every named module in the installer helper package, the LaunchAgent
 template, the allowlisted `van_compute/` sources, worker identity, connection
@@ -275,7 +287,8 @@ root-interpreted configuration. This is the sole deployed-file exception.
 
 Queue jobs and results remain runtime data under the configured `obd-things`
 compute directory; they are not deployed files. The generic staging portion of
-`pi/sync_scripts.sh` does not copy compute files. Its final conditional installer
+the sibling `scripts` checkout's `pi/sync_scripts.sh` does not copy compute files.
+Its final conditional installer
 call preserves the coupled Pi/Mac protocol boundary, so it cannot publish half
 of an upgrade. During the one-time layout migration, the installer retires the
 legacy `/home/pi/scripts/compute/` tree only after the replacement package
@@ -364,7 +377,7 @@ still requires the forward recovery command above.
 After a **completed** cutover, the tested fallback is to restore the verified
 Step 1 broker and worker implementations while retaining the new safe installer,
 package entrypoints, unit and metrics provider. Pin the rollback base to the
-reviewed S1 commit `f32ce9e`, not the caller's `HEAD`. Copy the safe deployer from
+reviewed filtered-history S1 commit `02a182d`, not the caller's `HEAD`. Copy the safe deployer from
 the **successfully deployed fixed Mac release** into that base; do not revive
 S1's pre-fix installer. Current frozen installers include the sibling
 `van_compute_installer/` package and the overlay copies it with the CLI files;
@@ -374,8 +387,8 @@ an existing path; the chained commands stop on failure):
 
 ```zsh
 SAFE_INSTALLER_RELEASE="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$HOME/Library/LaunchAgents/com.jacobr.van-compute-worker.plist" | /usr/bin/sed 's#/venv/bin/python$##')"
-ROLLBACK=/Users/jacobr/dev/scripts/.claude/worktrees/s1-step2-rollback
-test -x "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.py" && git -C /Users/jacobr/dev/scripts worktree add --detach "$ROLLBACK" f32ce9e && git -C "$ROLLBACK" restore --source=c69a7a6 --worktree -- van_compute/broker.py van_compute/worker.py && cp "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.py" "$ROLLBACK/macbook/scripts/install_van_compute_worker.py" && cp "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.zsh" "$ROLLBACK/macbook/scripts/install_van_compute_worker.zsh" && { if test -d "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/van_compute_installer"; then cp -R "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/van_compute_installer" "$ROLLBACK/macbook/scripts/"; fi; } && /opt/homebrew/bin/python3 "$ROLLBACK/macbook/scripts/install_van_compute_worker.py" --dry-run
+ROLLBACK=/Users/jacobr/dev/van-compute/.claude/worktrees/s1-step2-rollback
+test -x "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.py" && git -C /Users/jacobr/dev/van-compute worktree add --detach "$ROLLBACK" 02a182d && git -C "$ROLLBACK" restore --source=a8637e8 --worktree -- van_compute/broker.py van_compute/worker.py && cp "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.py" "$ROLLBACK/macbook/scripts/install_van_compute_worker.py" && cp "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/install_van_compute_worker.zsh" "$ROLLBACK/macbook/scripts/install_van_compute_worker.zsh" && { if test -d "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/van_compute_installer"; then cp -R "$SAFE_INSTALLER_RELEASE/app/macbook/scripts/van_compute_installer" "$ROLLBACK/macbook/scripts/"; fi; } && /opt/homebrew/bin/python3 "$ROLLBACK/macbook/scripts/install_van_compute_worker.py" --dry-run
 ```
 
 Review the intentional broker/worker rollback and safe-installer overlay, then
@@ -390,7 +403,7 @@ Use the original host/worker identity and intended sandbox/dataset overrides.
 This reverts Step 2 runtime implementations (including backoff), not package
 layout, installed dependencies, configuration or queue state. The six unchanged
 protocol/queue/metrics/frontend/upgrade-gate/limit-helper dependencies match
-`c69a7a6`; the extra engine/config/backoff modules are not imported by those old
+`a8637e8`; the extra engine/config/backoff modules are not imported by those old
 entry modules. Do not run broad sync or the master installer's `--if-needed`
 until the cause is resolved: they would reinstall the newer runtime.
 
@@ -407,7 +420,8 @@ ssh pi@vanpi.lan 'set -eu; /usr/bin/readlink -e /home/pi/van_compute/current; /u
 The dashboard code expects `/home/pi/van_compute/current/van_compute/metrics.py`.
 The owner must perform and verify the live cutover; offline tests do not establish
 that it has happened. Dashboard application, template, static, and service changes
-still deploy through `pi/sync_scripts.sh`; normal compute deployment only refreshes
+still deploy through `/Users/jacobr/dev/scripts/pi/sync_scripts.sh`; normal compute
+deployment only refreshes
 an active dashboard already configured for that canonical package path.
 
 It deploys, but deliberately does not activate, the example policy for the

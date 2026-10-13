@@ -18,7 +18,6 @@ QUEUE_CLI = COMPUTE_ROOT / "entrypoints" / "van_compute.py"
 FRONTEND_CLI = COMPUTE_ROOT / "entrypoints" / "pi_compute.py"
 UPGRADE_GATE = COMPUTE_ROOT / "upgrade_gate.py"
 EXAMPLE_TASKS = COMPUTE_ROOT / "configs" / "van-compute-obd.example.json"
-DASHBOARD_SERVICE = REPOSITORY_ROOT / "pi" / "services" / "van-dashboard.service"
 BROKER_SERVICE = COMPUTE_ROOT / "configs" / "van-compute-broker.service"
 
 
@@ -246,9 +245,21 @@ class DeploymentFixtureMixin:
     def make_installer(
         self, directory, *, options=None, local=None, remote=None, **kwargs
     ):
+        environment = dict(kwargs.pop("environment", {}))
+        if not environment.get("VAN_COMPUTE_DATASET_CONFIG"):
+            directory_path = Path(directory)
+            fixture_root = (
+                directory_path if directory_path.is_dir() else directory_path.parent
+            )
+            fixture_root.mkdir(parents=True, exist_ok=True)
+            dataset_config = fixture_root / (
+                f".{directory_path.name}-van-compute-datasets.json"
+            )
+            dataset_config.write_bytes(b'{"datasets": {}}\n')
+            environment["VAN_COMPUTE_DATASET_CONFIG"] = str(dataset_config)
         return Installer(
             options or Options(),
-            environment=kwargs.pop("environment", {}),
+            environment=environment,
             home=Path(directory) / "home",
             script=INSTALLER,
             local=local or FakeLocal(),

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import importlib.util
 import io
 import json
 import os
@@ -19,13 +18,12 @@ from macbook.scripts.van_compute_installer import constants as installer_constan
 from macbook.scripts.van_compute_installer import mac as installer_mac
 from macbook.scripts.van_compute_installer import orchestrator as installer_orchestrator
 from macbook.scripts.van_compute_installer.models import (
-    DeploymentError, Options, Paths, SourceRelease,
+    DeploymentError, Options, Paths,
 )
 from macbook.scripts.van_compute_installer.orchestrator import Installer
-from pi import deploy_python
 from pi.tests.compute.van_compute_deployment_support import (
-    BROKER_SERVICE, COMPUTE_ROOT, DASHBOARD_SERVICE, EXAMPLE_TASKS, FRONTEND_CLI,
-    INSTALLER, QUEUE_CLI, REPOSITORY_ROOT, SHIM, UPGRADE_GATE,
+    BROKER_SERVICE, COMPUTE_ROOT, EXAMPLE_TASKS, FRONTEND_CLI,
+    INSTALLER, QUEUE_CLI, SHIM, UPGRADE_GATE,
     DeploymentFixtureMixin, FakeCompleted, FakeLocal, FakeLock, FakeRemote,
     WorkflowInstaller,
 )
@@ -101,7 +99,7 @@ class VanComputeDeploymentTests(DeploymentFixtureMixin, unittest.TestCase):
                     "van-compute is being upgraded; retry this command shortly\n",
                 )
 
-    def test_broker_and_dashboard_units_consume_the_package_current_link(self):
+    def test_broker_unit_consumes_the_package_current_link(self):
         broker = parse_directives(BROKER_SERVICE.read_text(encoding="utf-8"))
         broker_environment = parse_environment(broker)
         self.assertEqual(
@@ -125,77 +123,6 @@ class VanComputeDeploymentTests(DeploymentFixtureMixin, unittest.TestCase):
         )
         self.assertIn("/home/pi/van_compute/venv/bin/python3", pre_start)
         self.assertIn("/home/pi/van_compute/venv/bin/python3", start)
-        dashboard = parse_directives(DASHBOARD_SERVICE.read_text(encoding="utf-8"))
-        dashboard_environment = parse_environment(dashboard)
-        self.assertIn(
-            "/home/pi/van_compute/current",
-            dashboard_environment["PYTHONPATH"].split(":"),
-        )
-        self.assertIn(
-            [
-                "/usr/bin/test",
-                "-r",
-                "/home/pi/van_compute/current/van_compute/metrics.py",
-            ],
-            [command_arguments(value) for value in dashboard["ExecStartPre"]],
-        )
-
-    @unittest.skipUnless(
-        sys.version_info >= (3, 11) and importlib.util.find_spec("flask") is not None,
-        "Pi -P/dashboard smoke needs Python 3.11 and Flask (covered by compute venv suite)",
-    )
-    def test_staged_dashboard_imports_only_the_compute_metrics_contract(self):
-        plan = deploy_python.build_plan(REPOSITORY_ROOT, mode="stage")
-        with tempfile.TemporaryDirectory() as directory:
-            staged = Path(directory)
-            for relative in plan["manifest"]["files"]:
-                if not relative.endswith(".py"):
-                    continue
-                destination = staged / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(REPOSITORY_ROOT / relative, destination)
-            metrics_package = staged / "van_compute"
-            metrics_package.mkdir(parents=True, exist_ok=True)
-            (metrics_package / "__init__.py").write_text("", encoding="utf-8")
-            (metrics_package / "metrics.py").write_text(
-                "class ComputeMetricsError(RuntimeError):\n"
-                "    pass\n\n"
-                "class ComputeMetricsReader:\n"
-                "    def __init__(self, root):\n"
-                "        self.root = root\n",
-                encoding="utf-8",
-            )
-            environment = os.environ.copy()
-            environment["PYTHONPATH"] = str(staged)
-            environment["VAN_DASHBOARD_COMPUTE_ROOT"] = str(staged / "compute")
-            environment["VAN_DASHBOARD_STATE_PATH"] = str(staged / "state.json")
-            environment["VAN_DASHBOARD_RUNTIME_DIR"] = str(staged / "runtime")
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-P",
-                    "-c",
-                    (
-                        "import os; "
-                        "from van_compute import metrics; "
-                        "assert {name for name in vars(metrics) if not name.startswith('_')} "
-                        "== {'ComputeMetricsError', 'ComputeMetricsReader'}; "
-                        "import pi.apps.van_dashboard as dashboard; "
-                        "from pi.apps.van_dashboard import runtime; "
-                        "app = dashboard.create_app(); "
-                        "assert app is not None; "
-                        "assert isinstance(runtime.compute_monitor, metrics.ComputeMetricsReader); "
-                        "assert runtime.compute_monitor.root == os.environ['VAN_DASHBOARD_COMPUTE_ROOT']"
-                    ),
-                ],
-                cwd=staged,
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_example_tasks_remain_a_valid_repository_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -367,8 +294,13 @@ class VanComputeDeploymentTests(DeploymentFixtureMixin, unittest.TestCase):
             installer.paths.support_root.mkdir(parents=True)
             installed = installer.paths.dataset_target
             installed.write_bytes(b'{"datasets":{}}\n')
-            planned = installer.build_source_release()
-            installed.write_bytes(b'{"datasets": {}}\n')
+            with mock.patch.object(installer, "dataset_source", return_value=None):
+                planned = installer.build_source_release()
+            self.assertIsNone(planned.dataset_source)
+            self.assertEqual(
+                planned.dataset_fingerprint, installer._hash_file(installed)
+            )
+            installed.write_bytes(b'{"datasets": {}}  \n')
             with self.assertRaisesRegex(
                 DeploymentError, "changed after planning"
             ):

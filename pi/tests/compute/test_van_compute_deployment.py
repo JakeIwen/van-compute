@@ -22,9 +22,8 @@ from macbook.scripts.van_compute_installer.models import (
     DeploymentError, Options, Paths, SourceRelease,
 )
 from macbook.scripts.van_compute_installer.orchestrator import Installer
-from pi import deploy_python
 from pi.tests.compute.van_compute_deployment_support import (
-    BROKER_SERVICE, COMPUTE_ROOT, DASHBOARD_SERVICE, EXAMPLE_TASKS, FRONTEND_CLI,
+    BROKER_SERVICE, COMPUTE_ROOT, EXAMPLE_TASKS, FRONTEND_CLI,
     INSTALLER, QUEUE_CLI, REPOSITORY_ROOT, SHIM, UPGRADE_GATE,
     DeploymentFixtureMixin, FakeCompleted, FakeLocal, FakeLock, FakeRemote,
     WorkflowInstaller,

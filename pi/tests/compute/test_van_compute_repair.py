@@ -39,6 +39,8 @@ class MacReleaseRepairTests(unittest.TestCase):
         self.local = ProvisioningLocal()
         self.installer = self.helpers.make_installer(self.directory, local=self.local)
         self.source = self.installer.build_source_release()
+        self.installer.paths.support_root.mkdir(parents=True)
+        self.installer.install_dataset(self.source)
         self.old = self.helpers.create_owned_release(self.installer, self.source)
         self.helpers.point_launchagent_at(self.installer, self.old)
         self.installer.capture_prior_release()
