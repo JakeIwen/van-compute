@@ -29,6 +29,7 @@ INSTALLER_SOURCE_FILES = tuple(
         "orchestrator.py",
         "phases.py",
         "remote.py",
+        "runners.py",
         "source.py",
     )
 )
