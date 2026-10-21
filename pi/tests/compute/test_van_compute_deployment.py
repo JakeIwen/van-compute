@@ -216,6 +216,10 @@ class VanComputeDeploymentTests(DeploymentFixtureMixin, unittest.TestCase):
                     ],
                 )
 
+    @unittest.skipUnless(
+        sys.platform == "darwin" and Path("/bin/zsh").is_file(),
+        "Mac installer shell entry requires macOS /bin/zsh",
+    )
     def test_shell_entry_point_executes_python_dry_run(self):
         with tempfile.TemporaryDirectory() as directory:
             environment = os.environ.copy()

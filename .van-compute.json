@@ -5,7 +5,7 @@
       "name": "compute-tests",
       "description": "Install pinned test dependencies from an offline wheelhouse and run the complete fail-fast compute suite.",
       "profile": "python-script",
-      "source_paths": ["run_tests.py", "requirements-test.txt", "van_compute", "macbook", "pi/tests"],
+      "source_paths": ["AGENTS.md", "run_tests.py", "requirements-test.txt", "van_compute", "macbook", "pi/tests"],
       "minimum_inputs": 1,
       "maximum_inputs": 1,
       "argv": ["{source:run_tests.py}", "--wheelhouse", "{input:0}"],

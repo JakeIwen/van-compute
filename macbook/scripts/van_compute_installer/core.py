@@ -10,9 +10,8 @@ from typing import Callable, Mapping, TextIO
 import uuid
 
 from .constants import DEFAULT_HOST, DEFAULT_WORKER
-from .models import (
-    DeploymentError, LocalRunner, Options, Paths, RemoteRunner, SourceRelease, State,
-)
+from .models import DeploymentError, Options, Paths, SourceRelease, State
+from .runners import LocalRunner, RemoteRunner
 
 DEFAULT_SCRIPT = Path(__file__).parent.parent / "install_van_compute_worker.py"
 

@@ -4,7 +4,8 @@
 
 - `van_compute/`: protocol, queue, broker, worker, metrics, typed runtime configuration, and shared child/result engine; `retention.py` owns completed-job inspection and guarded pruning, `retention_policy.py` selects age/budget candidates, and `retention_citations.py` owns Git working-tree citation discovery.
 - `macbook/scripts/install_van_compute_worker.zsh` and `.py`: stable installer entry points.
-- `macbook/scripts/van_compute_installer/`: coupled Mac/Pi installer implementation.
+- `macbook/scripts/van_compute_installer/`: coupled Mac/Pi installer implementation;
+  `models.py` owns deployment records and `runners.py` owns local SSH/SCP adapters.
 - `macbook/launchagents/`: worker LaunchAgent template.
 - `pi/tests/compute/`: self-contained compute and deployment regression suites; `van_compute_test_fixtures.py` and deployment support modules hold shared fixtures.
 - `pi/docs/compute/VAN_COMPUTE.md`: architecture, deployment, rollback, and host-compatibility decisions.
@@ -42,6 +43,15 @@ not establish that the remote script stopped. Dashboard-selected package updates
 in the sibling `scripts` checkout run the existing compute-provider preflight
 before transferring a package.
 
+## Contracts
+
+| Path | Caller | Owner |
+| --- | --- | --- |
+| `python3 -m van_compute.broker` | `van_compute/configs/van-compute-broker.service` | `van_compute/broker.py` |
+| `macbook/scripts/install_van_compute_worker.zsh` | Owner Terminal and `scripts/pi/sync_scripts.sh` | `macbook/scripts/install_van_compute_worker.py`, `macbook/scripts/van_compute_installer/` |
+| `macbook/scripts/install_van_compute_worker.py` | Stable wrapper copied into frozen releases | `macbook/scripts/van_compute_installer/cli.py` |
+| `macbook/launchagents/com.jacobr.van-compute-worker.plist` | Coupled installer and installed LaunchAgent | `van_compute/worker.py` |
+
 The worker's host-wide retry gate applies only to transport outages, across all
 four control connections and all ten slots. Cooldowns cap at 30 seconds and the
 exclusive nonmutating recovery probe at 10 seconds, including connection setup;
@@ -50,3 +60,10 @@ It never blindly replays an upload or finish; exact-slot lease recovery remains
 authoritative. Drain cancels new
 admission/waiting claims, not active jobs. Keep `limited_child.py` standalone and
 free of package imports or untrusted startup PYTHONPATH.
+
+The Pi broker descendant-cleanup integration test runs on Linux: macOS agent
+sandboxes can refuse orphan process-group inspection. The complete suite reports
+that platform skip on macOS; run it under Pi Python 3.11 for the broker boundary.
+The installer shell-entry test runs only on macOS because the supported wrapper
+requires `/bin/zsh`. Child-environment fixtures seed the Mac compatibility
+variable they pin, so their bytes remain deterministic on Linux and macOS.
