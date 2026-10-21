@@ -41,6 +41,15 @@ not establish that the remote script stopped. Dashboard-selected package updates
 in the sibling `scripts` checkout run the existing compute-provider preflight
 before transferring a package.
 
+## Contracts
+
+| Path | Caller | Owner |
+| --- | --- | --- |
+| `python3 -m van_compute.broker` | `van_compute/configs/van-compute-broker.service` | `van_compute/broker.py` |
+| `macbook/scripts/install_van_compute_worker.zsh` | Owner Terminal and `scripts/pi/sync_scripts.sh` | `macbook/scripts/install_van_compute_worker.py`, `macbook/scripts/van_compute_installer/` |
+| `macbook/scripts/install_van_compute_worker.py` | Stable wrapper copied into frozen releases | `macbook/scripts/van_compute_installer/cli.py` |
+| `macbook/launchagents/com.jacobr.van-compute-worker.plist` | Coupled installer and installed LaunchAgent | `van_compute/worker.py` |
+
 The worker's host-wide retry gate applies only to transport outages, across all
 four control connections and all ten slots. Cooldowns cap at 30 seconds and the
 exclusive nonmutating recovery probe at 10 seconds, including connection setup;
