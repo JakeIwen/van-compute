@@ -2,12 +2,14 @@
 
 ## Repository map
 
-- `van_compute/`: protocol, queue, broker, worker, metrics, typed runtime configuration, and shared child/result engine; `retention.py` owns completed-job pruning and `retention_citations.py` owns Git working-tree citation discovery.
+- `van_compute/`: protocol, queue, broker, worker, metrics, typed runtime configuration, and shared child/result engine; `retention.py` owns completed-job inspection and guarded pruning, `retention_policy.py` selects age/budget candidates, and `retention_citations.py` owns Git working-tree citation discovery.
 - `macbook/scripts/install_van_compute_worker.zsh` and `.py`: stable installer entry points.
 - `macbook/scripts/van_compute_installer/`: coupled Mac/Pi installer implementation.
 - `macbook/launchagents/`: worker LaunchAgent template.
 - `pi/tests/compute/`: self-contained compute and deployment regression suites; `van_compute_test_fixtures.py` and deployment support modules hold shared fixtures.
 - `pi/docs/compute/VAN_COMPUTE.md`: architecture, deployment, rollback, and host-compatibility decisions.
+- `run_tests.py` and `requirements-test.txt`: complete fail-fast suite entry point and pinned test dependency; the optional wheelhouse path installs only into a temporary target.
+- `.van-compute.json`: repository compute tasks; `compute-tests` supplies an offline wheelhouse to the complete suite runner.
 
 ## Compute execution contracts
 

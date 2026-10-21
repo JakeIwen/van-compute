@@ -12,7 +12,7 @@ from pathlib import Path
 import stat
 import sys
 import time
-from typing import Callable, Iterable, Iterator
+from typing import Callable, Iterator
 import uuid
 
 from van_compute import queue, upgrade_gate
@@ -21,11 +21,19 @@ from van_compute.retention_citations import (
     job_ids_from_chunks,
     scan_citations,
 )
+from van_compute.retention_policy import (
+    RetentionPlan,
+    mark_budget_candidates,
+    mark_duplicate_ids,
+    order_for_deletion,
+    plan_retention,
+    retention_payload as _payload,
+    retention_settings,
+)
 
 
 RETENTION_DAYS = {"done": 60, "failed": 31}
 RETENTION_STATES = tuple(RETENTION_DAYS)
-CATEGORIES = ("protected", "kept-young", "skipped", "eligible")
 SUBMITTER_DRAIN_TIMEOUT = 120.0
 SUBMITTER_POLL_INTERVAL = 0.5
 
@@ -42,6 +50,26 @@ def add_prune_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Git checkout whose non-tmp files protect cited jobs",
     )
     parser.add_argument("--now", help="override the current ISO timestamp")
+    parser.add_argument(
+        "--keep-days",
+        type=_positive_int,
+        help="maximum age in days for uncited successful and failed jobs",
+    )
+    parser.add_argument(
+        "--max-history-bytes",
+        type=_positive_int,
+        help="maximum allocated bytes for local done and failed history",
+    )
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer") from None
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -54,6 +82,7 @@ class JobDecision:
     reason: str
     finished_at: str | None = None
     identity: tuple[int, int] | None = None
+    reclaimable_size: int = 0
 
 
 class _UnsafeTarget(queue.QueueError):
@@ -228,8 +257,15 @@ def _mount_at_or_below(target: Path, mounts: frozenset[Path]) -> bool:
     return os.path.ismount(target)
 
 
-def _tree_size(target: Path, device: int, mounts: frozenset[Path]) -> int:
+def _is_mount(path: Path, mounts: frozenset[Path]) -> bool:
+    return path in mounts if sys.platform.startswith("linux") else os.path.ismount(path)
+
+
+def _tree_sizes(
+    target: Path, device: int, mounts: frozenset[Path]
+) -> tuple[int, int]:
     total = 0
+    reclaimable = 0
     pending = [target]
     while pending:
         path = pending.pop()
@@ -240,7 +276,9 @@ def _tree_size(target: Path, device: int, mounts: frozenset[Path]) -> int:
         if details.st_dev != device:
             raise _UnsafeTarget(f"entry crosses the queue filesystem: {path}")
         if stat.S_ISDIR(details.st_mode):
-            if _mount_at_or_below(path, mounts):
+            # Traversal reaches every descendant itself, so exact membership is
+            # sufficient here. The broader ancestor check remains at deletion.
+            if _is_mount(path, mounts):
                 raise _UnsafeTarget(f"entry is at or below a mount point: {path}")
             try:
                 with os.scandir(path) as entries:
@@ -249,7 +287,36 @@ def _tree_size(target: Path, device: int, mounts: frozenset[Path]) -> int:
                 raise _UnsafeTarget(f"cannot inspect {path}: {exc}") from None
         elif not (stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode)):
             raise _UnsafeTarget(f"entry has an unsupported file type: {path}")
-        total += details.st_size
+        allocated = details.st_blocks * 512
+        total += allocated
+        if stat.S_ISDIR(details.st_mode) or details.st_nlink == 1:
+            reclaimable += allocated
+    return total, reclaimable
+
+
+def _tree_size(target: Path, device: int, mounts: frozenset[Path]) -> int:
+    return _tree_sizes(target, device, mounts)[0]
+
+
+def _completed_history_size(root: Path, mounts: frozenset[Path]) -> int:
+    """Return allocated bytes for done/failed, counting hardlinks once."""
+    device = root.stat().st_dev
+    pending = [root / state for state in RETENTION_STATES]
+    seen: set[tuple[int, int]] = set()
+    total = 0
+    while pending:
+        path = pending.pop()
+        details = path.lstat()
+        if details.st_dev != device:
+            continue
+        identity = (details.st_dev, details.st_ino)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        total += details.st_blocks * 512
+        if stat.S_ISDIR(details.st_mode) and not _is_mount(path, mounts):
+            with os.scandir(path) as entries:
+                pending.extend(Path(entry.path) for entry in entries)
     return total
 
 
@@ -292,6 +359,7 @@ def _classify_job(
     protected: frozenset[str],
     now: dt.datetime,
     mounts: frozenset[Path],
+    retention_days: dict[str, int],
 ) -> JobDecision:
     try:
         details = path.lstat()
@@ -300,16 +368,23 @@ def _classify_job(
     except OSError as exc:
         return _skipped(state, path, f"cannot inspect entry: {exc}")
     if not queue.JOB_ID_RE.fullmatch(path.name):
-        return _skipped(state, path, "entry name is not a job ID", details.st_size)
+        return _skipped(state, path, "entry name is not a job ID", details.st_blocks * 512)
     if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
-        return _skipped(state, path, "job entry is not a real directory", details.st_size)
+        return _skipped(
+            state, path, "job entry is not a real directory", details.st_blocks * 512
+        )
     device = root.stat().st_dev
     if details.st_dev != device:
-        return _skipped(state, path, "job entry is on a different filesystem", details.st_size)
+        return _skipped(
+            state,
+            path,
+            "job entry is on a different filesystem",
+            details.st_blocks * 512,
+        )
     try:
-        size = _tree_size(path, device, mounts)
+        size, reclaimable = _tree_sizes(path, device, mounts)
     except _UnsafeTarget as exc:
-        return _skipped(state, path, str(exc), details.st_size)
+        return _skipped(state, path, str(exc), details.st_blocks * 512)
     try:
         finished_at, finished = _finished_at(path, state, device)
     except _UnsafeTarget as exc:
@@ -323,10 +398,11 @@ def _classify_job(
             "protected",
             "citation closure",
             finished_at,
+            reclaimable_size=reclaimable,
         )
     if _active_copy_exists(root, path.name):
         return _skipped(state, path, "job ID is also present in queued or running", size)
-    age_limit = dt.timedelta(days=RETENTION_DAYS[state])
+    age_limit = dt.timedelta(days=retention_days[state])
     if now - finished <= age_limit:
         return JobDecision(
             state,
@@ -336,6 +412,8 @@ def _classify_job(
             "kept-young",
             "inside retention window",
             finished_at,
+            identity=(details.st_dev, details.st_ino),
+            reclaimable_size=reclaimable,
         )
     return JobDecision(
         state,
@@ -346,6 +424,7 @@ def _classify_job(
         "older than retention window",
         finished_at,
         identity=(details.st_dev, details.st_ino),
+        reclaimable_size=reclaimable,
     )
 
 
@@ -354,6 +433,7 @@ def _inventory(
     protected: frozenset[str],
     now: dt.datetime,
     mounts: frozenset[Path],
+    retention_days: dict[str, int],
 ) -> list[JobDecision]:
     decisions: list[JobDecision] = []
     for state in RETENTION_STATES:
@@ -363,23 +443,10 @@ def _inventory(
         except OSError as exc:
             raise queue.QueueError(f"cannot inspect queue state {state_root}: {exc}") from None
         decisions.extend(
-            _classify_job(root, state, path, protected, now, mounts)
+            _classify_job(root, state, path, protected, now, mounts, retention_days)
             for path in entries
         )
-    return decisions
-
-
-def _summary(decisions: Iterable[JobDecision]) -> dict[str, object]:
-    categories = {name: {"count": 0, "bytes": 0} for name in CATEGORIES}
-    by_state = {
-        state: {name: {"count": 0, "bytes": 0} for name in CATEGORIES}
-        for state in RETENTION_STATES
-    }
-    for item in decisions:
-        for bucket in (categories[item.category], by_state[item.state][item.category]):
-            bucket["count"] += 1
-            bucket["bytes"] += item.size
-    return {"categories": categories, "by_state": by_state}
+    return mark_duplicate_ids(decisions)
 
 
 def _remove_open_directory(descriptor: int, device: int) -> None:
@@ -438,38 +505,6 @@ def _delete_tree(
         os.close(state_descriptor)
 
 
-def _payload(
-    *,
-    apply: bool,
-    citations_root: Path,
-    now: dt.datetime,
-    scan: CitationScan,
-    citation_scans: int,
-    protected: frozenset[str],
-    decisions: list[JobDecision],
-    deleted: list[str],
-) -> dict[str, object]:
-    eligible = [item.job_id for item in decisions if item.category == "eligible"]
-    skipped = [
-        {"id": item.job_id, "state": item.state, "reason": item.reason}
-        for item in decisions
-        if item.category == "skipped"
-    ]
-    return {
-        "apply": apply,
-        "citations_root": str(citations_root),
-        "now": now.isoformat(),
-        "citation_scans": citation_scans,
-        "citation_files_scanned": scan.files_scanned,
-        "direct_citation_ids": len(scan.job_ids),
-        "protected_ids": len(protected),
-        "summary": _summary(decisions),
-        "eligible_ids": eligible,
-        "deleted_ids": deleted,
-        "skipped": skipped,
-    }
-
-
 def _merge_scans(first: CitationScan, second: CitationScan) -> CitationScan:
     return CitationScan(
         frozenset(first.job_ids | second.job_ids),
@@ -486,11 +521,26 @@ def _inspect(
     root: Path,
     citations_root: Path,
     now: dt.datetime,
+    retention_days: dict[str, int],
 ) -> tuple[CitationScan, frozenset[str], list[JobDecision]]:
     scan = scan_citations(citations_root)
     protected = _protected_set(root, scan)
-    decisions = _inventory(root, protected, now, _linux_mount_points())
+    decisions = _inventory(
+        root, protected, now, _linux_mount_points(), retention_days
+    )
     return scan, protected, decisions
+
+
+def _history_plan(
+    root: Path,
+    decisions: list[JobDecision],
+    maximum_bytes: int | None,
+) -> RetentionPlan:
+    return plan_retention(
+        decisions,
+        maximum_bytes,
+        before_bytes=_completed_history_size(root, _linux_mount_points()),
+    )
 
 
 @contextmanager
@@ -568,7 +618,7 @@ def _apply_second_scan(
     protected = _protected_set(root, merged)
     revised = [
         replace(item, category="protected", reason="citation closure")
-        if item.category == "eligible" and item.job_id in protected
+        if item.category in {"eligible", "kept-young"} and item.job_id in protected
         else item
         for item in decisions
     ]
@@ -581,6 +631,7 @@ def _delete_eligible(
     now: dt.datetime,
     decisions: list[JobDecision],
     gate_owner: str,
+    retention_days: dict[str, int],
 ) -> tuple[list[JobDecision], list[str]]:
     final: list[JobDecision] = []
     deleted: list[str] = []
@@ -595,7 +646,14 @@ def _delete_eligible(
             protected,
             now,
             _linux_mount_points(),
+            retention_days,
         )
+        if (
+            current.category == "kept-young"
+            and decision.reason
+            == "oldest uncited job selected to meet history budget"
+        ):
+            current = replace(current, category="eligible", reason=decision.reason)
         if current.category != "eligible":
             final.append(current)
             continue
@@ -632,6 +690,8 @@ def prune_from_args(root: Path, args: argparse.Namespace) -> dict[str, object]:
         args.citations_root,
         apply=args.apply,
         now_text=args.now,
+        keep_days=args.keep_days,
+        max_history_bytes=args.max_history_bytes,
     )
 
 
@@ -640,8 +700,14 @@ def run_prune_command(
     args: argparse.Namespace,
     printer: Callable[[object], None],
 ) -> int:
-    printer(prune_from_args(root, args))
-    return 0
+    payload = prune_from_args(root, args)
+    printer(payload)
+    outcome = (
+        payload["history_budget"]["after_satisfied"]
+        if args.apply
+        else payload["history_budget"]["projected_satisfied"]
+    )
+    return 0 if outcome else 1
 
 
 def prune_jobs(
@@ -650,12 +716,24 @@ def prune_jobs(
     *,
     apply: bool = False,
     now_text: str | None = None,
+    keep_days: int | None = None,
+    max_history_bytes: int | None = None,
 ) -> dict[str, object]:
+    try:
+        retention_days = retention_settings(
+            RETENTION_DAYS, keep_days, max_history_bytes
+        )
+    except ValueError as exc:
+        raise queue.QueueError(str(exc)) from None
     now = parse_now(now_text)
     citations_root = citations_root.expanduser().resolve()
 
     if not apply:
-        scan, protected, decisions = _inspect(root, citations_root, now)
+        scan, protected, decisions = _inspect(
+            root, citations_root, now, retention_days
+        )
+        plan = _history_plan(root, decisions, max_history_bytes)
+        decisions = mark_budget_candidates(decisions, plan)
         return _payload(
             apply=False,
             citations_root=citations_root,
@@ -665,15 +743,15 @@ def prune_jobs(
             protected=protected,
             decisions=decisions,
             deleted=[],
+            plan=plan,
+            retention_days=retention_days,
         )
 
     with _submission_gate() as gate_owner:
         with queue.queue_lock(root):
             _require_apply_allowed(root, gate_owner)
             first, _initial_protected, decisions = _inspect(
-                root,
-                citations_root,
-                now,
+                root, citations_root, now, retention_days
             )
             scan, protected, decisions = _apply_second_scan(
                 root,
@@ -681,13 +759,18 @@ def prune_jobs(
                 first,
                 decisions,
             )
+            plan = _history_plan(root, decisions, max_history_bytes)
+            decisions = mark_budget_candidates(decisions, plan)
+            decisions = order_for_deletion(decisions, plan.eligible_ids)
             final, deleted = _delete_eligible(
                 root,
                 protected,
                 now,
                 decisions,
                 gate_owner,
+                retention_days,
             )
+            after_bytes = _completed_history_size(root, _linux_mount_points())
             return _payload(
                 apply=True,
                 citations_root=citations_root,
@@ -697,4 +780,7 @@ def prune_jobs(
                 protected=protected,
                 decisions=final,
                 deleted=deleted,
+                plan=plan,
+                retention_days=retention_days,
+                after_bytes=after_bytes,
             )

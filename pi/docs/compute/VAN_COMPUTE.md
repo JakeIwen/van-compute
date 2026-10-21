@@ -91,6 +91,38 @@ Live CAN/SocketCAN access, interface configuration, bus wake or UDS traffic,
 ADB/device access, routing, storage, and service control never go through this
 system.
 
+## Completed-history retention
+
+The administrative `prune` command accepts `--keep-days` (one maximum age for
+both successful and failed jobs) and `--max-history-bytes` (local allocated
+space under the queue's `done/` and `failed/` directories). Without these
+options the existing 60-day successful / 31-day failed policy remains in force.
+Preview is the default; `--apply` authorizes deletion.
+
+Expired uncited jobs are selected first. If history remains above the space
+budget, younger uncited jobs are selected oldest-first until it fits. A size
+budget therefore takes precedence over retaining the full age window. Cited
+jobs, transitive dependencies and active-job dependencies remain protected;
+active jobs and archive targets are outside completed-history accounting.
+
+`history_budget` reports allocated bytes before, projected remaining bytes,
+and actual remaining bytes measured again after apply. The command returns
+nonzero when it cannot satisfy the applicable projected/actual budget.
+Protected, malformed, mounted and duplicate-ID entries are never force-deleted
+to make a quota. Hardlinked blocks are counted once in measured totals and
+treated conservatively in per-job reclaim projections. Citation rescanning,
+queue locking, submission fencing and inode revalidation remain mandatory.
+
+The obd-things owner policy passes `--keep-days 30 --max-history-bytes 2147483648`.
+That repository owns its completion-triggered and hourly systemd maintenance;
+this package owns selection, accounting and deletion. A completed job can
+briefly exceed the retention target before the triggered maintenance finishes.
+This feature does not place a filesystem quota on active computation.
+
+Deploy this CLI update through the coupled installer below before updating a
+consumer to require the new flags. Older installed CLIs reject those flags
+before performing any deletion; do not modify immutable deployed packages.
+
 ## Install
 
 The shell path remains the supported compatibility entry point, but it now execs

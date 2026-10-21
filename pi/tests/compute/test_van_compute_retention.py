@@ -4,6 +4,7 @@ from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
+import shutil
 import threading
 import unittest
 from unittest import mock
@@ -45,6 +46,236 @@ class RetentionTests(RetentionHarness, unittest.TestCase):
         self.assertEqual(payload["summary"]["categories"]["kept-young"]["count"], 2)
         self.assertNotIn(done_at_limit, payload["eligible_ids"])
         self.assertNotIn(failed_at_limit, payload["eligible_ids"])
+
+    def test_keep_days_applies_one_upper_age_to_both_states(self):
+        done_at_limit = self.add_job("done", age_days=30)
+        done_old = self.add_job("done", age_days=30, age_seconds=1)
+        failed_at_limit = self.add_job("failed", age_days=30)
+        failed_old = self.add_job("failed", age_days=30, age_seconds=1)
+
+        result, payload, errors = self.run_prune("--keep-days", "30")
+
+        self.assertEqual((result, errors), (0, ""))
+        self.assertEqual(payload["retention_days"], {"done": 30, "failed": 30})
+        self.assertEqual(payload["eligible_ids"], [done_old, failed_old])
+        self.assertNotIn(done_at_limit, payload["eligible_ids"])
+        self.assertNotIn(failed_at_limit, payload["eligible_ids"])
+
+    def test_budget_evicts_expired_before_older_unexpired_job(self):
+        older_unexpired = self.add_job("done", age_days=50)
+        expired = self.add_job("failed", age_days=40)
+        _, baseline, _ = self.run_prune()
+        expired_bytes = baseline["summary"]["by_state"]["failed"]["eligible"]["bytes"]
+        maximum = baseline["history_budget"]["before_bytes"] - expired_bytes
+
+        result, payload, errors = self.run_prune(
+            "--max-history-bytes", str(maximum)
+        )
+
+        self.assertEqual((result, errors), (0, ""))
+        self.assertEqual(payload["eligible_ids"], [expired])
+        self.assertNotIn(older_unexpired, payload["eligible_ids"])
+        self.assertEqual(payload["history_budget"]["projected_bytes"], maximum)
+        self.assertTrue(payload["history_budget"]["projected_satisfied"])
+
+    def test_budget_selects_younger_uncited_jobs_oldest_first(self):
+        oldest = self.add_job("done", age_days=20)
+        middle = self.add_job("failed", age_days=10)
+        newest = self.add_job("done", age_days=5)
+        _, baseline, _ = self.run_prune()
+        sizes = {
+            job_id: retention._tree_size(
+                next((self.root / state / job_id for state in ("done", "failed")
+                      if (self.root / state / job_id).exists())),
+                self.root.stat().st_dev,
+                frozenset(),
+            )
+            for job_id in (oldest, middle, newest)
+        }
+        maximum = baseline["history_budget"]["before_bytes"] - sizes[oldest] - sizes[middle]
+
+        result, payload, errors = self.run_prune(
+            "--keep-days", "30", "--max-history-bytes", str(maximum)
+        )
+
+        self.assertEqual((result, errors), (0, ""))
+        self.assertEqual(payload["eligible_ids"], [oldest, middle])
+        self.assertNotIn(newest, payload["eligible_ids"])
+        self.assertEqual(
+            {item["reason"] for item in payload["eligible"]},
+            {"oldest uncited job selected to meet history budget"},
+        )
+
+    def test_budget_reports_protected_history_that_prevents_target(self):
+        protected = self.add_job("done", age_days=10)
+        self.cite("projects/example/findings/protected.md", protected)
+
+        result, payload, errors = self.run_prune(
+            "--keep-days", "30", "--max-history-bytes", "1"
+        )
+
+        self.assertEqual((result, errors), (1, ""))
+        budget = payload["history_budget"]
+        self.assertFalse(budget["projected_satisfied"])
+        self.assertFalse(budget["after_satisfied"])
+        self.assertEqual(budget["blockers"][0]["id"], protected)
+        self.assertEqual(budget["blockers"][0]["category"], "protected")
+
+    def test_preview_omits_blockers_when_projected_cleanup_meets_budget(self):
+        eligible = self.add_job("done", age_days=61)
+        protected = self.add_job("failed", age_days=10)
+        self.cite("projects/example/findings/protected.md", protected)
+        _, baseline, _ = self.run_prune()
+        maximum = (
+            baseline["history_budget"]["before_bytes"]
+            - baseline["eligible"][0]["bytes"]
+        )
+
+        result, payload, errors = self.run_prune(
+            "--max-history-bytes", str(maximum)
+        )
+
+        self.assertEqual((result, errors), (0, ""))
+        self.assertEqual(payload["eligible_ids"], [eligible])
+        self.assertTrue(payload["history_budget"]["projected_satisfied"])
+        self.assertFalse(payload["history_budget"]["after_satisfied"])
+        self.assertEqual(payload["history_budget"]["blockers"], [])
+
+    def test_budget_apply_deletes_in_reported_order_and_reports_after(self):
+        expired = self.add_job("done", age_days=31)
+        younger = self.add_job("failed", age_days=20)
+        newest = self.add_job("done", age_days=5)
+        _, baseline, _ = self.run_prune("--keep-days", "30")
+        maximum = baseline["history_budget"]["before_bytes"] - sum(
+            retention._tree_size(
+                self.root / state / job_id,
+                self.root.stat().st_dev,
+                frozenset(),
+            )
+            for state, job_id in (("done", expired), ("failed", younger))
+        )
+        deleted_order = []
+        original_delete = retention._delete_tree
+
+        def record_delete(root, state, job_id, mounts, identity):
+            deleted_order.append(job_id)
+            return original_delete(root, state, job_id, mounts, identity)
+
+        with mock.patch.object(retention, "_delete_tree", side_effect=record_delete):
+            result, payload, errors = self.run_prune(
+                "--apply",
+                "--keep-days", "30",
+                "--max-history-bytes", str(maximum),
+            )
+
+        self.assertEqual((result, errors), (0, ""))
+        self.assertEqual(deleted_order, [expired, younger])
+        self.assertEqual(payload["deleted_ids"], [expired, younger])
+        self.assertEqual(payload["history_budget"]["after_bytes"], maximum)
+        self.assertTrue(payload["history_budget"]["after_satisfied"])
+        self.assertTrue((self.root / "done" / newest).is_dir())
+
+    def test_budget_apply_reports_measured_bytes_when_delete_is_refused(self):
+        job_id = self.add_job("done", age_days=31)
+        _, baseline, _ = self.run_prune("--keep-days", "30")
+        before = baseline["history_budget"]["before_bytes"]
+        maximum = max(1, before - baseline["eligible"][0]["bytes"])
+
+        with mock.patch.object(
+            retention,
+            "_delete_tree",
+            side_effect=retention._UnsafeTarget("fixture refusal"),
+        ):
+            result, payload, errors = self.run_prune(
+                "--apply",
+                "--keep-days", "30",
+                "--max-history-bytes", str(maximum),
+            )
+
+        self.assertEqual((result, errors), (1, ""))
+        self.assertEqual(payload["deleted_ids"], [])
+        self.assertEqual(payload["history_budget"]["after_bytes"], before)
+        self.assertFalse(payload["history_budget"]["after_satisfied"])
+        self.assertEqual(payload["history_budget"]["blockers"][0]["id"], job_id)
+
+    def test_budget_includes_completed_state_directory_overhead(self):
+        expected = sum(
+            (self.root / state).stat().st_blocks * 512
+            for state in ("done", "failed")
+        )
+        maximum = max(1, expected - 1)
+        result, payload, errors = self.run_prune(
+            "--max-history-bytes", str(maximum)
+        )
+
+        self.assertEqual((result, errors), (int(expected > maximum), ""))
+        budget = payload["history_budget"]
+        self.assertEqual(budget["before_bytes"], expected)
+        self.assertEqual(budget["projected_bytes"], expected)
+        if expected > maximum:
+            self.assertEqual(
+                budget["blockers"][0]["category"], "unreclaimable-overhead"
+            )
+        else:
+            self.assertEqual(budget["blockers"], [])
+
+    def test_duplicate_completed_job_ids_are_skipped(self):
+        job_id = self.add_job("done")
+        duplicate = self.root / "failed" / job_id
+        shutil.copytree(self.root / "done" / job_id, duplicate)
+        manifest = queue.load_json(duplicate / "manifest.json")
+        manifest["state"] = "failed"
+        queue.atomic_json(duplicate / "manifest.json", manifest)
+
+        result, payload, errors = self.run_prune("--apply")
+
+        self.assertEqual((result, errors), (0, ""))
+        self.assertEqual(payload["eligible_ids"], [])
+        self.assertEqual(payload["deleted_ids"], [])
+        self.assertEqual(payload["summary"]["categories"]["skipped"]["count"], 2)
+        self.assertEqual(
+            {item["reason"] for item in payload["skipped"]},
+            {"job ID appears in multiple completed states"},
+        )
+        self.assertTrue((self.root / "done" / job_id).is_dir())
+        self.assertTrue(duplicate.is_dir())
+
+    def test_walkers_preserve_non_linux_mount_detection(self):
+        job_id = self.add_job("done")
+        job = self.root / "done" / job_id
+        nested = job / "mounted"
+        nested.mkdir()
+        payload = nested / "payload"
+        payload.write_bytes(b"x" * 8192)
+        device = self.root.stat().st_dev
+
+        with mock.patch.object(retention.sys, "platform", "darwin"), mock.patch.object(
+            retention.os.path, "ismount", side_effect=lambda path: Path(path) == nested
+        ):
+            with self.assertRaisesRegex(retention._UnsafeTarget, "mount point"):
+                retention._tree_sizes(job, device, frozenset())
+            mounted_total = retention._completed_history_size(self.root, frozenset())
+
+        normal_total = retention._completed_history_size(self.root, frozenset())
+        self.assertGreaterEqual(normal_total - mounted_total, payload.stat().st_blocks * 512)
+
+    def test_walkers_use_exact_linux_mount_membership(self):
+        job_id = self.add_job("done")
+        job = self.root / "done" / job_id
+        nested = job / "mounted"
+        nested.mkdir()
+        (nested / "payload").write_bytes(b"x" * 8192)
+        device = self.root.stat().st_dev
+        mounts = frozenset({nested})
+
+        with mock.patch.object(retention.sys, "platform", "linux"), mock.patch.object(
+            retention.os.path,
+            "ismount",
+            side_effect=AssertionError("Linux should use mountinfo membership"),
+        ):
+            with self.assertRaisesRegex(retention._UnsafeTarget, "mount point"):
+                retention._tree_sizes(job, device, mounts)
+            retention._completed_history_size(self.root, mounts)
 
     def test_bare_and_path_form_citations_protect_jobs(self):
         bare = self.add_job("done")
