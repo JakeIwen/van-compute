@@ -2,6 +2,15 @@
 
 `van-compute` owns the coupled Pi broker and Mac worker for guarded offline compute jobs. Deployment source paths intentionally retain their historical repository-relative layout because installed and frozen releases fingerprint those paths.
 
+## Dashboard
+
+![M4 Compute Offload metrics and recent jobs](docs/screenshots/m4-compute-pane.png)
+
+The read-only M4 Compute pane reports offloaded work, resource totals, queue
+outcomes, and retained job diagnostics. The pane is hosted by the sibling
+Van Dashboard in `scripts`; this repository owns the broker, worker, metrics,
+and API data behind it.
+
 ## Test
 
 From the repository root, using a Python 3.11+ environment with Flask installed:
