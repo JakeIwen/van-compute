@@ -58,3 +58,10 @@ It never blindly replays an upload or finish; exact-slot lease recovery remains
 authoritative. Drain cancels new
 admission/waiting claims, not active jobs. Keep `limited_child.py` standalone and
 free of package imports or untrusted startup PYTHONPATH.
+
+The Pi broker descendant-cleanup integration test runs on Linux: macOS agent
+sandboxes can refuse orphan process-group inspection. The complete suite reports
+that platform skip on macOS; run it under Pi Python 3.11 for the broker boundary.
+The installer shell-entry test runs only on macOS because the supported wrapper
+requires `/bin/zsh`. Child-environment fixtures seed the Mac compatibility
+variable they pin, so their bytes remain deterministic on Linux and macOS.

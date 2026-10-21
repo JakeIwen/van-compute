@@ -51,7 +51,9 @@ class InstallerLayoutContractTests(unittest.TestCase):
             if isinstance(node, ast.Import)
             for alias in node.names
         }
-        self.assertNotIn("subprocess", imports)
+        imports.update(node.module for node in ast.walk(tree)
+                       if isinstance(node, ast.ImportFrom) and node.module)
+        self.assertFalse({"subprocess", "runners"} & imports)
 
     def test_local_runner_preserves_output_and_failure_contracts(self):
         runner = LocalRunner()

@@ -795,30 +795,6 @@ class RecoveryAndIsolationTests(BrokerHarness, unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("sandbox self-test failed", error.getvalue())
 
-    def test_background_descendant_is_terminated_before_results_publish(self):
-        submitted = self.submit(arguments=["--background"])
-
-        result = self.run_once()
-
-        self.assertTrue(result["ok"], result)
-        stdout = (
-            self.root / "done" / submitted["id"] / "result" / "stdout.txt"
-        ).read_text(encoding="utf-8")
-        child_pid = int(stdout.split("background=", 1)[1].splitlines()[0])
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.05)
-        else:
-            try:
-                os.kill(child_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            self.fail("background child survived result publication")
-
     def test_bubblewrap_command_exposes_only_staged_job_and_runtime(self):
         base = Path(self.temporary.name)
         fake_bwrap = base / "bwrap"

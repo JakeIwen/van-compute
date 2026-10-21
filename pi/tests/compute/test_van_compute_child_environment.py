@@ -16,6 +16,8 @@ from pi.tests.compute.van_compute_test_fixtures import (
     normalized_child_capture,
 )
 
+CHILD_TEXT_ENCODING = "0x1F5:0x0:0x0"
+
 
 def _prepare_broker_child_job(fixture):
     tool = fixture.source / "tools" / "capture_child.py"
@@ -54,6 +56,10 @@ def _run_broker_child_job(fixture):
     real_popen = broker.subprocess.Popen
 
     def recording_popen(command, *args, **kwargs):
+        kwargs["env"] = {
+            **kwargs.get("env", {}),
+            "__CF_USER_TEXT_ENCODING": CHILD_TEXT_ENCODING,
+        }
         helper_calls.append((list(command), dict(kwargs)))
         return real_popen(command, *args, **kwargs)
 
@@ -163,6 +169,10 @@ def worker_child_capture():
         real_scrub = worker.scrub_private_paths
 
         def recording_popen(command, *args, **kwargs):
+            kwargs["env"] = {
+                **kwargs.get("env", {}),
+                "__CF_USER_TEXT_ENCODING": CHILD_TEXT_ENCODING,
+            }
             helper_calls.append((list(command), dict(kwargs)))
             return real_popen(command, *args, **kwargs)
 
