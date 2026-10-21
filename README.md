@@ -13,13 +13,17 @@ and API data behind it.
 
 ## Test
 
-From the repository root, using a Python 3.11+ environment with Flask installed:
+From the repository root, using Python 3.11+, zsh for the installer smoke test,
+and the pinned test requirement:
 
 ```zsh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s pi/tests/compute
+python3 run_tests.py
 ```
 
-The suite is self-contained and does not require a sibling `scripts` checkout.
+`requirements-test.txt` is the test dependency contract. The compute task passes
+an offline wheelhouse to `python3 run_tests.py --wheelhouse PATH`; the runner
+installs it into a temporary target without changing the interpreter environment
+or using the network. The suite does not require a sibling `scripts` checkout.
 
 ## Deploy
 

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -220,8 +221,9 @@ class VanComputeDeploymentTests(DeploymentFixtureMixin, unittest.TestCase):
             environment = os.environ.copy()
             dry_home = Path(directory) / "home"
             environment["HOME"] = str(dry_home)
+            # Compute snapshots intentionally omit executable permission bits.
             result = subprocess.run(
-                [str(SHIM), "--dry-run"],
+                ["/bin/zsh", str(SHIM), "--dry-run"],
                 cwd=REPOSITORY_ROOT,
                 env=environment,
                 capture_output=True,
@@ -383,7 +385,7 @@ systemctl() {
             )
             script = script.replace(
                 "/usr/bin/python3 -P -m van_compute.queue",
-                sys.executable + " -m van_compute.queue",
+                shlex.quote(sys.executable) + " -m van_compute.queue",
             )
 
             def probe():
