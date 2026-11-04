@@ -157,14 +157,13 @@ unless the canonical compute provider has matching source markers, readable and
 importable metrics, and no maintenance/upgrade-owner fence. It does not require
 a fresh Mac heartbeat or the new checkout's source hash. This guard preserves the
 supervised first cutover; it never launches the Mac installer automatically to
-repair a missing provider. A scoped `deploy_python.py --update` from the sibling
-`scripts` checkout selecting the
-dashboard (including the default all-services selection) runs the same provider
-check before transferring a package; dry-run remains entirely local. Before
-starting, set `COMPUTE_REV` and `SCRIPTS_REV` in the owner's Terminal to the
-full commit IDs whose diffs were reviewed. The recipe creates clean detached
-worktrees for both deployment owners and keeps the package update scoped to the
-dashboard service:
+repair a missing provider. The sibling `van-dashboard` repo owns dashboard
+deployment; its `scripts/deploy.py` runs `scripts/check_compute_provider.py`
+before deployment. Its dry-run remains entirely local. Broad scripts sync still
+runs the compute installer. Before starting, set `COMPUTE_REV` and `SCRIPTS_REV`
+in the owner's Terminal to the full commit IDs whose diffs were reviewed. The
+recipe creates clean detached worktrees for both deployment owners and keeps the
+package update scoped to the dashboard service:
 
 ```zsh
 ( set -eu
@@ -451,10 +450,11 @@ ssh pi@vanpi.lan 'set -eu; /usr/bin/readlink -e /home/pi/van_compute/current; /u
 
 The dashboard code expects `/home/pi/van_compute/current/van_compute/metrics.py`.
 The owner must perform and verify the live cutover; offline tests do not establish
-that it has happened. Dashboard application, template, static, and service changes
-still deploy through `/Users/jacobr/dev/scripts/pi/sync_scripts.sh`; normal compute
-deployment only refreshes
-an active dashboard already configured for that canonical package path.
+that it has happened. Dashboard application, frontend, and service changes deploy
+through `/Users/jacobr/dev/van-dashboard/scripts/deploy.py`, which runs
+`scripts/check_compute_provider.py`. Broad scripts sync still runs the compute
+installer; normal compute deployment only refreshes an active dashboard already
+configured for that canonical package path.
 
 It deploys, but deliberately does not activate, the example policy for the
 separate live `obd-things` checkout. After reviewing it, activate it only if no

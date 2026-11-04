@@ -8,8 +8,8 @@
 
 The read-only M4 Compute pane reports offloaded work, resource totals, queue
 outcomes, and retained job diagnostics. The pane is hosted by the sibling
-Van Dashboard in `scripts`; this repository owns the broker, worker, metrics,
-and API data behind it.
+`van-dashboard` repo, whose deploy runs `scripts/check_compute_provider.py`;
+this repository owns the broker, worker, metrics, and API data behind it.
 
 ## Test
 

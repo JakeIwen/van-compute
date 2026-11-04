@@ -39,9 +39,9 @@ in `pi/tests/compute/van_compute_test_fixtures.py` and deployment support module
 Failed Mac builds are disposable only when this invocation owns the generation
 and no installed/prior LaunchAgent reference protects it. Once Pi cutover starts,
 only the remote cutover script may remove its stage: local SSH interruption does
-not establish that the remote script stopped. Dashboard-selected package updates
-in the sibling `scripts` checkout run the existing compute-provider preflight
-before transferring a package.
+not establish that the remote script stopped. The sibling `van-dashboard` repo owns dashboard deployment; its `scripts/deploy.py`
+runs `scripts/check_compute_provider.py` before deployment. Broad scripts sync
+still runs the compute installer.
 
 ## Contracts
 
