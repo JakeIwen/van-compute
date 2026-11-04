@@ -21,11 +21,12 @@ telemetry and publication are intentionally host-specific. Preserve all 260
 compute golden files (258 protocol fixtures plus two child-environment fixtures)
 and the host drift decisions in `pi/docs/compute/VAN_COMPUTE.md`. First cutover
 must install compute before updating the dashboard package: its unit/imports
-require `/home/pi/van_compute/current/van_compute/metrics.py`. Broad sync's
-package-before-compute order is not a first-cutover workflow; its earliest
-preflight now checks the installed canonical metrics provider and refuses
-missing/unsafe providers or maintenance/upgrade-owner fences before any writes.
-Keep the compute installer in the owner's Terminal. Reused Pi releases are
+require `/home/pi/van_compute/current/van_compute/metrics.py`. That cutover is
+complete; the dashboard now deploys from `~/dev/van-dashboard`, whose
+`scripts/deploy.py` runs `scripts/check_compute_provider.py` first. Broad scripts
+sync no longer preflights the provider: it uploads scripts, then the compute
+installer (`--if-needed`) applies its own drain/fence/heartbeat gates and may
+install a missing or unhealthy provider. Keep the compute installer in the owner's Terminal. Reused Pi releases are
 verified before drain, ignoring only runtime bytecode. Mac repair/`--rebuild`
 creates a new immutable `<deployment24>-<build_uuid32>` generation, never mutates
 retained releases, and skips pruning; legacy unsuffixed releases remain valid.

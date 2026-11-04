@@ -147,25 +147,54 @@ install drains the worker, fences submissions, enters maintenance, switches the
 Pi package, replaces the Mac worker, and requires a fresh compatible heartbeat
 before releasing the queue.
 
-The repository-wide updater is a supported entry point only after the initial
-provider-first package cutover has completed. The Step 1 dashboard imports
-`van_compute.metrics` from `/home/pi/van_compute/current`, while broad sync
-updates Python packages before it runs the compute installer. Therefore the
-first deployment must install and validate compute on both hosts before updating
-the dashboard consumer. Broad sync now refuses **before any deployment writes**
-unless the canonical compute provider has matching source markers, readable and
-importable metrics, and no maintenance/upgrade-owner fence. It does not require
-a fresh Mac heartbeat or the new checkout's source hash. This guard preserves the
-supervised first cutover; it never launches the Mac installer automatically to
-repair a missing provider. The sibling `van-dashboard` repo owns dashboard
-deployment; its `scripts/deploy.py` runs `scripts/check_compute_provider.py`
-before deployment. Its dry-run remains entirely local. Broad scripts sync still
-runs the compute installer. Before starting, set `COMPUTE_REV` and `SCRIPTS_REV`
-in the owner's Terminal to the full commit IDs whose diffs were reviewed. The
-recipe creates clean detached worktrees for both deployment owners and keeps the
-package update scoped to the dashboard service:
+### Current deployment ownership
 
-```zsh
+The initial provider-first compute cutover is complete; do not repeat it. The
+separate dashboard repository migration is also live (2026-11-03). The sibling
+`~/dev/van-dashboard` repo now owns dashboard deployment through
+`~/dev/van-dashboard/scripts/deploy.py`, which runs
+`scripts/check_compute_provider.py` before deployment; its dry-run is entirely
+local. Use that repo's `docs/REACT_DASHBOARD.md` deployment section for current
+dashboard updates. The van-dashboard repo's `docs/cutover.md` records the
+dashboard migration and its recovery context, not a requirement to redo it.
+Do not deploy the dashboard with the retired scripts service selector.
+
+Broad scripts sync still updates scripts and invokes the compute installer,
+not the dashboard deployer. It no longer preflights the compute provider (that
+check moved to the dashboard deployer). It uploads scripts, then
+`sync_compute` runs the compute installer with `--if-needed`; the installer owns
+its drain, fence and heartbeat gates and may install a missing or unhealthy
+provider. Do not assume broad sync verifies provider prerequisites before it
+writes.
+
+The compute safety requirements still apply: use reviewed source from the
+owner's Terminal, review the local-only plan first, and retain the coupled
+Pi/Mac installer and its drain/fence/heartbeat gates. Installed compute releases
+carry their own frozen installer CLI and sibling helper package for recovery,
+independent of the deployment worktree. Broad sync reads the primary `scripts`
+checkout and the configured `van-compute` checkout: reconcile both reviewed
+checkouts without discarding unrelated work before using it.
+
+### Historical first compute cutover (completed; DO NOT RUN)
+
+The archived recipe below predates the dashboard repository split. It installed
+and validated compute on both hosts before updating the old dashboard consumer,
+which imported `van_compute.metrics` from `/home/pi/van_compute/current`. That
+provider-first order was necessary because broad sync updated Python packages
+before running the compute installer. The recipe used reviewed full
+`COMPUTE_REV` and `SCRIPTS_REV` commit IDs and clean detached worktrees retained
+until deployment completed.
+
+**DO NOT RUN this obsolete recipe.** Its `SCRIPTS_REV`, scripts worktree and
+`pi/deploy_python.py --service van-dashboard.service` belong only to the
+completed historical cutover, not current installation or dashboard updates.
+Use the current deployment owners above; neither migration must be redone.
+
+<details>
+<summary>Archived first-cutover shell recipe — DO NOT RUN</summary>
+
+```text
+# HISTORICAL ONLY — DO NOT RUN
 ( set -eu
 : "${COMPUTE_REV:?set COMPUTE_REV to the reviewed van-compute commit ID}"
 : "${SCRIPTS_REV:?set SCRIPTS_REV to the reviewed scripts commit ID}"
@@ -190,15 +219,12 @@ ssh pi@vanpi.lan 'set -eu; /usr/bin/systemctl is-active van-compute-broker.servi
 )
 ```
 
-Keep both reviewed worktrees until the deployment completes. Afterward the
-installed release carries its own frozen installer CLI and sibling helper
-package for recovery, independent of the compute worktree. Broad sync always reads the
-primary `scripts` checkout and the configured `van-compute` checkout: do not use
-it until the owner has reconciled both checkouts without discarding unrelated
-work.
+</details>
 
-After that supervised provider-first cutover, routine repository-wide updates
-remain supported:
+### Routine scripts and compute updates
+
+Routine repository-wide scripts and compute updates remain supported; dashboard
+updates use the separate deployer above:
 
 ```zsh
 /Users/jacobr/dev/scripts/pi/sync_scripts.sh
