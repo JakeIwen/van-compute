@@ -23,6 +23,8 @@ Determinism is injected at environmental boundaries, not into serializers:
   sets its output modes and mtimes itself. The real archive writers run unchanged.
 * Path.write_text is a delegating observer of every execution.json write;
 * only sandbox command construction is bypassed (the established test fakes).
+* a test-owned bin/python symlink pins the broker runtime basename before
+  execution.json is serialized and hashed, independent of python/python3 launch.
 
 The ONLY byte normalization rules are the explicit re.escape patterns in
 normalization_rules(): this test's absolute temporary root -> <TMP> and the
@@ -48,6 +50,7 @@ import re
 import secrets
 import shutil
 import socket
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -128,6 +131,62 @@ def normalization_rules(base):
         (re.compile(re.escape(str(base).encode("utf-8"))), b"<TMP>"),
         (re.compile(re.escape(sys.executable.encode("utf-8"))), b"<PYTHON>"),
     )
+
+
+def broker_python(base, executable):
+    # Pin the fixture input, not serialized argv: manifests hash execution.json.
+    # The real broker must still choose and record its sandbox executable path.
+    path = base / "runtime" / "bin" / "python"
+    path.parent.mkdir(parents=True)
+    path.symlink_to(executable)
+    return path
+
+
+class GoldenRuntimeTests(unittest.TestCase):
+    def test_broker_runtime_accepts_python_and_python3_launches(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for name in ("python", "python3"):
+                with self.subTest(interpreter=name):
+                    base = Path(temporary) / name
+                    alias = base / "bin" / name
+                    alias.parent.mkdir(parents=True)
+                    alias.symlink_to(sys.executable)
+                    runtime = broker_python(base, alias)
+                    mapped, bindings = broker.sandbox_executable(str(runtime), "python")
+                    self.assertEqual(mapped, "/job/runtime/python/bin/python")
+                    self.assertEqual(bindings, [(runtime.parent.parent, "/job/runtime/python")])
+                    child = subprocess.run(
+                        [str(runtime), "-c", "print('fixture child ran')"],
+                        capture_output=True, check=False,
+                    )
+                    self.assertEqual((child.returncode, child.stdout, child.stderr),
+                                     (0, b"fixture child ran\n", b""))
+
+    def assert_mutations_stay_visible(self):
+        expected = (GOLDEN_ROOT / "broker_directory/local/execution-write-01.json").read_bytes()
+        for before, after in (
+            (b"/job/runtime/python/bin/python", b"/job/runtime/python/bin/python3"),
+            (b"/job/runtime/python/bin/python", b"/job/runtime/python/bin/python-other"),
+            (b"/job/runtime/python/bin/python", b"/usr/bin/sqlite3"),
+            (b"/job/source/tools/offline.py", b"/job/source/tools/other.py"),
+            (b'"--directory"', b'"--directory", "--extra"'),
+        ):
+            with self.subTest(change=after):
+                actual = expected.replace(before, after, 1)
+                self.assertNotEqual(actual, expected)
+                for pattern, replacement in normalization_rules(Path("/fixture-temp")):
+                    actual = pattern.sub(lambda _match: replacement, actual)
+                # Normalization may legitimately rewrite a mutant (the Pi broker
+                # shape maps its python3 path to <PYTHON>); it must never turn
+                # the mutant back into the golden bytes.
+                self.assertNotEqual(actual, expected)
+
+    def test_different_launch_or_arguments_remain_visible(self):
+        self.assert_mutations_stay_visible()
+
+    def test_mutations_stay_visible_with_broker_sandbox_executable(self):
+        with mock.patch.object(sys, "executable", "/job/runtime/python/bin/python3"):
+            self.assert_mutations_stay_visible()
 
 
 class InProcessRemote(worker.RemoteQueue):
@@ -383,6 +442,7 @@ class ComputeGoldenTests(unittest.TestCase):
         harness.setUp()
         try:
             args = harness.args
+            args.python = str(broker_python(self.base, sys.executable))
             args.root = self.root
             args.work_root = self.base / "broker-work"
             args.work_root.mkdir(exist_ok=True)
@@ -399,8 +459,13 @@ class ComputeGoldenTests(unittest.TestCase):
                 None, 524288 if limited else FREE_BYTES,
             )
 
+        def no_sandbox(executable, command, **paths):
+            if command[0] == "/job/runtime/python/bin/python":
+                command = [args.python, *command[1:]]
+            return broker_tests.BrokerHarness.no_sandbox(executable, command, **paths)
+
         with ExitStack() as patches:
-            patches.enter_context(mock.patch.object(broker, "bubblewrap_command", broker_tests.BrokerHarness.no_sandbox))
+            patches.enter_context(mock.patch.object(broker, "bubblewrap_command", no_sandbox))
             patches.enter_context(mock.patch.object(broker, "_wait_for_process", wait))
             if variant == "preparation_error":
                 patches.enter_context(mock.patch.object(broker, "_copy_sources", side_effect=OSError("fixture source unavailable")))
