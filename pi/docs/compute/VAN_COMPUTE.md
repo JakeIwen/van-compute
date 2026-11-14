@@ -770,14 +770,16 @@ fixtures must remain byte-identical.
 8. **Watchdogs:** Pi checks disk every 0.5 seconds at reserve+result_limit and
    samples again after a fast exit. Mac checks RSS, process count then disk
    every second at reserve only, without a final sample. A Mac `ps` timeout
-   reuses the last good process table while it is at most 15 seconds old when
-   the timeout returns; because each probe can itself take the 5-second
-   timeout, a job may go up to about 20 seconds without a fresh RSS/process
-   reading before it is failed. Callers within one poll interval of a timeout
-   share its outcome (the reused table, or the same failure) rather than
-   queueing more `ps` probes on the shared lock. A table that is too old, a
-   first-sample timeout, a nonzero `ps` exit or an OSError still fail the job
-   with exit 125. A loaded Mac had killed healthy suites on one slow sample.
+   is an unknown reading, not a breach: callers reuse the last good process
+   table (an unseen group, or a first sample, reads as empty), and after each
+   timeout every slot shares that outcome without probing until a backoff of
+   1, 2, 4 ... seconds, capped at 30, expires. Jobs fail with exit 125 only
+   once 180 seconds pass with no fresh table, so RSS and process limits go
+   unenforced for at most that long while `ps` is stalled. A nonzero `ps`
+   exit or an OSError still fails the job at once. A 15-second tolerance still
+   killed healthy suites on a busy Mac (Time Machine plus several agent
+   sessions). Exit 125 with `resource_monitor_error` set in `execution.json`
+   marks a monitoring failure rather than a job failure; callers may retry it.
    Thresholds, sampling
    order, error strings and exit codes remain host-specific, including Mac's
    legacy empty-watchdog-error graceful termination/143 behavior.

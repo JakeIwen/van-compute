@@ -67,13 +67,21 @@ SCHEDULER_SLOTS = 10
 SSH_CONTROL_CONNECTIONS = 4
 RESOURCE_POLL_INTERVAL = 1.0
 PROCESS_TABLE_TIMEOUT = 5
-# A loaded Mac can stall one `ps` past its timeout; failing the job on a single
-# slow sample killed healthy suites. Timeouts reuse the last good table while it
-# is younger than this; older tables and any other ps failure still fail closed.
-PROCESS_TABLE_STALE_LIMIT = 15.0
+# A busy Mac (Time Machine, several agent sessions) can stall `ps` past its
+# timeout for long stretches; failing jobs after a 15-second gap still killed
+# healthy suites. A timeout is an unknown reading, not a breach: callers reuse
+# the last good table (or read an unseen group as empty), probes back off, and
+# jobs fail only after this long with no fresh table. Other ps failures (a
+# nonzero exit, OSError) still fail closed at once.
+PROCESS_TABLE_BLIND_LIMIT = 180.0
+PROCESS_TABLE_RETRY_MAX = 30.0
 _PROCESS_TABLE_LOCK = threading.Lock()
 _PROCESS_TABLE_SAMPLED_AT = 0.0
-_PROCESS_TABLE_TIMED_OUT_AT: float | None = None
+# Monotonic time the current run of timeouts went blind (the last good sample,
+# or the first failed probe when none exists); None while probes succeed.
+_PROCESS_TABLE_BLIND_SINCE: float | None = None
+_PROCESS_TABLE_TIMEOUTS = 0
+_PROCESS_TABLE_RETRY_AT = 0.0
 _PROCESS_TABLE_TIMEOUT_ERROR = ""
 _PROCESS_TABLE_GROUPS: dict[int, tuple[int, int]] = {}
 COPY_CHUNK = 1024 * 1024
@@ -911,24 +919,23 @@ def process_group_exists(group_id: int) -> bool:
 def process_group_resources(group_id: int) -> tuple[int, int]:
     """Return aggregate RSS/count from one shared process-table sample.
 
-    A ps timeout falls back to the last good table while it is younger than
-    PROCESS_TABLE_STALE_LIMIT. Callers within one poll interval of a timeout
-    share its outcome (the reused table, or the same failure once the table is
-    too old) instead of queueing serial five-second retries on the lock.
+    A ps timeout leaves the reading unknown: callers get the last good table
+    (empty for groups it lacks) until PROCESS_TABLE_BLIND_LIMIT passes without
+    a fresh one. After each timeout every caller shares that outcome without
+    probing until an exponential backoff (capped at PROCESS_TABLE_RETRY_MAX)
+    expires, so ten slots do not queue serial five-second probes on the lock
+    of an already loaded Mac.
     """
     global _PROCESS_TABLE_GROUPS, _PROCESS_TABLE_SAMPLED_AT
-    global _PROCESS_TABLE_TIMED_OUT_AT, _PROCESS_TABLE_TIMEOUT_ERROR
+    global _PROCESS_TABLE_BLIND_SINCE, _PROCESS_TABLE_TIMEOUTS
+    global _PROCESS_TABLE_RETRY_AT, _PROCESS_TABLE_TIMEOUT_ERROR
     with _PROCESS_TABLE_LOCK:
         now = time.monotonic()
+        if _PROCESS_TABLE_BLIND_SINCE is not None and now < _PROCESS_TABLE_RETRY_AT:
+            return _process_table_tolerated(group_id, now)
         if (
-            _PROCESS_TABLE_TIMED_OUT_AT is not None
-            and now - _PROCESS_TABLE_TIMED_OUT_AT < RESOURCE_POLL_INTERVAL
-        ):
-            if _process_table_is_fresh_enough(now):
-                return _PROCESS_TABLE_GROUPS.get(group_id, (0, 0))
-            raise WorkerError(_PROCESS_TABLE_TIMEOUT_ERROR)
-        if (
-            group_id not in _PROCESS_TABLE_GROUPS
+            _PROCESS_TABLE_BLIND_SINCE is not None
+            or group_id not in _PROCESS_TABLE_GROUPS
             or now - _PROCESS_TABLE_SAMPLED_AT >= RESOURCE_POLL_INTERVAL
         ):
             try:
@@ -943,13 +950,21 @@ def process_group_resources(group_id: int) -> tuple[int, int]:
                 )
             except subprocess.TimeoutExpired as exc:
                 failed_at = time.monotonic()
-                _PROCESS_TABLE_TIMED_OUT_AT = failed_at
+                if _PROCESS_TABLE_BLIND_SINCE is None:
+                    _PROCESS_TABLE_BLIND_SINCE = (
+                        _PROCESS_TABLE_SAMPLED_AT
+                        if _PROCESS_TABLE_SAMPLED_AT > 0
+                        else now
+                    )
+                _PROCESS_TABLE_TIMEOUTS += 1
+                _PROCESS_TABLE_RETRY_AT = failed_at + min(
+                    PROCESS_TABLE_RETRY_MAX,
+                    RESOURCE_POLL_INTERVAL * 2 ** (_PROCESS_TABLE_TIMEOUTS - 1),
+                )
                 _PROCESS_TABLE_TIMEOUT_ERROR = (
                     f"resource watchdog could not run ps: {exc}"
                 )
-                if _process_table_is_fresh_enough(failed_at):
-                    return _PROCESS_TABLE_GROUPS.get(group_id, (0, 0))
-                raise WorkerError(_PROCESS_TABLE_TIMEOUT_ERROR) from None
+                return _process_table_tolerated(group_id, failed_at)
             except (OSError, subprocess.SubprocessError) as exc:
                 raise WorkerError(
                     f"resource watchdog could not run ps: {exc}"
@@ -975,15 +990,22 @@ def process_group_resources(group_id: int) -> tuple[int, int]:
                 )
             _PROCESS_TABLE_GROUPS = groups
             _PROCESS_TABLE_SAMPLED_AT = now
-            _PROCESS_TABLE_TIMED_OUT_AT = None
+            _PROCESS_TABLE_BLIND_SINCE = None
+            _PROCESS_TABLE_TIMEOUTS = 0
+            _PROCESS_TABLE_RETRY_AT = 0.0
         return _PROCESS_TABLE_GROUPS.get(group_id, (0, 0))
 
 
-def _process_table_is_fresh_enough(now: float) -> bool:
-    return (
-        _PROCESS_TABLE_SAMPLED_AT > 0
-        and now - _PROCESS_TABLE_SAMPLED_AT <= PROCESS_TABLE_STALE_LIMIT
-    )
+def _process_table_tolerated(group_id: int, now: float) -> tuple[int, int]:
+    """Reuse the last table during a ps outage, or fail once it ran too long."""
+    assert _PROCESS_TABLE_BLIND_SINCE is not None
+    blind = now - _PROCESS_TABLE_BLIND_SINCE
+    if blind > PROCESS_TABLE_BLIND_LIMIT:
+        raise WorkerError(
+            f"{_PROCESS_TABLE_TIMEOUT_ERROR} (no process-table reading for "
+            f"{blind:.0f} seconds across {_PROCESS_TABLE_TIMEOUTS} timed-out probes)"
+        )
+    return _PROCESS_TABLE_GROUPS.get(group_id, (0, 0))
 
 
 def filesystem_free_bytes(path: Path) -> int:
