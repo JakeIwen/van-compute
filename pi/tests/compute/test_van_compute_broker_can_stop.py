@@ -1,5 +1,8 @@
 import contextlib
 import datetime as dt
+import fcntl
+import functools
+import json
 import os
 from pathlib import Path
 import secrets
@@ -10,7 +13,10 @@ import time
 import unittest
 from unittest import mock
 
-from van_compute import broker, engine_process, job_requeue, pi_can_stop, queue
+from van_compute import (
+    broker, engine_process, job_cleanup_marker, job_requeue, pi_can_stop,
+    pi_cleanup_hold, queue,
+)
 from van_compute.can_activity import CanProbe
 from van_compute.pi_can_stop import (
     CAN_PROBE_FAILED, CAN_TRANSMIT, SERVICE_STOP, StopLatch,
@@ -483,20 +489,197 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
         )
         self.assert_gone(self.seen_pids)
 
-    def test_an_unconfirmed_termination_publishes_and_requeues_nothing(self):
+    def hold_scenario(self, group_alive_for_sleeps, stop_at_sleep=None):
+        """Run a job whose wait crashes, with a cleanup the group survives for a
+        while.  Returns (result_or_exception, observations taken during holds)."""
         submitted = self.submit_hanging()
-        events = []
-        cache, wait = self.failing_wait_with_scope_events(events)
-        with cache, wait, mock.patch.object(
-            broker, "_process_group_exists", lambda _group: True
-        ), mock.patch.object(engine_process, "GROUP_GONE_TIMEOUT", 0.2):
-            with self.assertRaises(broker.TerminationUnconfirmed):
-                self.run_with(lambda _dir=None: QUIET)
+        lock_path = Path(self.temporary.name) / "cache.lock"
+        events, seen = [], []
+        sleeps = {"count": 0}
+        stopping = {"on": False}
+
+        class LockScope:
+            def __enter__(inner):
+                inner.handle = lock_path.open("w")
+                fcntl.flock(inner.handle, fcntl.LOCK_SH)
+
+            def __exit__(inner, *_exc):
+                events.append("scope-exit")
+                inner.handle.close()
+
+        real_job_cache = broker.task_cache.job_cache
+
+        def locking_job_cache(*arguments, **keywords):
+            directory, _scope = real_job_cache(*arguments, **keywords)
+            return directory, LockScope()
+
+        def failing_wait(process, **_keywords):
+            deadline = time.monotonic() + 5
+            while len(self.hang_pids()) < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.seen_pids = self.hang_pids()
+            raise broker.BrokerError("watchdog crashed")
+
+        def hold_sleep(_seconds):
+            sleeps["count"] += 1
+            probe = lock_path.open("w")
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                other_holder_got_the_lock = True
+            except BlockingIOError:
+                other_holder_got_the_lock = False
+            finally:
+                probe.close()
+            running = self.root / "running" / submitted["id"]
+            seen.append({
+                "other_holder_got_the_lock": other_holder_got_the_lock,
+                "work_dirs": len(list(self.work.iterdir())),
+                "marker": queue.load_json(running / "manifest.json").get(
+                    "cleanup_unconfirmed"
+                ),
+                "failed": (self.root / "failed" / submitted["id"]).exists(),
+            })
+            if stop_at_sleep is not None and sleeps["count"] >= stop_at_sleep:
+                stopping["on"] = True
+
+        def group_exists(_group):
+            if stop_at_sleep is not None:
+                return True
+            return sleeps["count"] < group_alive_for_sleeps
+
+        hold = functools.partial(
+            pi_cleanup_hold.CleanupHold, sleep=hold_sleep, log=lambda _line: None
+        )
+        patches = [
+            mock.patch.object(broker.task_cache, "job_cache", locking_job_cache),
+            mock.patch.object(broker, "_wait_for_process", failing_wait),
+            mock.patch.object(broker, "_process_group_exists", group_exists),
+            mock.patch.object(broker, "CleanupHold", hold),
+            mock.patch.object(engine_process, "GROUP_GONE_TIMEOUT", 0.1),
+        ]
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            try:
+                outcome = self.run_with(
+                    lambda _dir=None: QUIET, should_stop=lambda: stopping["on"]
+                )
+            except broker.TerminationUnconfirmed as exc:
+                outcome = exc
+        return submitted, outcome, seen, events
+
+    def test_a_group_that_will_not_die_is_held_with_cache_lock_and_work_dir(self):
+        submitted, result, seen, events = self.hold_scenario(group_alive_for_sleeps=3)
+        self.assertGreaterEqual(len(seen), 3)
+        for observation in seen:
+            self.assertFalse(observation["other_holder_got_the_lock"])
+            self.assertEqual(observation["work_dirs"], 1)
+            self.assertIsNotNone(observation["marker"])
+            self.assertFalse(observation["failed"])
+        # Once confirmed gone, the original error takes the normal failure path.
+        self.assertEqual(result["action"], "executed")
+        self.assertFalse(result["ok"])
         self.assertEqual(events, ["scope-exit"])
-        self.assertTrue((self.root / "running" / submitted["id"]).is_dir())
+        self.assertTrue((self.root / "failed" / submitted["id"]).is_dir())
+        self.assertNotIn(
+            "cleanup_unconfirmed",
+            queue.load_json(self.root / "failed" / submitted["id"] / "manifest.json"),
+        )
+        self.assertNotIn(
+            job_cleanup_marker.REASON,
+            [
+                entry.get("reason")
+                for entry in queue.load_json(
+                    self.root / "failed" / submitted["id"] / "manifest.json"
+                ).get("attempt_history", [])
+            ],
+        )
+        self.assert_gone(self.seen_pids)
+
+    def test_a_failing_kill_and_reap_goes_to_the_hold_not_to_publication(self):
+        with mock.patch.object(
+            pi_cleanup_hold, "kill_and_reap_group",
+            side_effect=PermissionError("denied"),
+        ):
+            submitted, result, seen, _events = self.hold_scenario(
+                group_alive_for_sleeps=2
+            )
+        self.assertGreaterEqual(len(seen), 2)
+        self.assertFalse(any(item["failed"] for item in seen))
+        self.assertFalse(any(item["other_holder_got_the_lock"] for item in seen))
+        self.assertEqual(result["action"], "executed")
+        self.assertTrue((self.root / "failed" / submitted["id"]).is_dir())
+        # The faked "gone" answer ended the hold before the kill landed, so the
+        # unreaped leader is still a zombie; reap it before checking.
+        for pid in self.seen_pids:
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        self.assert_gone(self.seen_pids)
+
+    def test_a_stop_during_the_hold_publishes_and_requeues_nothing(self):
+        submitted, error, seen, events = self.hold_scenario(
+            group_alive_for_sleeps=0, stop_at_sleep=2
+        )
+        self.assertIsInstance(error, broker.TerminationUnconfirmed)
+        self.assertEqual(events, ["scope-exit"])
+        running = self.root / "running" / submitted["id"]
+        self.assertTrue(running.is_dir())
         self.assertFalse((self.root / "queued" / submitted["id"]).exists())
         self.assertFalse((self.root / "failed" / submitted["id"]).exists())
-        self.assert_gone(self.seen_pids)
+        manifest = queue.load_json(running / "manifest.json")
+        self.assertIsNotNone(manifest.get("cleanup_unconfirmed"))
+        self.assertEqual(
+            manifest["attempt_history"][-1]["reason"], job_cleanup_marker.REASON
+        )
+
+    def test_serve_exits_cleanly_when_a_stop_ends_a_cleanup_hold(self):
+        with mock.patch.object(
+            broker, "run_once", side_effect=broker.TerminationUnconfirmed("stopped")
+        ):
+            broker.serve(self.args, mock.Mock())  # returns instead of raising
+
+    def claim_and_mark(self, marked):
+        submitted = self.submit() if not marked else self.submit_hanging()
+        manifest, reason = broker.claim_local_job(
+            self.root, grace_seconds=0, remote_max_age=45,
+            eligibility=broker.local_eligibility,
+        )
+        self.assertIsNotNone(manifest, reason)
+        if marked:
+            job_cleanup_marker.mark_cleanup_unconfirmed(
+                self.root, submitted["id"], manifest["lease_token"],
+                worker=broker.LOCAL_WORKER, now=dt.datetime.now(dt.timezone.utc),
+            )
+        return submitted
+
+    def test_a_marked_job_is_failed_on_resume_without_running_again(self):
+        submitted = self.claim_and_mark(True)
+        result = self.run_with(lambda _dir=None: QUIET)
+        self.assertEqual(result["action"], "executed")
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.hang_pids(), [], "the job was run again")
+        self.assertTrue((self.root / "failed" / submitted["id"]).is_dir())
+        self.assertIn("previous broker instance", json.dumps(result))
+
+    def test_an_unmarked_running_job_still_resumes(self):
+        submitted = self.claim_and_mark(False)
+        result = self.run_with(lambda _dir=None: QUIET)
+        self.assertEqual(result["action"], "executed")
+        self.assertTrue(result["ok"], result)
+
+    def test_marker_needs_the_exact_lease_token(self):
+        submitted = self.submit()
+        broker.claim_local_job(
+            self.root, grace_seconds=0, remote_max_age=45,
+            eligibility=broker.local_eligibility,
+        )
+        with self.assertRaises(queue.QueueError):
+            job_cleanup_marker.mark_cleanup_unconfirmed(
+                self.root, submitted["id"], secrets.token_hex(16),
+                worker=broker.LOCAL_WORKER, now=dt.datetime.now(dt.timezone.utc),
+            )
 
     def test_an_already_reaped_leader_with_running_descendants_is_still_cleaned_up(self):
         leader = subprocess.Popen(
@@ -516,7 +699,15 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
             broker, "_wait_for_process", side_effect=broker.BrokerError("crash")
         ), self.assertRaises(broker.BrokerError):
             broker._supervise_child(
-                leader, self.args, self.work, StopLatch(lambda: False, None)
+                leader, self.args, self.work, StopLatch(lambda: False, None),
+                pi_cleanup_hold.CleanupHold(
+                    job="job",
+                    group_exists=broker._process_group_exists,
+                    service_stopping=lambda: False,
+                    mark=lambda: None,
+                    unmark=lambda: None,
+                    unconfirmed_error=broker.TerminationUnconfirmed,
+                ),
             )
         # Gone for good: not even a zombie answers (macOS says EPERM for those).
         with self.assertRaises(ProcessLookupError):

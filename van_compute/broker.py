@@ -41,6 +41,10 @@ from van_compute import engine, limited_child, queue, task_cache
 from van_compute.config import BrokerConfig, MissedOffloadRecord
 from van_compute.can_activity import CanObserver
 from van_compute.job_requeue import requeue_running_job
+from van_compute.job_cleanup_marker import (
+    clear_cleanup_unconfirmed, mark_cleanup_unconfirmed,
+)
+from van_compute.pi_cleanup_hold import CleanupHold
 from van_compute.pi_can_stop import CanStopped, StopLatch, requeue_after_can_stop
 from van_compute.pi_gate_flags import add_gate_arguments, validated_thresholds
 from van_compute.pi_health_monitor import HealthMonitor
@@ -96,8 +100,8 @@ class BrokerError(RuntimeError):
 
 
 class TerminationUnconfirmed(BrokerError):
-    """A job's process group could not be confirmed gone; nothing may be
-    published, uploaded or requeued from its directories."""
+    """The broker was stopped while a job's process group could not be confirmed
+    gone; nothing may be published, uploaded or requeued from its directories."""
 
 
 @dataclass(frozen=True)
@@ -1057,7 +1061,9 @@ def _local_analysis_command(
     return command, runtime_bindings
 
 
-def _supervise_child(process, args: BrokerConfig, work: Path, stop: StopLatch):
+def _supervise_child(
+    process, args: BrokerConfig, work: Path, stop: StopLatch, hold: CleanupHold
+):
     try:
         outcome = _wait_for_process(
             process,
@@ -1071,16 +1077,11 @@ def _supervise_child(process, args: BrokerConfig, work: Path, stop: StopLatch):
             process.pid, terminate_grace=stop.group_grace()
         )
         return outcome, cleaned
-    except BaseException as original:
-        # Whatever went wrong, the child and its group must be gone before the
-        # cache scope around the launch is released.  Reaping the leader says
-        # nothing about its descendants, so the group itself is confirmed gone
-        # here, still inside the scope.
-        engine.kill_and_reap_group(process)
-        if not engine.wait_for_group_gone(process.pid, exists=_process_group_exists):
-            raise TerminationUnconfirmed(
-                f"process group {process.pid} still has members after SIGKILL"
-            ) from original
+    except BaseException:
+        # Return only once the group is confirmed gone (the original error then
+        # propagates into the normal failure or requeue handling); otherwise
+        # hold the cache scope and work directory.
+        hold.clean_up(process)
         raise
 
 
@@ -1121,13 +1122,15 @@ def execute_claimed_job(
     capacity_ok, capacity_reason = work_capacity_eligibility(manifest, args)
     if not capacity_ok:
         raise BrokerError(capacity_reason)
+    marked = bool(manifest.get("cleanup_unconfirmed"))
     stop = StopLatch(
         should_stop,
         observe_can,
         quiet_seconds=quiet_seconds,
         required_quiet_seconds=args.health_thresholds.can_quiet_seconds,
     )
-    if not stop.clear_to_launch():
+    # A marked job fails below instead of requeueing, so it is never run again.
+    if not marked and not stop.clear_to_launch():
         return _requeue_for_can(root, job_id, lease_token, stop, None)
     broker_active_started = time.monotonic()
     work_root = prepare_work_root(args.work_root)
@@ -1142,6 +1145,11 @@ def execute_claimed_job(
         result_root = work / "result"
         artifacts: dict[str, str] = {}
         try:
+            if marked:
+                raise BrokerError(
+                    "cleanup was unconfirmed in a previous broker instance; "
+                    "the job is not re-executed"
+                )
             source_preparation_started = time.monotonic()
             _copy_sources(job_path, manifest, source_root)
             source_preparation_seconds = time.monotonic() - source_preparation_started
@@ -1205,6 +1213,19 @@ def execute_claimed_job(
             started = utc_now()
             started_monotonic = time.monotonic()
 
+            hold = CleanupHold(
+                job=job_id,
+                group_exists=lambda group: _process_group_exists(group),
+                service_stopping=should_stop,
+                mark=lambda: mark_cleanup_unconfirmed(
+                    root, job_id, lease_token, worker=LOCAL_WORKER,
+                    now=dt.datetime.now(dt.timezone.utc),
+                ),
+                unmark=lambda: clear_cleanup_unconfirmed(
+                    root, job_id, lease_token, worker=LOCAL_WORKER
+                ),
+                unconfirmed_error=TerminationUnconfirmed,
+            )
             # The cache stays locked until the child and its process group are reaped.
             with cache_scope:
                 if stop.clear_to_launch():
@@ -1213,7 +1234,7 @@ def execute_claimed_job(
                         cwd=work,
                         environment=environment,
                         result_root=result_root,
-                        supervise=lambda p: _supervise_child(p, args, work, stop),
+                        supervise=lambda p: _supervise_child(p, args, work, stop, hold),
                     )
             stop.raise_if_can_stopped()
             duration = time.monotonic() - started_monotonic
@@ -1309,9 +1330,9 @@ def execute_claimed_job(
         except CanStopped:
             pass
         except TerminationUnconfirmed:
-            # Descendants may still be writing into this job's directories:
-            # publish nothing and requeue nothing.  The job stays running for a
-            # restarted broker to resume.
+            # Stopped while descendants may still be alive: publish nothing and
+            # requeue nothing.  The manifest's cleanup marker makes a restarted
+            # broker fail the job instead of re-running it.
             raise
         except Exception as exc:
             exit_code, execution = _failure_results(result_root, manifest, exc)
@@ -1649,7 +1670,13 @@ def serve(args: BrokerConfig, monitor: HealthMonitor) -> None:
     signal.signal(signal.SIGINT, stop)
     last_message = ""
     while not stopping:
-        result = run_once(args, should_stop=lambda: stopping, monitor=monitor)
+        try:
+            result = run_once(args, should_stop=lambda: stopping, monitor=monitor)
+        except TerminationUnconfirmed as exc:
+            # Only raised when the stop flag ended a cleanup hold: a clean exit.
+            print(json.dumps({"action": "cleanup-hold", "reason": str(exc)}),
+                  flush=True)
+            break
         rendered = json.dumps(result, sort_keys=True)
         if (
             rendered != last_message

@@ -106,8 +106,21 @@ quiet chain). The first stop cause latched wins:
 - CAN is also checked before staging and again, with the task cache held,
   immediately before the child launches; a lock there requeues with no child
   started.
-- Any exception while waiting on a child kills and reaps its process group
-  before the cache is released.
+- Any exception while waiting on a child (or while cleaning up after it) must
+  end with the job's process group confirmed gone before the cache lock is
+  released or the work directory removed. If it cannot be confirmed, the
+  broker holds both: it SIGKILLs the group and rechecks about once a second,
+  logging a `cleanup-hold` JSON line when the hold starts and about every 60 s.
+  The running manifest carries a `cleanup_unconfirmed` marker (and a
+  `cleanup-unconfirmed` attempt-history entry) for the duration; the hold ends
+  when the group is gone (marker cleared, the original error then takes the
+  normal failure path) or when the broker is told to stop, which raises
+  `TerminationUnconfirmed` and publishes and requeues nothing. Releasing at
+  that point is deliberate: `KillMode=control-group` kills the unit's whole
+  cgroup and a restarted broker cannot start until it is empty. There is no
+  timeout-based release. A restarted broker that finds a running Pi-local job
+  with the marker fails it (not re-executed) instead of resuming it, so a
+  persistent fault cannot loop under `Restart=always`.
 
 The guarantee is bounded, and covers only senders that take the lock (the
 `vonstar` unlock goes through `can_handoff.active_turn` and radar through

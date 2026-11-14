@@ -81,6 +81,32 @@ OWNERSHIP_LOST = "ownership-lost"
 MAINTENANCE = "queue-maintenance"
 
 
+def owned_running_job(
+    root: Path, job_id: str, lease_token: str, worker: str
+) -> tuple[Path, dict[str, object]] | None:
+    """The running job and manifest when this worker and exact lease own it.
+
+    The caller holds the queue lock.  `require_running_job` still accepts a
+    tokenless legacy manifest, which other callers rely on; changing a job's
+    state must prove this attempt's lease, so the stored token has to be
+    present, well formed and equal.
+    """
+    try:
+        job_dir, manifest = queue.require_running_job(
+            root, job_id, worker, lease_token=lease_token
+        )
+    except queue.QueueError:
+        return None
+    stored = manifest.get("lease_token")
+    if (
+        not isinstance(stored, str)
+        or not queue.LEASE_TOKEN_RE.fullmatch(stored)
+        or not secrets.compare_digest(stored, lease_token)
+    ):
+        return None
+    return job_dir, manifest
+
+
 def requeue_owned_job(
     root: Path,
     job_id: str,
@@ -100,22 +126,10 @@ def requeue_owned_job(
     with queue.queue_lock(root):
         if queue.maintenance_status(root) is not None:
             return MAINTENANCE
-        try:
-            job_dir, manifest = queue.require_running_job(
-                root, job_id, worker, lease_token=lease_token
-            )
-        except queue.QueueError:
+        owned = owned_running_job(root, job_id, lease_token, worker)
+        if owned is None:
             return OWNERSHIP_LOST
-        # require_running_job still accepts a tokenless legacy manifest, which
-        # other callers rely on.  A requeue must prove this attempt's lease, so
-        # the stored token has to be present, well formed and equal.
-        stored = manifest.get("lease_token")
-        if (
-            not isinstance(stored, str)
-            or not queue.LEASE_TOKEN_RE.fullmatch(stored)
-            or not secrets.compare_digest(stored, lease_token)
-        ):
-            return OWNERSHIP_LOST
+        job_dir, manifest = owned
         requeue_running_job(
             root, job_dir, manifest, reason=reason, now=now, error_type=error_type
         )
