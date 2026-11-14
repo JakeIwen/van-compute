@@ -480,9 +480,14 @@ def _mac_sandbox_command(
     worker_root: Path,
     error_type: type[RuntimeError],
     cache_root: Path | None = None,
+    proxy_port: int | None = None,
 ) -> list[str]:
     if profile is None:
         return list(command)
+    # The shipped profile grants TCP to this loopback port only; a profile
+    # without a live registry proxy behind it has no valid port to bind.
+    if proxy_port is None or not 1 <= proxy_port <= 65535:
+        raise error_type("sandboxed Mac jobs require a running registry proxy port")
     profile = profile.expanduser().resolve()
     if not profile.is_file():
         raise error_type(f"sandbox profile does not exist: {profile}")
@@ -500,6 +505,7 @@ def _mac_sandbox_command(
         "CACHE_ROOT": job_root / "cache" if cache_root is None else cache_root,
         "HOME": environment["HOME"],
         "TMPDIR": environment["TMPDIR"],
+        "PROXY_PORT": proxy_port,
     }
     dataset_paths = [path for _, path in sorted(datasets.items())]
     # The installed profile has a fixed number of parameter slots.  Unused
@@ -569,6 +575,7 @@ class MacSandbox:
     worker_root: Path
     error_type: type[RuntimeError]
     cache_root: Path | None = None
+    proxy_port: int | None = None
 
     def command_path(self, path: Path, area: str) -> Path:
         return path
@@ -590,4 +597,5 @@ class MacSandbox:
             worker_root=self.worker_root,
             error_type=self.error_type,
             cache_root=self.cache_root,
+            proxy_port=self.proxy_port,
         )

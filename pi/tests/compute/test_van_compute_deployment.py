@@ -150,7 +150,19 @@ class VanComputeDeploymentTests(DeploymentFixtureMixin, unittest.TestCase):
         sandbox_calls = [
             call for call in local.calls if "/usr/bin/sandbox-exec" in call[0]
         ]
-        self.assertEqual(len(sandbox_calls), 7)
+        self.assertEqual(len(sandbox_calls), 8)
+        # One staged registry proxy serves every check, each granted its port,
+        # and is shut down once they finish.
+        self.assertEqual(len(local.spawned), 1)
+        helper_arguments, helper_cwd, helper = local.spawned[0]
+        self.assertEqual(helper_arguments[0], str(staging / "venv/bin/python"))
+        self.assertEqual(helper_cwd, staging / "app")
+        self.assertTrue(helper.closed)
+        for call in sandbox_calls:
+            self.assertIn("PROXY_PORT=47001", call[0])
+        proxy_probe = sandbox_calls[-1][0]
+        self.assertIn(f"PYTHONPATH={staging / 'app'}", proxy_probe)
+        self.assertEqual(proxy_probe[-2:], ["47001", "47002"])
         sandbox_cwds = {call[5] for call in sandbox_calls}
         self.assertEqual(len(sandbox_cwds), 1)
         sandbox_cwd = next(iter(sandbox_cwds))

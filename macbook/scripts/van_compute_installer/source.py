@@ -31,6 +31,7 @@ INSTALLER_SOURCE_FILES = tuple(
         "remote.py",
         "runners.py",
         "sandbox_cache.py",
+        "sandbox_proxy.py",
         "source.py",
     )
 )

@@ -68,6 +68,28 @@ class InstallerLayoutContractTests(unittest.TestCase):
                 capture_output=True,
             )
 
+    def test_background_helper_announces_and_reports_its_exit(self):
+        runner = LocalRunner()
+        helper = runner.spawn([
+            sys.executable, "-c",
+            "import sys; print('ready', flush=True); sys.stdin.read()",
+        ])
+        self.assertEqual(helper.announcement(10), "ready")
+        helper.finish(10)
+        failing = runner.spawn([
+            sys.executable, "-c",
+            "import sys; print('ready', flush=True); sys.stdin.read(); "
+            "print('helper broke', file=sys.stderr); sys.exit(4)",
+        ])
+        self.assertEqual(failing.announcement(10), "ready")
+        with self.assertRaisesRegex(DeploymentError, "helper broke"):
+            failing.finish(10)
+        silent = runner.spawn([
+            sys.executable, "-c", "import sys; print('no port', file=sys.stderr)",
+        ])
+        with self.assertRaisesRegex(DeploymentError, "no port"):
+            silent.announcement(10)
+
     def test_remote_runner_owns_ssh_and_scp_vectors(self):
         local = RecordingLocal()
         remote = RemoteRunner("pi@example", local)

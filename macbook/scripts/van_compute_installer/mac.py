@@ -19,6 +19,7 @@ from .constants import (
 )
 from .models import DeploymentError, OwnedBuild, SourceRelease
 from .sandbox_cache import make_probe_caches, run_cache_probe
+from .sandbox_proxy import probe_proxy, run_proxy_probe
 
 
 class MacProvisionMixin:
@@ -187,7 +188,7 @@ class MacProvisionMixin:
             )
 
     def _sandbox_arguments(
-        self, staging: Path, sandbox_test: Path, cache_selected: Path
+        self, staging: Path, sandbox_test: Path, cache_selected: Path, proxy_port: int
     ) -> list[str]:
         arguments = [
             "/usr/bin/sandbox-exec",
@@ -199,6 +200,8 @@ class MacProvisionMixin:
             f"JOB_ROOT={sandbox_test}",
             "-D",
             f"CACHE_ROOT={cache_selected}",
+            "-D",
+            f"PROXY_PORT={proxy_port}",
         ]
         for index in range(16):
             arguments.extend(("-D", f"DATASET_{index}=/dev/null"))
@@ -305,19 +308,20 @@ class MacProvisionMixin:
         sentinel.write_text("must-not-be-readable\n", encoding="utf-8")
         os.chmod(sentinel, 0o600)
         environment = self._sandbox_environment(sandbox_test)
-        prefix = (
-            self._sandbox_arguments(staging, sandbox_test, cache_selected)
-            + environment
-        )
         checks = self._sandbox_checks(staging, sandbox_test)
         try:
-            self._run_sandbox_checks(
-                staging, sandbox_test, sentinel, prefix, checks
-            )
-            run_cache_probe(
-                self.local, staging, sandbox_test, sentinel, prefix,
-                cache_selected, cache_other,
-            )
+            with probe_proxy(self.local, staging) as ports:
+                prefix = self._sandbox_arguments(
+                    staging, sandbox_test, cache_selected, ports.proxy
+                ) + environment
+                self._run_sandbox_checks(
+                    staging, sandbox_test, sentinel, prefix, checks
+                )
+                run_cache_probe(
+                    self.local, staging, sandbox_test, sentinel, prefix,
+                    cache_selected, cache_other,
+                )
+                run_proxy_probe(self.local, staging, sandbox_test, prefix, ports)
         finally:
             sentinel.unlink(missing_ok=True)
             for directory in (sandbox_test, cache_selected, cache_other):

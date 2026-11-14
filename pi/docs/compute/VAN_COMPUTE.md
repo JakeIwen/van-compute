@@ -49,8 +49,9 @@ The Mac installer fails closed unless it can validate the effective
 `sandbox-exec` profile. Each job gets a clean environment and a private
 HOME and TMP, and a private cache unless its task opts into a persistent one
 (see Persistent task caches); no credentials passed through its environment, no
-network, declared read-only datasets only, monitored resource ceilings, and a
-writable job directory (plus its one declared cache) only.
+network except the package registries through the worker's proxy (see Mac
+registry proxy), declared read-only datasets only, monitored resource
+ceilings, and a writable job directory (plus its one declared cache) only.
 Private Mac dataset paths stay out of manifests and logical command telemetry;
 recognized text results are scrubbed before upload. Tasks that use a private
 dataset must not copy its physical path into binary output or files embedded in
@@ -93,6 +94,60 @@ Live CAN/SocketCAN access, interface configuration, bus wake or UDS traffic,
 ADB/device access, routing, storage, and service control never go through this
 system.
 
+## Mac registry proxy
+
+Sandboxed Mac jobs (`--sandbox-profile`) need `pip install` and `npm ci`, and
+Seatbelt cannot allow a host name: the profile can only grant TCP to one
+loopback port. So the worker runs a CONNECT proxy
+(`van_compute/registry_proxy.py`) in its own process, outside the sandbox, and
+the profile allows `remote tcp` to `localhost:PROXY_PORT` and nothing else (no
+DNS, no UDP). Pi jobs still have no network, and an unsandboxed Mac worker
+(`--allow-unsandboxed-dynamic`) runs no proxy and keeps full network.
+
+- **Allowlist.** `CONNECT <host>:443` only, for `pypi.org`,
+    `files.pythonhosted.org` and `registry.npmjs.org` (`REGISTRY_HOSTS`, defined
+    once in that module). IP literals, other ports, trailing dots and plain-HTTP
+    or absolute-URI requests are refused. Adding a registry means editing that
+    set and reviewing the risk below.
+- **Addresses.** The proxy resolves the name itself and refuses it if any
+    answer is not global unicast (private, loopback, link-local, CGNAT,
+    multicast, or an IPv6 form embedding one), so a poisoned or rebound name
+    cannot reach the LAN (router, Pi, UBNT) or loopback services. It connects to
+    the address it vetted and never re-resolves.
+- **SNI.** The registries share CDN addresses with other sites, so a tunnel
+    bounded by address alone could reach them. Before connecting upstream the
+    proxy reads the client's first TLS record and requires a ClientHello, whole
+    in that record, whose SNI equals the CONNECT host and that has no encrypted
+    ClientHello extension; it then forwards that record and relays opaquely.
+- **Bounds.** At most 64 tunnels (excess connections get 503 and are closed
+    before any thread or lookup); 8 KiB request head; timeouts for the head and
+    ClientHello (10 s each), upstream connect (10 s), idle tunnels (120 s) and a
+    tunnel's whole life (1 hour). Each tunnel is logged to the worker log with
+    host, bytes each way, duration and how it ended; refusals are logged with
+    their reason.
+- **Lifecycle.** `main()` starts the proxy only with `--sandbox-profile`,
+    around both `--run-once` and the persistent scheduler, and stops it after
+    every job child is reaped, drain included. It holds the same port on
+    127.0.0.1 and ::1 (Seatbelt's `localhost` covers both), retrying a fresh
+    port if ::1 has it taken, so no other service can sit on the granted port.
+    A proxy that cannot bind fails worker startup. The port is threaded
+    explicitly through `WorkerConfig.registry_proxy_port` to the job; jobs get
+    `HTTPS_PROXY`/`https_proxy` (no `HTTP_PROXY`, no `NO_PROXY`) only then, and
+    the profile is never applied without a live port (`PROXY_PORT=0` would make
+    `sandbox-exec` fail). Children orphaned by a worker crash lose their network
+    when the next start picks a new port.
+- **Accepted risk.** No TLS interception: inside the tunnel a job can talk to
+    an allowed registry for any purpose, such as publishing with a token it
+    holds, and HTTP domain fronting inside the encrypted channel is refused only
+    by the CDNs' own SNI/Host matching.
+- **Installer probe.** Offline: the installer runs the staged release's proxy
+    (staged venv Python, outside the sandbox) with every allowlisted name mapped
+    to a local echo server, and keeps it up for every sandbox check. Inside the
+    sandbox the probe tunnels through the proxy on 127.0.0.1 and ::1 with both
+    directions relayed, sees an unlisted host and port 80 refused, and gets
+    EPERM for TCP to another loopback port and to a public address and for UDP
+    to the proxy port. The echo server must see exactly the two good tunnels.
+
 ## Persistent task caches
 
 A repo task may declare `"cache": "<name>"` in `.van-compute.json` (lowercase
@@ -123,8 +178,9 @@ downloads on every run; venvs and results stay per job.
   (for example a mode-000 directory) counts as over the cap and is evicted
   when idle.
 - **Network.** Pi jobs run with no network, so a Pi cache fills only from what
-  the job brings in. Mac jobs reach the network only where the worker runs
-  unsandboxed (`--allow-unsandboxed-dynamic`, the current install).
+  the job brings in. Sandboxed Mac jobs reach only the package registries
+  through the worker's proxy (see Mac registry proxy); an unsandboxed Mac
+  worker (`--allow-unsandboxed-dynamic`, the current install) has full network.
 - **Locations.** Pi: `<queue root>/task-caches` for whichever `--root` the broker
   runs with (override with `--task-cache-root`; it must be writable by the
   unit, and the default sits inside its `ReadWritePaths`). Mac:

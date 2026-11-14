@@ -334,6 +334,9 @@ class VanComputeDeploymentTests(DeploymentFixtureMixin, unittest.TestCase):
         self.assertIn(
             "macbook/scripts/van_compute_installer/sandbox_cache.py", relative
         )
+        self.assertIn(
+            "macbook/scripts/van_compute_installer/sandbox_proxy.py", relative
+        )
         self.assertNotIn("van_compute/.env", relative)
         self.assertNotIn("van_compute/cache.sqlite3", relative)
         self.assertNotIn("van_compute/configs/private.json", relative)

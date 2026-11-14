@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 
 from macbook.scripts.van_compute_installer import constants as installer_constants
-from van_compute import broker, engine, protocol, queue, task_cache, worker
+from van_compute import broker, engine, protocol, queue, registry_proxy, task_cache, worker
 from pi.tests.compute.van_compute_test_fixtures import (
     BrokerHarness, DECLARATION, GOOD_HEALTH,
 )
@@ -255,6 +255,11 @@ class MacSandboxProfileTests(unittest.TestCase):
         )
         if trial.returncode != 0:
             self.skipTest("sandbox-exec cannot be applied from this process")
+        # The profile applies only with a live proxy port to grant.
+        proxy = registry_proxy.RegistryProxy(log=lambda _message: None)
+        proxy.start()
+        self.addCleanup(proxy.stop)
+        self.proxy_port = proxy.port
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -271,6 +276,7 @@ class MacSandboxProfileTests(unittest.TestCase):
             worker_root=REPO,
             error_type=RuntimeError,
             cache_root=self.selected if cache_root == "selected" else cache_root,
+            proxy_port=self.proxy_port,
         )
         return subprocess.run(wrapped, capture_output=True, text=True, cwd=self.job)
 

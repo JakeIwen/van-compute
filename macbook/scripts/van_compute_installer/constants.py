@@ -70,6 +70,12 @@ SANDBOX_PROFILE = r'''(version 1)
     (subpath (param "JOB_ROOT"))
     (subpath (param "CACHE_ROOT"))
     (literal "/dev/null"))
+; Seatbelt cannot filter by host, so the only network a job gets is TCP to the
+; worker's registry proxy, which enforces the package-registry allowlist.
+; "localhost" covers 127.0.0.1 and ::1 (the proxy holds the port on both);
+; "remote tcp" rather than "remote ip" keeps UDP to that port denied.
+(allow network-outbound
+    (remote tcp (string-append "localhost:" (param "PROXY_PORT"))))
 '''
 
 SANDBOX_DENIAL_PROBE = r'''

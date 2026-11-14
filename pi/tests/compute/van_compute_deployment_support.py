@@ -29,10 +29,35 @@ class FakeCompleted:
 
 
 
+class FakeBackground:
+    """Stands in for the installer's registry-proxy probe helper."""
+
+    ANNOUNCEMENT = '{"proxy_port": 47001, "upstream_port": 47002}'
+
+    def __init__(self):
+        self.closed = False
+
+    def announcement(self, timeout):
+        return self.ANNOUNCEMENT
+
+    def close(self, timeout):
+        self.closed = True
+        return ""
+
+    def finish(self, timeout):
+        self.closed = True
+
+
 class FakeLocal:
     def __init__(self, launch_states=None):
         self.calls = []
+        self.spawned = []
         self.launch_states = list(launch_states or [])
+
+    def spawn(self, arguments, *, cwd=None):
+        helper = FakeBackground()
+        self.spawned.append((list(arguments), cwd, helper))
+        return helper
 
     def run(
         self,

@@ -37,7 +37,9 @@ import time
 from typing import BinaryIO, Callable, Mapping, Sequence
 
 
-from van_compute import config, engine, limited_child, protocol, task_cache
+from van_compute import (
+    config, engine, limited_child, protocol, registry_proxy, task_cache,
+)
 from van_compute.backoff import HostRetryGate, RetryCancelled
 from van_compute.config import WorkerConfig
 
@@ -1204,6 +1206,7 @@ def sandbox_command(
     environment: Mapping[str, str],
     datasets: Mapping[str, Path],
     cache_root: Path | None = None,
+    proxy_port: int | None = None,
 ) -> list[str]:
     sandbox: engine.Sandbox = engine.MacSandbox(
         profile,
@@ -1215,6 +1218,7 @@ def sandbox_command(
         WORKER_ROOT,
         WorkerError,
         cache_root,
+        proxy_port,
     )
     return sandbox.wrap(command)
 
@@ -1299,8 +1303,13 @@ def job_environment(
     job_root: Path,
     source_root: Path,
     cache_root: Path,
+    registry_proxy_port: int | None = None,
 ) -> dict[str, str]:
-    """The complete child environment; nothing is inherited from the worker."""
+    """The complete child environment; nothing is inherited from the worker.
+
+    Proxy variables appear only while the worker's registry proxy runs, which
+    is only in sandboxed mode.
+    """
     home_root = job_root / "home"
     return {
         "HOME": str(home_root),
@@ -1314,6 +1323,7 @@ def job_environment(
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
         "VAN_COMPUTE_JOB_ID": str(manifest.get("id", "")),
+        **registry_proxy.child_environment(registry_proxy_port),
     }
 
 
@@ -1338,6 +1348,7 @@ def execute_job(
     worker_id: str | None = None,
     allow_unsandboxed_dynamic: bool = False,
     task_cache_store: task_cache.TaskCacheStore | None = None,
+    registry_proxy_port: int | None = None,
 ) -> tuple[int, dict[str, object]]:
     task_name = str(manifest.get("task", ""))
     arguments = manifest.get("arguments", [])
@@ -1396,7 +1407,8 @@ def execute_job(
         task_cache_store, cache_request, job_root / "cache"
     )
     environment = job_environment(
-        manifest, job_root=job_root, source_root=source_root, cache_root=cache_root
+        manifest, job_root=job_root, source_root=source_root, cache_root=cache_root,
+        registry_proxy_port=registry_proxy_port,
     )
     command = sandbox_command(
         command,
@@ -1407,6 +1419,7 @@ def execute_job(
         environment=environment,
         datasets=datasets,
         cache_root=cache_root,
+        proxy_port=registry_proxy_port,
     )
     child_command = [
         sys.executable,
@@ -1691,6 +1704,7 @@ def run_claimed_job(
                 worker_id=remote.worker,
                 allow_unsandboxed_dynamic=args.allow_unsandboxed_dynamic,
                 task_cache_store=cache_store,
+                registry_proxy_port=args.registry_proxy_port,
             )
             if execution.get("interrupted"):
                 raise WorkerShutdown(
@@ -2402,12 +2416,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(raw_arguments)
     try:
         runtime_config = _validated_runtime_config(args)
-        if not runtime_config.serve:
-            payload = run_once(runtime_config)
-            print(json.dumps(payload, indent=2, sort_keys=True))
-            return 0 if payload.get("ok") else 1
-
-        _serve_persistent(runtime_config)
+        # Wraps both branches and outlives every job: the scheduler returns
+        # only after its executor has reaped all children.
+        with registry_proxy.sandbox_registry_proxy(
+            runtime_config.sandbox_profile is not None
+        ) as proxy_port:
+            runtime_config = replace(runtime_config, registry_proxy_port=proxy_port)
+            if not runtime_config.serve:
+                payload = run_once(runtime_config)
+                print(json.dumps(payload, indent=2, sort_keys=True))
+                return 0 if payload.get("ok") else 1
+            _serve_persistent(runtime_config)
         return 0
     except (
         OSError,

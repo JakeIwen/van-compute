@@ -136,6 +136,9 @@ class WorkerConfig:
     # None: this host has no cache root, so a job that asks for one fails.
     task_cache_root: Path | None = None
     task_cache_max_bytes: int = 0
+    # Set by the worker while its registry proxy runs (only with a sandbox
+    # profile); None means jobs get no proxy environment or port grant.
+    registry_proxy_port: int | None = None
 
     @classmethod
     def from_namespace(
