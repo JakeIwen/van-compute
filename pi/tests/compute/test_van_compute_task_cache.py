@@ -102,8 +102,8 @@ root, namespace, name, ready, release = sys.argv[1:6]
 store = task_cache.TaskCacheStore(Path(root), 0)
 with store.use(task_cache.CacheRequest(namespace, name)):
     Path(ready).write_text("held")
-    deadline = time.time() + 30
-    while not Path(release).exists() and time.time() < deadline:
+    # Held until released; the test's teardown kills it if a test fails first.
+    while not Path(release).exists():
         time.sleep(0.02)
 """
 
@@ -360,6 +360,23 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(report.evicted, ("ns/idle",))
         self.assertTrue(hidden.exists())
         release.write_text("go")
+
+    def test_entry_vanishing_mid_measure_is_unmeasurable_not_zero(self):
+        self.fill("ns", "live", 4096, age=10)
+        real_listdir = os.listdir
+
+        def listdir_then_delete(target):
+            names = real_listdir(target)
+            if "blob" in names:  # a running job removes it right after enumeration
+                os.unlink("blob", dir_fd=target)
+            return names
+
+        with mock.patch.object(task_cache.os, "listdir", side_effect=listdir_then_delete):
+            info = next(i for i in self.store.caches() if i.name == "live")
+        self.assertIsNone(info.size_bytes)
+        self.assertEqual(
+            task_cache._measure(os.open(self.root / "ns", os.O_RDONLY), "missing", 0), 0
+        )
 
     def test_pi_default_cache_root_follows_the_selected_queue_root(self):
         parsed = broker.build_parser().parse_args(["--root", "/srv/queue"])

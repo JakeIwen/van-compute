@@ -440,9 +440,18 @@ def _is_locked(namespace_fd: int, name: str) -> bool:
 
 
 def _measure(namespace_fd: int, name: str, device: int) -> int | None:
-    """Allocated bytes of one cache, or None when any part cannot be read."""
+    """Allocated bytes of one cache, or None when any part cannot be read.
+
+    Only a cache that is already absent counts as 0; an entry vanishing while
+    the tree is walked (a job is running in it) makes the size unmeasurable.
+    """
     try:
         details = os.stat(name, dir_fd=namespace_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+    try:
         if not stat.S_ISDIR(details.st_mode):
             return details.st_blocks * 512
         descriptor = os.open(name, _DIR_FLAGS, dir_fd=namespace_fd)
@@ -450,8 +459,6 @@ def _measure(namespace_fd: int, name: str, device: int) -> int | None:
             return details.st_blocks * 512 + _traverse(descriptor, device, remove=False)
         finally:
             os.close(descriptor)
-    except FileNotFoundError:
-        return 0
     except (OSError, TaskCacheError):
         return None
 
