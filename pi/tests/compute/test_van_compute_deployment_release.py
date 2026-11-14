@@ -429,6 +429,22 @@ class VanComputeDeploymentTests(DeploymentFixtureMixin, unittest.TestCase):
             environment["HOME"] = str(root / "home")
             for runtime in (Path("/opt/homebrew/bin/python3"), Path("/usr/bin/python3")):
                 with self.subTest(runtime=runtime):
+                    probe = subprocess.run(
+                        [str(runtime), "-c", "pass"],
+                        cwd=app, env=environment, text=True,
+                        capture_output=True, check=False,
+                    )
+                    # /usr/bin/python3 is an xcrun shim that cannot start inside
+                    # the Mac job sandbox (no CommandLineTools read access); a
+                    # sandboxed van-compute job is the only place that is fine.
+                    if (
+                        probe.returncode != 0
+                        and runtime == Path("/usr/bin/python3")
+                        and "VAN_COMPUTE_JOB_ID" in os.environ
+                        and "HTTPS_PROXY" in os.environ
+                    ):
+                        self.skipTest("/usr/bin/python3 cannot start in the Mac job sandbox")
+                    self.assertEqual(probe.returncode, 0, probe.stderr)
                     completed = subprocess.run(
                         [str(runtime), str(frozen), "--dry-run"],
                         cwd=app,
