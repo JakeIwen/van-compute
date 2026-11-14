@@ -1,20 +1,25 @@
+import contextlib
+import datetime as dt
 import os
 from pathlib import Path
 import secrets
 import subprocess
+import sys
 import threading
 import time
 import unittest
 from unittest import mock
 
-from van_compute import broker, pi_can_stop, queue
+from van_compute import broker, engine_process, job_requeue, pi_can_stop, queue
 from van_compute.can_activity import CanProbe
 from van_compute.pi_can_stop import (
     CAN_PROBE_FAILED, CAN_TRANSMIT, SERVICE_STOP, StopLatch,
 )
 from van_compute.pi_health_monitor import HealthMonitor
 
-from pi.tests.compute.test_van_compute_pi_health import FixedRates
+from pi.tests.compute.test_van_compute_pi_health import (
+    FakeClock, FixedRates, host_readers,
+)
 from pi.tests.compute.van_compute_test_fixtures import BrokerHarness, GOOD_HEALTH
 
 QUIET = CanProbe(False, (), None)
@@ -362,6 +367,222 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
         self.assertEqual(result["action"], "executed")
         self.assertFalse(result["ok"])
         self.assert_gone(cleanup_seen[0])
+
+    def run_gated_by_monitor(self, clock, monitor):
+        """run_once on the monitor's own snapshot, so the quiet requirement applies."""
+        with host_readers(), mock.patch.object(
+            broker, "bubblewrap_self_test", return_value=(True, "test")
+        ), mock.patch.object(broker, "bubblewrap_command", side_effect=self.no_sandbox):
+            return broker.run_once(self.args, monitor=monitor)
+
+    def warm_monitor(self):
+        clock = FakeClock(0.0)
+        monitor = HealthMonitor(
+            Path("/unused"),
+            probe=lambda _dir=None: QUIET,
+            sampler=FixedRates(),
+            clock=clock,
+            sleep=clock.sleep,
+        )
+        for second in range(0, 66, 5):  # 65 s of quiet in 5 s steps
+            clock.now = float(second)
+            monitor.observe_can()
+        return clock, monitor
+
+    def test_a_quiet_chain_that_survives_staging_still_runs(self):
+        self.submit()
+        clock, monitor = self.warm_monitor()
+        result = self.run_gated_by_monitor(clock, monitor)
+        self.assertEqual(result["action"], "executed", result)
+
+    def test_slow_staging_that_breaks_the_quiet_chain_requeues_before_launch(self):
+        submitted = self.submit_hanging()
+        clock, monitor = self.warm_monitor()
+        real_copy = broker._copy_sources
+
+        def slow_copy(*arguments, **keywords):
+            real_copy(*arguments, **keywords)
+            clock.now += 20.0  # longer than the tracker's 15 s observation gap
+
+        with mock.patch.object(broker, "_copy_sources", slow_copy):
+            result = self.run_gated_by_monitor(clock, monitor)
+        self.assertEqual(result["action"], "requeued", result)
+        self.assertEqual(result["reason"], pi_can_stop.CAN_NOT_QUIET)
+        self.assertEqual(self.hang_pids(), [], "a child was started")
+        self.assertTrue((self.root / "queued" / submitted["id"]).is_dir())
+
+    def test_slow_cache_acquisition_that_breaks_the_quiet_chain_requeues(self):
+        submitted = self.submit_hanging()
+        clock, monitor = self.warm_monitor()
+        real_job_cache = broker.task_cache.job_cache
+
+        def slow_job_cache(*arguments, **keywords):
+            directory, scope = real_job_cache(*arguments, **keywords)
+
+            @contextlib.contextmanager
+            def waiting():
+                clock.now += 20.0  # waiting for the cache lock
+                with scope:
+                    yield
+
+            return directory, waiting()
+
+        with mock.patch.object(broker.task_cache, "job_cache", slow_job_cache):
+            result = self.run_gated_by_monitor(clock, monitor)
+        self.assertEqual(result["action"], "requeued", result)
+        self.assertEqual(result["reason"], pi_can_stop.CAN_NOT_QUIET)
+        self.assertEqual(self.hang_pids(), [], "a child was started")
+        self.assertTrue((self.root / "queued" / submitted["id"]).is_dir())
+
+    def failing_wait_with_scope_events(self, events):
+        """Patch the wait to crash once the job runs, and record cache-scope exit."""
+        real_job_cache = broker.task_cache.job_cache
+
+        class Scope:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                events.append("scope-exit")
+
+        def recording_job_cache(*arguments, **keywords):
+            directory, _scope = real_job_cache(*arguments, **keywords)
+            return directory, Scope()
+
+        def failing_wait(process, **_keywords):
+            deadline = time.monotonic() + 5
+            while len(self.hang_pids()) < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.seen_pids = self.hang_pids()
+            raise broker.BrokerError("watchdog crashed")
+
+        return (
+            mock.patch.object(broker.task_cache, "job_cache", recording_job_cache),
+            mock.patch.object(broker, "_wait_for_process", failing_wait),
+        )
+
+    def test_cleanup_confirms_the_group_is_gone_before_the_cache_is_released(self):
+        self.submit_hanging()
+        events = []
+        answers = iter([True, True, False])
+
+        def group_exists(group):
+            answer = next(answers, False)
+            events.append(f"exists:{answer}")
+            return answer
+
+        cache, wait = self.failing_wait_with_scope_events(events)
+        with cache, wait, mock.patch.object(
+            broker, "_process_group_exists", group_exists
+        ):
+            result = self.run_with(lambda _dir=None: QUIET)
+        self.assertEqual(result["action"], "executed")
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            events, ["exists:True", "exists:True", "exists:False", "scope-exit"]
+        )
+        self.assert_gone(self.seen_pids)
+
+    def test_an_unconfirmed_termination_publishes_and_requeues_nothing(self):
+        submitted = self.submit_hanging()
+        events = []
+        cache, wait = self.failing_wait_with_scope_events(events)
+        with cache, wait, mock.patch.object(
+            broker, "_process_group_exists", lambda _group: True
+        ), mock.patch.object(engine_process, "GROUP_GONE_TIMEOUT", 0.2):
+            with self.assertRaises(broker.TerminationUnconfirmed):
+                self.run_with(lambda _dir=None: QUIET)
+        self.assertEqual(events, ["scope-exit"])
+        self.assertTrue((self.root / "running" / submitted["id"]).is_dir())
+        self.assertFalse((self.root / "queued" / submitted["id"]).exists())
+        self.assertFalse((self.root / "failed" / submitted["id"]).exists())
+        self.assert_gone(self.seen_pids)
+
+    def test_an_already_reaped_leader_with_running_descendants_is_still_cleaned_up(self):
+        leader = subprocess.Popen(
+            [
+                sys.executable, "-c",
+                "import subprocess; subprocess.Popen(['sleep', '30'])",
+            ],
+            start_new_session=True,
+        )
+        leader.wait()  # reaped, so kill_and_reap_group has no child to wait for
+        group = leader.pid
+        self.addCleanup(self.kill_group, group)
+        self.assertTrue(engine_process.process_group_exists(
+            group, host=engine_process.Host.PI, error_type=broker.BrokerError
+        ))
+        with mock.patch.object(
+            broker, "_wait_for_process", side_effect=broker.BrokerError("crash")
+        ), self.assertRaises(broker.BrokerError):
+            broker._supervise_child(
+                leader, self.args, self.work, StopLatch(lambda: False, None)
+            )
+        # Gone for good: not even a zombie answers (macOS says EPERM for those).
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(group, 0)
+
+    @staticmethod
+    def kill_group(group):
+        try:
+            os.killpg(group, 9)
+        except ProcessLookupError:
+            pass
+
+
+class RequeueOwnershipTests(BrokerHarness, unittest.TestCase):
+    def claim(self):
+        submitted = self.submit()
+        manifest, reason = broker.claim_local_job(
+            self.root, grace_seconds=0, remote_max_age=45,
+            eligibility=broker.local_eligibility,
+        )
+        self.assertIsNotNone(manifest, reason)
+        return submitted["id"], manifest["lease_token"]
+
+    def requeue(self, job_id, token):
+        return job_requeue.requeue_owned_job(
+            self.root, job_id, token, worker=broker.LOCAL_WORKER, reason="test",
+            now=dt.datetime.now(dt.timezone.utc), error_type=broker.BrokerError,
+        )
+
+    def set_stored_token(self, job_id, **change):
+        path = self.root / "running" / job_id / "manifest.json"
+        manifest = queue.load_json(path)
+        if "lease_token" in change and change["lease_token"] is None:
+            manifest.pop("lease_token")
+        else:
+            manifest.update(change)
+        queue.atomic_json(path, manifest)
+
+    def test_only_the_exact_lease_token_requeues(self):
+        job_id, token = self.claim()
+        self.assertEqual(self.requeue(job_id, token), job_requeue.REQUEUED)
+        self.assertTrue((self.root / "queued" / job_id).is_dir())
+
+    def test_a_missing_malformed_or_different_stored_token_changes_nothing(self):
+        for label, stored in (
+            ("missing", None),
+            ("malformed", "not-a-token"),
+            ("different", secrets.token_hex(16)),
+        ):
+            with self.subTest(label):
+                job_id, token = self.claim()
+                self.set_stored_token(job_id, lease_token=stored)
+                before = queue.load_json(
+                    self.root / "running" / job_id / "manifest.json"
+                )
+                self.assertEqual(
+                    self.requeue(job_id, token), job_requeue.OWNERSHIP_LOST
+                )
+                self.assertTrue((self.root / "running" / job_id).is_dir())
+                self.assertFalse((self.root / "queued" / job_id).exists())
+                self.assertEqual(
+                    queue.load_json(self.root / "running" / job_id / "manifest.json"),
+                    before,
+                )
+                # Reset for the next subtest: put it back in the queue by hand.
+                (self.root / "running" / job_id).rename(self.root / "failed" / job_id)
 
 
 if __name__ == "__main__":

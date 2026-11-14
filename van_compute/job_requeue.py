@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 from pathlib import Path
+import secrets
 import shutil
 
 from van_compute import queue
@@ -104,6 +105,16 @@ def requeue_owned_job(
                 root, job_id, worker, lease_token=lease_token
             )
         except queue.QueueError:
+            return OWNERSHIP_LOST
+        # require_running_job still accepts a tokenless legacy manifest, which
+        # other callers rely on.  A requeue must prove this attempt's lease, so
+        # the stored token has to be present, well formed and equal.
+        stored = manifest.get("lease_token")
+        if (
+            not isinstance(stored, str)
+            or not queue.LEASE_TOKEN_RE.fullmatch(stored)
+            or not secrets.compare_digest(stored, lease_token)
+        ):
             return OWNERSHIP_LOST
         requeue_running_job(
             root, job_dir, manifest, reason=reason, now=now, error_type=error_type

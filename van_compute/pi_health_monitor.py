@@ -52,12 +52,18 @@ class HealthMonitor:
             rates, can, self.tracker.quiet_seconds(self._clock())
         )
 
-    def wait_for_quiet(self, quiet_seconds: float) -> None:
+    def quiet_seconds(self) -> float:
+        return self.tracker.quiet_seconds(self._clock())
+
+    def wait_for_quiet(self, quiet_seconds: float) -> CanProbe:
         """Watch CAN until it has been quiet long enough, or stop at the first
-        lock or probe failure (the gate then defers)."""
+        lock or probe failure.  Returns the last observation: a caller that
+        sees it not quiet must defer rather than re-observe, since a later
+        quiet observation would hide the activity that ended the wait."""
         while True:
-            if not self.observe_can().quiet:
-                return
+            probe = self.observe_can()
+            if not probe.quiet:
+                return probe
             if self.tracker.quiet_seconds(self._clock()) >= quiet_seconds:
-                return
+                return probe
             self._sleep(CAN_WATCH_INTERVAL_SECONDS)

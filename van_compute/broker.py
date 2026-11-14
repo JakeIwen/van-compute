@@ -95,6 +95,11 @@ class BrokerError(RuntimeError):
     """The broker cannot safely place or execute a job."""
 
 
+class TerminationUnconfirmed(BrokerError):
+    """A job's process group could not be confirmed gone; nothing may be
+    published, uploaded or requeued from its directories."""
+
+
 @dataclass(frozen=True)
 class LocalProcessOutcome:
     exit_code: int
@@ -1066,10 +1071,16 @@ def _supervise_child(process, args: BrokerConfig, work: Path, stop: StopLatch):
             process.pid, terminate_grace=stop.group_grace()
         )
         return outcome, cleaned
-    except BaseException:
+    except BaseException as original:
         # Whatever went wrong, the child and its group must be gone before the
-        # cache scope around the launch is released.
+        # cache scope around the launch is released.  Reaping the leader says
+        # nothing about its descendants, so the group itself is confirmed gone
+        # here, still inside the scope.
         engine.kill_and_reap_group(process)
+        if not engine.wait_for_group_gone(process.pid, exists=_process_group_exists):
+            raise TerminationUnconfirmed(
+                f"process group {process.pid} still has members after SIGKILL"
+            ) from original
         raise
 
 
@@ -1092,6 +1103,7 @@ def execute_claimed_job(
     *,
     should_stop: Callable[[], bool] = lambda: False,
     observe_can: CanObserver | None = None,
+    quiet_seconds: Callable[[], float] | None = None,
 ) -> dict[str, object]:
     job_id = queue.validate_job_id(str(manifest.get("id", "")))
     lease_token = str(manifest.get("lease_token", ""))
@@ -1109,7 +1121,12 @@ def execute_claimed_job(
     capacity_ok, capacity_reason = work_capacity_eligibility(manifest, args)
     if not capacity_ok:
         raise BrokerError(capacity_reason)
-    stop = StopLatch(should_stop, observe_can)
+    stop = StopLatch(
+        should_stop,
+        observe_can,
+        quiet_seconds=quiet_seconds,
+        required_quiet_seconds=args.health_thresholds.can_quiet_seconds,
+    )
     if not stop.clear_to_launch():
         return _requeue_for_can(root, job_id, lease_token, stop, None)
     broker_active_started = time.monotonic()
@@ -1291,6 +1308,11 @@ def execute_claimed_job(
             )
         except CanStopped:
             pass
+        except TerminationUnconfirmed:
+            # Descendants may still be writing into this job's directories:
+            # publish nothing and requeue nothing.  The job stays running for a
+            # restarted broker to resume.
+            raise
         except Exception as exc:
             exit_code, execution = _failure_results(result_root, manifest, exc)
             artifacts = {}
@@ -1381,6 +1403,7 @@ def run_once(
     should_stop: Callable[[], bool] = lambda: False,
     monitor: HealthMonitor | None = None,
 ) -> dict[str, object]:
+    gated_by_monitor = monitor is not None and health_reader is None
     health_reader = _observe_and_pick_reader(monitor, health_reader)
     root = queue.safe_root(args.root)
     work_root = prepare_work_root(args.work_root)
@@ -1442,6 +1465,7 @@ def run_once(
         manifest,
         should_stop=should_stop,
         observe_can=None if monitor is None else monitor.observe_can,
+        quiet_seconds=monitor.quiet_seconds if gated_by_monitor else None,
     )
     if "action" in result:  # stopped for CAN and requeued, or left untouched
         return result
@@ -1477,8 +1501,19 @@ def run_self_test(args: BrokerConfig) -> dict[str, object]:
 
 def health_report(config: BrokerConfig, monitor: HealthMonitor) -> dict[str, object]:
     """The `--health` payload: what the gate sees now and what it decides."""
-    assessment = assess_health(monitor.snapshot(), config.health_thresholds)
-    return {**asdict(assessment), "thresholds": asdict(config.health_thresholds)}
+    thresholds = asdict(config.health_thresholds)
+    try:
+        assessment = assess_health(monitor.snapshot(), config.health_thresholds)
+    except HealthProbeError as exc:
+        # `--health` always answers in JSON with exit 0; an unreadable source
+        # is an unhealthy answer, not a usage error.
+        return {
+            "ok": False,
+            "reasons": [f"health probe failed: {exc}"],
+            "snapshot": None,
+            "thresholds": thresholds,
+        }
+    return {**asdict(assessment), "thresholds": thresholds}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1661,8 +1696,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             if config.self_test:
                 print(json.dumps(run_self_test(config), indent=2, sort_keys=True))
             elif config.once:
-                monitor.wait_for_quiet(config.can_quiet_seconds)
-                result = run_once(config, monitor=monitor)
+                waited = monitor.wait_for_quiet(config.can_quiet_seconds)
+                if waited.quiet:
+                    result = run_once(config, monitor=monitor)
+                else:
+                    # The wait ended on a lock or probe failure; observing again
+                    # inside run_once could see a transient quiet and run anyway.
+                    result = {
+                        "action": "deferred",
+                        "reason": "CAN not quiet while waiting: "
+                        + (waited.error or ", ".join(waited.held_locks)),
+                    }
                 print(json.dumps(result, indent=2, sort_keys=True))
             else:
                 serve(config, monitor)

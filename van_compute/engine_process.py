@@ -222,6 +222,33 @@ def kill_and_reap_group(process: subprocess.Popen) -> None:
     process.returncode = os.waitstatus_to_exitcode(status)
 
 
+# How long cleanup waits for a SIGKILLed group to disappear (zombies count as
+# alive until their parent or init reaps them).
+GROUP_GONE_TIMEOUT = 5.0
+
+
+def wait_for_group_gone(
+    group: int,
+    *,
+    exists: Callable[[int], bool],
+    timeout: float | None = None,
+    clock=time,
+) -> bool:
+    """True once no process remains in `group`.  An inspection error counts as
+    "still there" and is retried until the deadline (macOS answers EPERM for a
+    group of zombies that init has not reaped yet)."""
+    deadline = clock.monotonic() + (GROUP_GONE_TIMEOUT if timeout is None else timeout)
+    while True:
+        try:
+            if not exists(group):
+                return True
+        except Exception:  # never claim the group is gone on an error
+            pass
+        if clock.monotonic() >= deadline:
+            return False
+        clock.sleep(0.05)
+
+
 def process_group_exists(
     group: int, *, host: Host, error_type: type[RuntimeError]
 ) -> bool:

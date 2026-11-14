@@ -145,11 +145,50 @@ class SamplerTests(unittest.TestCase):
         self.window = (1000, 0, [10, 0, 0, 90, 0, 0, 0, 0, 0, 0])
         self.sampler.sample()
         self.clock.sleeps.clear()
+        # Time must pass, or the zero-elapsed window would force the re-window
+        # by itself and the decrease path would go untested.
+        self.clock.now += 5.0
         self.write(5, 0, [20, 0, 0, 180, 0, 0, 0, 0, 0, 0])  # swap counter reset
         self.window = (105, 0, [30, 0, 0, 270, 0, 0, 0, 0, 0, 0])
         rates = self.sampler.sample()
         self.assertEqual(self.clock.sleeps, [1.0])
         self.assertEqual(rates.swap_pages_per_second, 100.0)
+
+    def assert_decrease_takes_a_fresh_window(self, later, fresh):
+        self.window = (100, 100, [100, 0, 100, 700, 0, 0, 0, 0, 0, 0])
+        self.sampler.sample()
+        self.clock.sleeps.clear()
+        self.clock.now += 5.0
+        self.write(*later)
+        self.window = fresh
+        rates = self.sampler.sample()
+        self.assertEqual(self.clock.sleeps, [1.0])
+        return rates
+
+    def test_a_swap_counter_decrease_is_not_masked_by_the_other_one_rising(self):
+        # pswpin fell by 100 while pswpout rose by 600: the sum rises by 500.
+        rates = self.assert_decrease_takes_a_fresh_window(
+            (0, 700, [200, 0, 100, 800, 0, 0, 0, 0, 0, 0]),
+            (10, 710, [250, 0, 100, 850, 0, 0, 0, 0, 0, 0]),
+        )
+        self.assertEqual(rates.swap_pages_per_second, 20.0)
+
+    def test_a_cpu_field_decrease_is_not_masked_by_another_rising(self):
+        # user fell by 50 while system rose by 150: busy and total both rise.
+        rates = self.assert_decrease_takes_a_fresh_window(
+            (100, 100, [50, 0, 250, 800, 0, 0, 0, 0, 0, 0]),
+            (100, 100, [100, 0, 250, 850, 0, 0, 0, 0, 0, 0]),
+        )
+        self.assertAlmostEqual(rates.cpu_busy_fraction, 0.5)
+
+    def test_a_negative_counter_is_a_probe_failure(self):
+        self.vmstat.write_text("pswpin -5\npswpout 1\n", encoding="ascii")
+        with self.assertRaises(HealthProbeError):
+            self.sampler.sample()
+        self.write(0, 0, [0] * 10)
+        self.stat.write_text("cpu -1 2 3 4 5 6 7 8\n", encoding="ascii")
+        with self.assertRaises(HealthProbeError):
+            self.sampler.sample()
 
     def test_two_invalid_windows_raise(self):
         self.window = None  # counters never move, so no CPU time elapses
@@ -455,7 +494,7 @@ class CommandLineTests(BrokerHarness, unittest.TestCase):
             *extra,
         ]
 
-    def main(self, arguments, probe=lambda _dir: QUIET):
+    def main(self, arguments, probe=lambda _dir: QUIET, sampler=None, readers=None):
         clock = FakeClock()
         made = []
 
@@ -464,13 +503,13 @@ class CommandLineTests(BrokerHarness, unittest.TestCase):
             return HealthMonitor(
                 lock_dir,
                 probe=probe,
-                sampler=FixedRates(),
+                sampler=sampler or FixedRates(),
                 clock=clock,
                 sleep=clock.sleep,
             )
 
         output = StringIO()
-        with host_readers(), mock.patch.object(
+        with (readers or host_readers()), mock.patch.object(
             broker, "HealthMonitor", factory
         ), mock.patch.object(
             broker, "bubblewrap_self_test", return_value=(True, "test")
@@ -535,8 +574,58 @@ class CommandLineTests(BrokerHarness, unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertLess(len(clock.sleeps), 5)
         result = json.loads(output)
-        self.assertEqual(result["reason"], "Pi health gate")
-        self.assertIn("CAN transmit lock held", result["health"]["reasons"][0])
+        self.assertEqual(result["action"], "deferred")
+        self.assertIn("active-diagnostics-can0.lock", result["reason"])
+
+    def test_once_defers_when_only_its_first_wait_saw_activity(self):
+        # With no quiet window to wait out, the wait ends on the first (active)
+        # observation; the later quiet ones inside run_once must not undo that.
+        job = self.submit()
+        answers = iter([CanProbe(True, ("active-diagnostics-can0.lock",), None)])
+        code, output, _clock, _made = self.main(
+            self.arguments("--once", "--can-quiet-seconds", "0"),
+            probe=lambda _dir: next(answers, QUIET),
+        )
+        self.assertEqual(code, 0)
+        result = json.loads(output)
+        self.assertEqual(result["action"], "deferred")
+        self.assertIn("CAN not quiet", result["reason"])
+        self.assertTrue((self.root / "queued" / job["id"]).is_dir())
+
+    def test_health_reports_a_failed_rate_read_as_unhealthy_json(self):
+        class Broken:
+            def sample(self):
+                raise HealthProbeError("no counters")
+
+        code, output, _clock, _made = self.main(
+            self.arguments("--health"), sampler=Broken()
+        )
+        self.assertEqual(code, 0)
+        report = json.loads(output)
+        self.assertFalse(report["ok"])
+        self.assertIn("no counters", report["reasons"][0])
+        self.assertIn("thresholds", report)
+
+    def test_health_reports_a_failed_memory_read_as_unhealthy_json(self):
+        readers = mock.patch.object(
+            pi_health, "_read_meminfo", side_effect=HealthProbeError("no meminfo")
+        )
+        code, output, _clock, _made = self.main(
+            self.arguments("--health"), readers=readers
+        )
+        self.assertEqual(code, 0)
+        report = json.loads(output)
+        self.assertFalse(report["ok"])
+        self.assertIn("no meminfo", report["reasons"][0])
+
+    def test_health_with_invalid_arguments_still_exits_nonzero(self):
+        error = StringIO()
+        with contextlib.redirect_stderr(error):
+            code, output, _clock, _made = self.main(
+                self.arguments("--health", "--timeout", "0")
+            )
+        self.assertEqual(code, 2)
+        self.assertEqual(output, "")
 
     def test_old_gate_flags_exit_with_the_replacement_named(self):
         error = StringIO()

@@ -35,12 +35,12 @@ class Rates:
 @dataclass(frozen=True)
 class _Counters:
     at: float
-    swap_pages: int
-    cpu_busy: int
-    cpu_total: int
+    swap_in: int
+    swap_out: int
+    cpu: tuple[int, ...]
 
 
-def _read_swap_pages(path: Path) -> int:
+def _read_swap_pages(path: Path) -> tuple[int, int]:
     values: dict[str, int] = {}
     try:
         for line in path.read_text(encoding="ascii").splitlines():
@@ -51,11 +51,14 @@ def _read_swap_pages(path: Path) -> int:
         raise HealthProbeError(f"cannot read swap activity from {path}: {exc}") from None
     if len(values) != 2:
         raise HealthProbeError(f"{path} lacks pswpin or pswpout")
-    return values["pswpin"] + values["pswpout"]
+    if min(values.values()) < 0:
+        raise HealthProbeError(f"{path} has a negative swap counter")
+    return values["pswpin"], values["pswpout"]
 
 
-def _read_cpu_times(path: Path) -> tuple[int, int]:
-    """Return (busy, total) jiffies, where busy excludes idle and iowait."""
+def _read_cpu_times(path: Path) -> tuple[int, ...]:
+    """Return the aggregate cpu line's jiffy fields, each kept separate so a
+    decrease in one cannot be hidden by an increase in another."""
     try:
         first = path.read_text(encoding="ascii").splitlines()[0].split()
         fields = [int(value) for value in first[1 : 1 + CPU_FIELDS]]
@@ -63,8 +66,9 @@ def _read_cpu_times(path: Path) -> tuple[int, int]:
         raise HealthProbeError(f"cannot read CPU times from {path}: {exc}") from None
     if first[0] != "cpu" or len(fields) != CPU_FIELDS:
         raise HealthProbeError(f"{path} has no complete aggregate cpu line")
-    total = sum(fields)
-    return total - fields[IDLE_FIELD] - fields[IOWAIT_FIELD], total
+    if min(fields) < 0:
+        raise HealthProbeError(f"{path} has a negative CPU counter")
+    return tuple(fields)
 
 
 class RateSampler:
@@ -85,20 +89,27 @@ class RateSampler:
         self._previous: _Counters | None = None
 
     def _read(self) -> _Counters:
-        busy, total = _read_cpu_times(self._stat_path)
-        return _Counters(
-            self._clock(), _read_swap_pages(self._vmstat_path), busy, total
-        )
+        cpu = _read_cpu_times(self._stat_path)
+        swap_in, swap_out = _read_swap_pages(self._vmstat_path)
+        return _Counters(self._clock(), swap_in, swap_out, cpu)
 
     @staticmethod
     def _between(earlier: _Counters, later: _Counters) -> Rates | None:
         elapsed = later.at - earlier.at
-        total = later.cpu_total - earlier.cpu_total
-        pages = later.swap_pages - earlier.swap_pages
-        busy = later.cpu_busy - earlier.cpu_busy
-        if elapsed <= 0 or total <= 0 or pages < 0 or busy < 0:
+        # Every counter only grows; any one going down means a reset or a bad
+        # read, and the other counters' growth must not mask it.
+        swap_deltas = (
+            later.swap_in - earlier.swap_in,
+            later.swap_out - earlier.swap_out,
+        )
+        cpu_deltas = [new - old for new, old in zip(later.cpu, earlier.cpu)]
+        if elapsed <= 0 or min(swap_deltas + tuple(cpu_deltas)) < 0:
             return None
-        return Rates(pages / elapsed, min(1.0, busy / total))
+        total = sum(cpu_deltas)
+        if total <= 0:
+            return None
+        busy = total - cpu_deltas[IDLE_FIELD] - cpu_deltas[IOWAIT_FIELD]
+        return Rates(sum(swap_deltas) / elapsed, busy / total)
 
     def sample(self) -> Rates:
         current = self._read()

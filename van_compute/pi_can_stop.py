@@ -22,7 +22,10 @@ from van_compute.pi_health_monitor import CAN_WATCH_INTERVAL_SECONDS
 SERVICE_STOP = "service-stop"
 CAN_TRANSMIT = "pi-can-transmit"
 CAN_PROBE_FAILED = "can-probe-failed"
-CAN_CAUSES = frozenset({CAN_TRANSMIT, CAN_PROBE_FAILED})
+# Quiet long enough at the gate, but staging or the cache wait left a gap that
+# broke the chain before the launch.
+CAN_NOT_QUIET = "pi-can-not-quiet"
+CAN_CAUSES = frozenset({CAN_TRANSMIT, CAN_PROBE_FAILED, CAN_NOT_QUIET})
 # SIGTERM to SIGKILL for a CAN stop: with the 0.5 s watch this keeps the job
 # alive about 1.5 s after a lock appears, instead of the usual 10 s courtesy.
 CAN_TERMINATE_GRACE = 1.0
@@ -43,9 +46,13 @@ class StopLatch:
         *,
         interval: float = CAN_WATCH_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        quiet_seconds: Callable[[], float] | None = None,
+        required_quiet_seconds: float = 0.0,
     ) -> None:
         self._service_stop = service_stop
         self._observe_can = observe_can
+        self._quiet_seconds = quiet_seconds
+        self._required_quiet = required_quiet_seconds
         self._interval = interval
         self._clock = clock
         self._last_check: float | None = None
@@ -77,9 +84,23 @@ class StopLatch:
 
     def clear_to_launch(self) -> bool:
         """Check CAN right now, before a child is started (also called once the
-        task cache is held, immediately before launch)."""
+        task cache is held, immediately before launch).
+
+        The gate's quiet requirement is re-checked here: staging or a cache
+        wait can outlast the tracker's observation gap and silently break the
+        chain the gate relied on.
+        """
         if self.cause is None:
             self._check_can()
+            if (
+                self.cause is None
+                and self._quiet_seconds is not None
+                and (quiet := self._quiet_seconds()) < self._required_quiet
+            ):
+                self._latch(
+                    CAN_NOT_QUIET,
+                    f"quiet {quiet:.0f} s, below {self._required_quiet:.0f} s",
+                )
         return not self.can_cause
 
     def should_stop(self) -> bool:
