@@ -14,12 +14,17 @@ import sys
 import tempfile
 import threading
 import unittest
+
 from unittest import mock
 
 from macbook.scripts.van_compute_installer import constants as installer_constants
 from macbook.scripts.van_compute_installer.runners import LocalRunner
 from macbook.scripts.van_compute_installer.sandbox_proxy import (
     probe_proxy, run_proxy_probe,
+)
+from pi.tests.compute.van_compute_test_fixtures import (
+    IPV6_LOOPBACK_SKIP,
+    ipv6_loopback_available,
 )
 from van_compute import engine, registry_proxy, worker
 
@@ -133,6 +138,7 @@ class WorkerProxyWiringTests(unittest.TestCase):
             return {"ok": True}
         return record
 
+    @unittest.skipUnless(ipv6_loopback_available(), IPV6_LOOPBACK_SKIP)
     def test_main_runs_the_proxy_around_run_once_only_with_a_sandbox_profile(self):
         profile = self.base / "sandbox.sb"
         profile.write_text("(version 1)\n", encoding="utf-8")
@@ -149,6 +155,7 @@ class WorkerProxyWiringTests(unittest.TestCase):
         with self.assertRaises(ConnectionRefusedError):
             socket.create_connection(("127.0.0.1", observed[1]), timeout=2).close()
 
+    @unittest.skipUnless(ipv6_loopback_available(), IPV6_LOOPBACK_SKIP)
     def test_main_keeps_the_proxy_up_for_the_persistent_scheduler(self):
         profile = self.base / "sandbox.sb"
         profile.write_text("(version 1)\n", encoding="utf-8")

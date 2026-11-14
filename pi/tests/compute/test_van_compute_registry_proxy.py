@@ -11,6 +11,11 @@ import threading
 import time
 import unittest
 
+from pi.tests.compute.van_compute_test_fixtures import (
+    IPV6_LOOPBACK_SKIP,
+    ipv6_loopback_available,
+)
+
 from van_compute import registry_proxy
 from van_compute.registry_proxy import (
     ProxyLimits, RegistryProxy, client_hello_record, resolve_public,
@@ -100,6 +105,7 @@ def read_status(connection: socket.socket) -> bytes:
     return buffer.split(b"\r\n", 1)[0]
 
 
+@unittest.skipUnless(ipv6_loopback_available(), IPV6_LOOPBACK_SKIP)
 class RegistryProxyTests(unittest.TestCase):
     def setUp(self):
         self.upstream = EchoUpstream()

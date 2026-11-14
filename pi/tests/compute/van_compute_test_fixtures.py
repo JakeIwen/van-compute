@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import socket
 import tempfile
 from unittest import mock
 
@@ -26,6 +27,21 @@ Path(sys.argv[1]).write_text(
     encoding="utf-8",
 )
 """
+
+
+# The registry proxy runs only on the Mac worker and must hold its port on
+# ::1 too; the Pi's kernel has IPv6 disabled, so tests that start a real
+# proxy skip there.
+IPV6_LOOPBACK_SKIP = "this host has no IPv6 loopback"
+
+
+def ipv6_loopback_available() -> bool:
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
 
 
 def child_env_golden(name):
