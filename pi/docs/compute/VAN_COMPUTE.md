@@ -769,7 +769,12 @@ fixtures must remain byte-identical.
    the scheduler copies config rather than mutating its caller's event field.
 8. **Watchdogs:** Pi checks disk every 0.5 seconds at reserve+result_limit and
    samples again after a fast exit. Mac checks RSS, process count then disk
-   every second at reserve only, without a final sample. Thresholds, sampling
+   every second at reserve only, without a final sample. A Mac `ps` timeout
+   reuses the last good process table while it is at most 15 seconds old, and
+   callers within one poll interval of that timeout skip retrying `ps`; an older
+   table, a first-sample timeout, a nonzero `ps` exit or an OSError still fail
+   the job with exit 125. A loaded Mac had killed healthy suites on one slow
+   sample. Thresholds, sampling
    order, error strings and exit codes remain host-specific, including Mac's
    legacy empty-watchdog-error graceful termination/143 behavior.
 9. **Cleanup:** Both terminate descendants before publication. Pi records a

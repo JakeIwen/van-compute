@@ -66,8 +66,14 @@ DEFAULT_POLL_INTERVAL = 15.0
 SCHEDULER_SLOTS = 10
 SSH_CONTROL_CONNECTIONS = 4
 RESOURCE_POLL_INTERVAL = 1.0
+PROCESS_TABLE_TIMEOUT = 5
+# A loaded Mac can stall one `ps` past its timeout; failing the job on a single
+# slow sample killed healthy suites. Timeouts reuse the last good table while it
+# is younger than this; older tables and any other ps failure still fail closed.
+PROCESS_TABLE_STALE_LIMIT = 15.0
 _PROCESS_TABLE_LOCK = threading.Lock()
 _PROCESS_TABLE_SAMPLED_AT = 0.0
+_PROCESS_TABLE_TIMED_OUT_AT: float | None = None
 _PROCESS_TABLE_GROUPS: dict[int, tuple[int, int]] = {}
 COPY_CHUNK = 1024 * 1024
 DATASET_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -902,10 +908,22 @@ def process_group_exists(group_id: int) -> bool:
 
 
 def process_group_resources(group_id: int) -> tuple[int, int]:
-    """Return aggregate RSS/count from one shared process-table sample."""
+    """Return aggregate RSS/count from one shared process-table sample.
+
+    A ps timeout falls back to the last good table while it is younger than
+    PROCESS_TABLE_STALE_LIMIT; after a timeout, callers within one poll interval
+    reuse that table instead of queueing serial five-second retries on the lock.
+    """
     global _PROCESS_TABLE_GROUPS, _PROCESS_TABLE_SAMPLED_AT
+    global _PROCESS_TABLE_TIMED_OUT_AT
     with _PROCESS_TABLE_LOCK:
         now = time.monotonic()
+        if (
+            _PROCESS_TABLE_TIMED_OUT_AT is not None
+            and now - _PROCESS_TABLE_TIMED_OUT_AT < RESOURCE_POLL_INTERVAL
+            and _process_table_is_fresh_enough(now)
+        ):
+            return _PROCESS_TABLE_GROUPS.get(group_id, (0, 0))
         if (
             group_id not in _PROCESS_TABLE_GROUPS
             or now - _PROCESS_TABLE_SAMPLED_AT >= RESOURCE_POLL_INTERVAL
@@ -917,9 +935,17 @@ def process_group_resources(group_id: int) -> tuple[int, int]:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    timeout=5,
+                    timeout=PROCESS_TABLE_TIMEOUT,
                     check=False,
                 )
+            except subprocess.TimeoutExpired as exc:
+                failed_at = time.monotonic()
+                if _process_table_is_fresh_enough(failed_at):
+                    _PROCESS_TABLE_TIMED_OUT_AT = failed_at
+                    return _PROCESS_TABLE_GROUPS.get(group_id, (0, 0))
+                raise WorkerError(
+                    f"resource watchdog could not run ps: {exc}"
+                ) from None
             except (OSError, subprocess.SubprocessError) as exc:
                 raise WorkerError(
                     f"resource watchdog could not run ps: {exc}"
@@ -945,7 +971,15 @@ def process_group_resources(group_id: int) -> tuple[int, int]:
                 )
             _PROCESS_TABLE_GROUPS = groups
             _PROCESS_TABLE_SAMPLED_AT = now
+            _PROCESS_TABLE_TIMED_OUT_AT = None
         return _PROCESS_TABLE_GROUPS.get(group_id, (0, 0))
+
+
+def _process_table_is_fresh_enough(now: float) -> bool:
+    return (
+        _PROCESS_TABLE_SAMPLED_AT > 0
+        and now - _PROCESS_TABLE_SAMPLED_AT <= PROCESS_TABLE_STALE_LIMIT
+    )
 
 
 def filesystem_free_bytes(path: Path) -> int:
