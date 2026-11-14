@@ -40,9 +40,11 @@ needed. The queue and broker are intentionally not a general remote shell.
 
 The broker starts a Pi-local job only when every check passes. Rates come from
 a sampler that keeps its previous reading: the delta since the last poll, or a
-fresh one-second window when there is no reading or it is over 30 s old. A
-counter that goes backwards, a missing field or an unreadable source defers the
-job (`health probe failed`); nothing is ever read as healthy by default.
+fresh one-second window when there is no reading, it is over 30 s old, or any
+single counter (each swap counter and each CPU field, checked separately) went
+backwards. A missing field, a negative value, an unreadable source or a fresh
+window that is still invalid defers the job (`health probe failed`); nothing is
+ever read as healthy by default.
 
 | Check | Default | Flag | Why |
 | --- | --- | --- | --- |
@@ -65,8 +67,8 @@ The memory minimum is not guaranteed headroom for other services. The job's
 `MemoryMax` covers the broker plus every descendant, so a job and the broker
 together may use more than the 256 MiB the minimum leaves free.
 
-CAN lock contract. Every Pi CAN transmitter in obd-things takes a nonblocking
-exclusive `flock` on `active-diagnostics-<name>.lock` in
+CAN lock contract. The Pi CAN transmitters in obd-things that take the lock
+each take a nonblocking exclusive `flock` on `active-diagnostics-<name>.lock` in
 `/home/pi/dev/obd-things/tmp/locks` for as long as it may transmit; the kernel
 drops it when the holder exits, so it cannot go stale. The broker reads
 `/proc/locks` and matches each record's `major:minor:inode` (device in hex,
@@ -107,8 +109,13 @@ quiet chain). The first stop cause latched wins:
 - Any exception while waiting on a child kills and reaps its process group
   before the cache is released.
 
-The guarantee is bounded. No Pi-local job starts while a CAN transmitter lock is
-held or until CAN has been quiet for `--can-quiet-seconds`; a running job's
+The guarantee is bounded, and covers only senders that take the lock (the
+`vonstar` unlock goes through `can_handoff.active_turn` and radar through
+transmit permits that revalidate the exclusive lock; arbitrary senders are not
+proven to). No Pi-local job starts while a CAN transmitter lock is
+held or until CAN has been quiet for `--can-quiet-seconds`, rechecked just
+before launch (a slow staging or cache wait that breaks the quiet chain
+requeues the job with no child started); a running job's
 process group is gone about 1.5 s after a lock appears (0.5 s watch, SIGTERM,
 SIGKILL after 1 s). A burst shorter than the watch interval can pass unseen,
 and strict zero overlap would need a handshake with the senders. Once the child
@@ -116,8 +123,10 @@ has exited on its own, its results publish without another CAN check: that is a
 bounded local copy at the unit's `IOWeight=10`.
 
 `--once` first watches CAN every 0.5 s for up to `--can-quiet-seconds` (stopping
-early, and deferring, if a lock appears). `--health` prints the current snapshot
-and assessment as JSON and exits 0 whether or not the gate passes; it takes no
+early, and deferring without placing a job, if a lock appears or the probe
+fails). `--health` prints the current snapshot
+and assessment as JSON and exits 0 whether or not the gate passes (an unreadable
+source is reported as unhealthy JSON; invalid arguments still exit nonzero); it takes no
 queue lock, so it works beside the service under its systemd sandbox. Its quiet
 time counts only from that process's start.
 
