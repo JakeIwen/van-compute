@@ -1293,6 +1293,30 @@ def validate_raw_result_bytes(result_root: Path, maximum_result_bytes: int) -> N
             raise WorkerError("job results exceed the total result limit")
 
 
+def job_environment(
+    manifest: Mapping[str, object],
+    *,
+    job_root: Path,
+    source_root: Path,
+    cache_root: Path,
+) -> dict[str, str]:
+    """The complete child environment; nothing is inherited from the worker."""
+    home_root = job_root / "home"
+    return {
+        "HOME": str(home_root),
+        "TMPDIR": str(job_root / "tmp") + "/",
+        "XDG_CACHE_HOME": str(cache_root),
+        "XDG_CONFIG_HOME": str(home_root / ".config"),
+        "LANG": "en_US.UTF-8",
+        "LC_ALL": "en_US.UTF-8",
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "VAN_COMPUTE_CHILD_PYTHONPATH": str(source_root),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "VAN_COMPUTE_JOB_ID": str(manifest.get("id", "")),
+    }
+
+
 def execute_job(
     manifest: dict[str, object],
     *,
@@ -1371,19 +1395,9 @@ def execute_job(
     cache_root, cache_scope = task_cache.job_cache(
         task_cache_store, cache_request, job_root / "cache"
     )
-    environment = {
-        "HOME": str(home_root),
-        "TMPDIR": str(temporary_root) + "/",
-        "XDG_CACHE_HOME": str(cache_root),
-        "XDG_CONFIG_HOME": str(home_root / ".config"),
-        "LANG": "en_US.UTF-8",
-        "LC_ALL": "en_US.UTF-8",
-        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        "VAN_COMPUTE_CHILD_PYTHONPATH": str(source_root),
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "VAN_COMPUTE_JOB_ID": str(manifest.get("id", "")),
-    }
+    environment = job_environment(
+        manifest, job_root=job_root, source_root=source_root, cache_root=cache_root
+    )
     command = sandbox_command(
         command,
         profile=sandbox_profile,
@@ -2323,6 +2337,64 @@ def _scheduler_signal_handlers(stop_event, drain_event):
     }
 
 
+def _serve_persistent(runtime_config: WorkerConfig) -> None:
+    """Run the scheduler under the host-wide lock until a stop signal."""
+    private_root = runtime_config.work_root.expanduser().resolve().parent
+    private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(private_root, 0o700)
+    lock_path = private_root / "scheduler.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        os.chmod(lock_path, 0o600)
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise WorkerError(
+                "another persistent scheduler is already running"
+            ) from None
+        stop_event = threading.Event()
+        drain_event = threading.Event()
+
+        previous_handlers = _scheduler_signal_handlers(stop_event, drain_event)
+        multiplexers = [
+            SSHMultiplexer(
+                runtime_config.host,
+                runtime_config.control_path.with_name(
+                    f"{runtime_config.control_path.name}.{index}"
+                ),
+                connect_timeout=runtime_config.connect_timeout,
+            )
+            for index in range(SSH_CONTROL_CONNECTIONS)
+        ]
+        try:
+            # Establish lazily through the host-wide retry gate. Starting
+            # offline must not turn into a launchd restart storm.
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "mode": "persistent",
+                        "worker": runtime_config.worker,
+                        "slots": SCHEDULER_SLOTS,
+                        "ssh_control_connections": SSH_CONTROL_CONNECTIONS,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            run_scheduler(
+                runtime_config,
+                stop_event=stop_event,
+                drain_event=drain_event,
+                multiplexers=multiplexers,
+            )
+        finally:
+            stop_event.set()
+            for multiplexer in multiplexers:
+                multiplexer.close()
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw_arguments = list(argv) if argv is not None else sys.argv[1:]
     os.umask(0o077)
@@ -2335,60 +2407,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(payload, indent=2, sort_keys=True))
             return 0 if payload.get("ok") else 1
 
-        private_root = runtime_config.work_root.expanduser().resolve().parent
-        private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(private_root, 0o700)
-        lock_path = private_root / "scheduler.lock"
-        with lock_path.open("a+", encoding="utf-8") as lock:
-            os.chmod(lock_path, 0o600)
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise WorkerError(
-                    "another persistent scheduler is already running"
-                ) from None
-            stop_event = threading.Event()
-            drain_event = threading.Event()
-
-            previous_handlers = _scheduler_signal_handlers(stop_event, drain_event)
-            multiplexers = [
-                SSHMultiplexer(
-                    runtime_config.host,
-                    runtime_config.control_path.with_name(
-                        f"{runtime_config.control_path.name}.{index}"
-                    ),
-                    connect_timeout=runtime_config.connect_timeout,
-                )
-                for index in range(SSH_CONTROL_CONNECTIONS)
-            ]
-            try:
-                # Establish lazily through the host-wide retry gate. Starting
-                # offline must not turn into a launchd restart storm.
-                print(
-                    json.dumps(
-                        {
-                            "ok": True,
-                            "mode": "persistent",
-                            "worker": runtime_config.worker,
-                            "slots": SCHEDULER_SLOTS,
-                            "ssh_control_connections": SSH_CONTROL_CONNECTIONS,
-                        },
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
-                run_scheduler(
-                    runtime_config,
-                    stop_event=stop_event,
-                    drain_event=drain_event,
-                    multiplexers=multiplexers,
-                )
-            finally:
-                stop_event.set()
-                for multiplexer in multiplexers:
-                    multiplexer.close()
-                for signum, handler in previous_handlers.items():
-                    signal.signal(signum, handler)
+        _serve_persistent(runtime_config)
         return 0
     except (
         OSError,
