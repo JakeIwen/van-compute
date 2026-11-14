@@ -143,6 +143,31 @@ class MarkerPersistenceTests(unittest.TestCase):
         self.assertTrue(fixture.marker, "the job stays marked")
 
 
+class UntilDoneTests(unittest.TestCase):
+    def test_a_busy_discard_is_logged_when_it_starts_and_every_minute(self):
+        fixture = HoldFixture()
+        answers = iter(["busy"] * 130)
+        fixture.hold.until_done(
+            "cache-discard", lambda: next(answers, None), entry="ns/cache"
+        )
+        lines = [l for l in fixture.logged if l.get("phase") == "cache-discard"]
+        self.assertEqual(len(lines), 3)  # at 0 s, ~60 s and ~120 s
+        self.assertEqual(lines[0]["reason"], "busy")
+        self.assertEqual(lines[0]["entry"], "ns/cache")
+        self.assertEqual(lines[0]["action"], "cleanup-hold")
+        self.assertEqual(lines[0]["job"], "job")
+
+    def test_an_error_is_the_logged_reason_and_a_stop_ends_the_retry(self):
+        fixture = HoldFixture(stop_after_sleeps=3)
+
+        def failing():
+            raise OSError("disk gone")
+
+        with self.assertRaises(Unconfirmed):
+            fixture.hold.until_done("cache-discard", failing)
+        self.assertIn("disk gone", fixture.logged[0]["reason"])
+
+
 class StopSignalTests(unittest.TestCase):
     def test_handlers_set_a_flag_and_are_restored(self):
         before = signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)

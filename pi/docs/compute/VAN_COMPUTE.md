@@ -123,14 +123,21 @@ quiet chain). The first stop cause latched wins:
   not prove the group is gone: systemd only logs "Processes still around after
   SIGKILL" for uninterruptible descendants and may restart the unit, and a
   foreground `--once` run has no cgroup containment at all.
-- So a marked running job is handled before any health gate or new claim. On
-  the same boot (`cleanup_boot_id` matches `/proc/sys/kernel/random/boot_id`)
+- So a marked running job is handled before any new claim, and before the
+  health gate, the staging-capacity check, any staging directory and (under
+  `--once`) the initial CAN quiet wait: killing the old group and discarding
+  its cache entry depend on neither disk space nor CAN. On the same boot (`cleanup_boot_id` matches `/proc/sys/kernel/random/boot_id`)
   while `cleanup_group` still has members, the broker holds that group the
   same way and claims nothing else. It then discards the job's task-cache
   entry under the cache's exclusive lock (never holding the queue lock), so a
   late write by a surviving process lands in unlinked files, and fails the job
-  without running it. A missing or different boot id means a reboot ended the
-  group, so the hold is skipped; the cache entry is still discarded. There is
+  without running it. A different boot id means a reboot ended the group; a missing
+  one skips the same-boot hold too, which on the Pi (where the boot id is always
+  readable) happens only after a reboot. The cache entry is still discarded,
+  retried (with `cache-discard` log lines at the start and about every 60 s)
+  while it is busy or its namespace cannot be inspected. The failure itself is
+  published once staging space allows, waiting (logged as `failure-publication`)
+  until then. There is
   no timeout-based release. Residual case: a marker that could not be written
   (the queue write kept failing until the stop) leaves nothing for the next run
   to find; the stop then logs that it could not write the marker.

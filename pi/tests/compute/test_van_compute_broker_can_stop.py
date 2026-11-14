@@ -1,3 +1,4 @@
+import collections
 import contextlib
 import dataclasses
 import datetime as dt
@@ -830,6 +831,53 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
         self.assertEqual(result["action"], "executed")
         self.assertTrue((self.root / "failed" / submitted["id"]).is_dir())
 
+    def test_a_marked_job_is_recovered_before_the_staging_capacity_check(self):
+        self.hold_log = []
+        group = self.previous_group()
+        submitted, later, store, request = self.marked_job_with_cache(group)
+        Usage = collections.namedtuple("Usage", "total used free")
+        space = {"free": 0}
+        observed = []
+
+        def sleep(_seconds):
+            # While waiting for space the old group is already gone and the
+            # cache entry discarded; nothing is published yet.
+            if not any(l.get("phase") == "failure-publication" for l in self.hold_log):
+                time.sleep(0.05)  # still holding the old group
+                return
+            observed.append((
+                self.group_alive(group),
+                store.path(request).exists(),
+                (self.root / "failed" / submitted["id"]).exists(),
+                (self.root / "queued" / later["id"]).is_dir(),
+            ))
+            space["free"] = 10**12
+
+        with mock.patch.object(
+            broker.shutil, "disk_usage",
+            lambda _path: Usage(10**12, 0, space["free"]),
+        ):
+            result = self.restart(request, {"sleep": sleep})
+        self.assertEqual(result["action"], "executed")
+        self.assertFalse(result["ok"])
+        self.assertTrue(observed)
+        self.assertEqual(observed[0], (False, False, False, True))
+        phases = [line.get("phase") for line in self.hold_log]
+        self.assertIn("failure-publication", phases)
+        self.assertTrue(any(line.get("group") == group for line in self.hold_log))
+        self.assertTrue((self.root / "failed" / submitted["id"]).is_dir())
+        self.assertTrue((self.root / "queued" / later["id"]).is_dir())
+
+    @staticmethod
+    def group_alive(group):
+        try:
+            os.killpg(group, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
     def test_a_reboot_skips_the_hold_but_still_discards_the_cache(self):
         self.hold_log = []
 
@@ -862,6 +910,38 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
         self.assertTrue((self.root / "queued" / later["id"]).is_dir())
         self.assertFalse((self.root / "failed" / submitted["id"]).exists())
         self.assertTrue(store.path(request).is_dir(), "cache kept while unconfirmed")
+
+    def test_once_recovers_a_marked_job_even_while_can_is_active(self):
+        self.hold_log = []
+        group = self.previous_group()
+        submitted, later, store, request = self.marked_job_with_cache(group)
+        held = CanProbe(True, ("active-diagnostics-can0.lock",), None)
+        clock = FakeClock()
+        factory = lambda lock_dir: HealthMonitor(
+            lock_dir, probe=lambda _d=None: held, sampler=FixedRates(),
+            clock=clock, sleep=clock.sleep,
+        )
+        config = dataclasses.replace(
+            self.args, once=True, can_quiet_seconds=60.0,
+            task_cache_root=self.args.task_cache_root,
+        )
+        output = StringIO()
+        with host_readers(), mock.patch.object(
+            broker, "_validate_args", return_value=config
+        ), mock.patch.object(broker, "HealthMonitor", factory), mock.patch.object(
+            broker.task_cache, "request_for_manifest", lambda _m: request
+        ), mock.patch.object(
+            broker, "read_boot_id", lambda: "boot-1"
+        ), mock.patch.object(
+            broker, "_start_task_cache"
+        ), contextlib.redirect_stdout(output):
+            code = broker.main(["--root", str(self.root), "--once"])
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertFalse(self.group_alive(group))
+        self.assertFalse(store.path(request).exists())
+        self.assertTrue((self.root / "failed" / submitted["id"]).is_dir())
+        self.assertEqual(clock.sleeps, [], "no quiet wait before recovery")
+        self.assertTrue((self.root / "queued" / later["id"]).is_dir())
 
     def test_serve_exits_cleanly_when_a_stop_ends_a_cleanup_hold(self):
         with mock.patch.object(

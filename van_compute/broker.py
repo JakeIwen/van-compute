@@ -39,7 +39,7 @@ from typing import Callable, Mapping, Sequence
 
 from van_compute import engine, limited_child, queue, task_cache
 from van_compute.config import BrokerConfig, MissedOffloadRecord
-from van_compute.can_activity import CanObserver
+from van_compute.can_activity import CanObserver, CanProbe
 from van_compute.job_requeue import requeue_running_job
 from van_compute.job_cleanup_marker import (
     clear_cleanup_unconfirmed, mark_cleanup_unconfirmed, read_boot_id,
@@ -1104,6 +1104,24 @@ def _cleanup_hold(root, job_id, lease_token, should_stop) -> CleanupHold:
     )
 
 
+def _recover_marked_job(args, manifest, hold: CleanupHold, cache_store) -> None:
+    """Hold a previous run's group, discard the job's cache entry, then wait
+    (logged) for the staging space the failure's publication needs."""
+    hold.hold_previous_group(manifest, read_boot_id)
+    request = task_cache.request_for_manifest(manifest)
+    if cache_store is not None and request is not None:
+        hold.until_done(
+            "cache-discard",
+            lambda: cache_store.discard(request),
+            entry=f"{request.namespace}/{request.name}",
+        )
+    def space_reason() -> str | None:
+        ok, reason = work_capacity_eligibility(manifest, args)
+        return None if ok else reason
+
+    hold.until_done("failure-publication", space_reason)
+
+
 def _requeue_for_can(root, job_id, lease_token, stop, work):
     return requeue_after_can_stop(
         root,
@@ -1133,15 +1151,26 @@ def execute_claimed_job(
     if job_path.name != job_id or authoritative.get("id") != job_id:
         raise BrokerError("claimed manifest id does not match its running directory")
     manifest = authoritative
-    eligible, reason = local_eligibility(manifest)
-    if not eligible:
-        raise BrokerError(reason)
-    if manifest.get("placement") != "pi-local":
-        raise BrokerError("local job is missing pi-local placement metadata")
-    capacity_ok, capacity_reason = work_capacity_eligibility(manifest, args)
-    if not capacity_ok:
-        raise BrokerError(capacity_reason)
     marked = bool(manifest.get("cleanup_unconfirmed"))
+    cache_store = (
+        None if args.task_cache_root is None
+        else task_cache.TaskCacheStore(args.task_cache_root, args.task_cache_max_bytes)
+    )
+    hold = _cleanup_hold(root, job_id, lease_token, should_stop)
+    if marked:
+        # Before every eligibility, capacity and staging step: killing the old
+        # group and discarding its cache entry must not depend on disk space or
+        # on anything else that could make this job fail early and repeat.
+        _recover_marked_job(args, manifest, hold, cache_store)
+    else:
+        eligible, reason = local_eligibility(manifest)
+        if not eligible:
+            raise BrokerError(reason)
+        if manifest.get("placement") != "pi-local":
+            raise BrokerError("local job is missing pi-local placement metadata")
+        capacity_ok, capacity_reason = work_capacity_eligibility(manifest, args)
+        if not capacity_ok:
+            raise BrokerError(capacity_reason)
     stop = StopLatch(
         should_stop,
         observe_can,
@@ -1153,11 +1182,6 @@ def execute_claimed_job(
         return _requeue_for_can(root, job_id, lease_token, stop, None)
     broker_active_started = time.monotonic()
     work_root = prepare_work_root(args.work_root)
-    cache_store = (
-        None if args.task_cache_root is None
-        else task_cache.TaskCacheStore(args.task_cache_root, args.task_cache_max_bytes)
-    )
-    hold = _cleanup_hold(root, job_id, lease_token, should_stop)
     with tempfile.TemporaryDirectory(prefix=f"{job_id}-", dir=work_root) as temporary:
         work = Path(temporary)
         source_root = work / "source"
@@ -1166,15 +1190,6 @@ def execute_claimed_job(
         artifacts: dict[str, str] = {}
         try:
             if marked:
-                # Before anything else: hold the group a previous run left
-                # (same boot only), then discard the job's cache entry so a
-                # late write from a survivor lands in unlinked files.
-                hold.hold_previous_group(manifest, read_boot_id)
-                request = task_cache.request_for_manifest(manifest)
-                if cache_store is not None and request is not None:
-                    hold.until_done(
-                        "cache discard", lambda: cache_store.discard(request)
-                    )
                 raise BrokerError(
                     "cleanup was unconfirmed in a previous broker instance; "
                     "the job is not re-executed"
@@ -1751,7 +1766,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             if config.self_test:
                 print(json.dumps(run_self_test(config), indent=2, sort_keys=True))
             elif config.once:
-                waited = monitor.wait_for_quiet(config.can_quiet_seconds)
+                running = _running_local_job(queue.safe_root(config.root))
+                if running is not None and running.get("cleanup_unconfirmed"):
+                    # Recovery of a marked job must not wait on, or defer for, CAN.
+                    waited = CanProbe(False, (), None)
+                else:
+                    waited = monitor.wait_for_quiet(config.can_quiet_seconds)
                 if waited.quiet:
                     # Stop signals set a flag (as under serve) so a Ctrl-C during
                     # a cleanup hold ends it cleanly instead of unwinding.

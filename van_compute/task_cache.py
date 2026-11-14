@@ -338,14 +338,32 @@ class TaskCacheStore:
             os.close(root_fd)
         return report
 
-    def discard(self, request: CacheRequest) -> bool:
-        """Delete one cache under its exclusive lock; True once it is gone.
+    def discard(self, request: CacheRequest) -> str | None:
+        """Delete one cache under its exclusive lock.
 
-        A late write by a surviving process of a failed job can then only land
-        in unlinked files.  Takes the cache lock only (never the queue lock).
+        Returns None once it is gone (or was never there), else why it is not:
+        busy, or a namespace that could not be inspected.  A late write by a
+        surviving process of a failed job can then only land in unlinked
+        files.  Takes the cache lock only (never the queue lock).  Unlike
+        `clear`, an unreadable namespace is a failure here, not an empty
+        report.
         """
-        report = self.clear(request.namespace, request.name)
-        return not report["busy"] and not report["failed"]
+        try:
+            if not self.root.is_dir():
+                return None
+            root_fd = os.open(self.root, _DIR_FLAGS)
+            try:
+                if request.namespace not in os.listdir(root_fd):
+                    return None
+                outcome = self._evict(
+                    root_fd, request.namespace, request.name,
+                    os.fstat(root_fd).st_dev,
+                )
+            finally:
+                os.close(root_fd)
+        except (OSError, TaskCacheError) as exc:
+            return f"cannot inspect cache: {exc}"
+        return {"evicted": None, "absent": None}.get(outcome, outcome)
 
     def caches(self) -> list[CacheInfo]:
         if not self.root.is_dir():

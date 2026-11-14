@@ -424,5 +424,30 @@ def stat_mode(path):
     return os.stat(path).st_mode & 0o777
 
 
+class DiscardTests(StoreTests):
+    def test_discard_removes_an_idle_entry_and_treats_absent_as_done(self):
+        self.fill("ns", "cache", 10, 0)
+        self.assertIsNone(self.store.discard(self.request()))
+        self.assertFalse((self.root / "ns" / "cache").exists())
+        self.assertIsNone(self.store.discard(self.request()))
+        self.assertIsNone(self.store.discard(self.request("never", "seen")))
+
+    def test_discard_reports_a_busy_entry_without_touching_it(self):
+        with self.store.use(self.request()) as path:
+            (Path(path) / "blob").write_text("x")
+            self.assertEqual(self.store.discard(self.request()), "busy")
+            self.assertTrue((Path(path) / "blob").exists())
+
+    def test_an_unreadable_namespace_is_not_reported_as_discarded(self):
+        self.fill("ns", "cache", 10, 0)
+        (self.root / "ns").chmod(0)
+        try:
+            outcome = self.store.discard(self.request())
+        finally:
+            (self.root / "ns").chmod(0o700)
+        self.assertIsNotNone(outcome)
+        self.assertTrue((self.root / "ns" / "cache").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -198,16 +198,24 @@ class CleanupHold:
         self.unmark = lambda: None
         self._hold(group, "previous broker run's cleanup was unconfirmed", process=None)
 
-    def until_done(self, what: str, action: Callable[[], bool]) -> None:
-        """Retry `action` (True when finished) once a second until it works or
-        the broker stops, so the job is not failed with the step undone."""
-        while not (self._try_bool(action)):
+    def until_done(
+        self, what: str, action: Callable[[], str | None], *, entry: str = ""
+    ) -> None:
+        """Retry `action` (None when finished, else the reason it is not) once
+        a second until it works or the broker stops, so the job is not failed
+        with the step undone.  Logs when it starts and about every 60 s."""
+        last_log: float | None = None
+        while True:
+            try:
+                reason = action()
+            except Exception as exc:
+                reason = f"{type(exc).__name__}: {exc}"
+            if reason is None:
+                return
+            now = self.clock()
+            if last_log is None or now - last_log >= HOLD_LOG_INTERVAL_SECONDS:
+                self._log(phase=what, entry=entry, reason=reason)
+                last_log = now
             if self._stopped():
                 self._raise_unconfirmed(None, f"{what} was not finished")
             self.sleep(HOLD_INTERVAL_SECONDS)
-
-    def _try_bool(self, action: Callable[[], bool]) -> bool:
-        try:
-            return bool(action())
-        except Exception:
-            return False
