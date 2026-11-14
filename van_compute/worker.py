@@ -77,8 +77,8 @@ PROCESS_TABLE_BLIND_LIMIT = 180.0
 PROCESS_TABLE_RETRY_MAX = 30.0
 _PROCESS_TABLE_LOCK = threading.Lock()
 _PROCESS_TABLE_SAMPLED_AT = 0.0
-# Monotonic time the current run of timeouts went blind (the last good sample,
-# or the first failed probe when none exists); None while probes succeed.
+# Monotonic start of the first timed-out probe in the current outage; None
+# while probes succeed.
 _PROCESS_TABLE_BLIND_SINCE: float | None = None
 _PROCESS_TABLE_TIMEOUTS = 0
 _PROCESS_TABLE_RETRY_AT = 0.0
@@ -951,11 +951,9 @@ def process_group_resources(group_id: int) -> tuple[int, int]:
             except subprocess.TimeoutExpired as exc:
                 failed_at = time.monotonic()
                 if _PROCESS_TABLE_BLIND_SINCE is None:
-                    _PROCESS_TABLE_BLIND_SINCE = (
-                        _PROCESS_TABLE_SAMPLED_AT
-                        if _PROCESS_TABLE_SAMPLED_AT > 0
-                        else now
-                    )
+                    # The outage starts with this probe, not the last good
+                    # sample: an idle worker may not have sampled for hours.
+                    _PROCESS_TABLE_BLIND_SINCE = now
                 _PROCESS_TABLE_TIMEOUTS += 1
                 _PROCESS_TABLE_RETRY_AT = failed_at + min(
                     PROCESS_TABLE_RETRY_MAX,

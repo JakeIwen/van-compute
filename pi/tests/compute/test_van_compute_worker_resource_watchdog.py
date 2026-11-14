@@ -109,21 +109,28 @@ class ResourceWatchdogPsTimeoutTests(unittest.TestCase):
         # Exponential backoff keeps a loaded Mac from running ps every second.
         self.assertLess(probes, 15)
 
-    def test_backoff_caps_at_retry_max(self):
+    def test_backoff_doubles_then_caps_at_retry_max(self):
         self.sample(["101 100\n"])
+        self.at_age(1)
+        delays = []
         for _ in range(8):
-            self.sample([SLOW_PS])
-            self.clock[0] = worker._PROCESS_TABLE_RETRY_AT
-        self.assertLessEqual(
-            worker._PROCESS_TABLE_RETRY_AT - self.clock[0], worker.PROCESS_TABLE_RETRY_MAX
-        )
-        self.clock[0] -= 1
-        self.assertEqual(self.sample([])[1], 0)
+            self.assertEqual(self.sample([SLOW_PS])[1], 1)
+            delays.append(worker._PROCESS_TABLE_RETRY_AT - self.clock[0])
+            self.clock[0] = worker._PROCESS_TABLE_RETRY_AT - 0.5
+            self.assertEqual(self.sample([])[1], 0)  # still backing off
+            self.clock[0] += 0.5
+        self.assertEqual(delays, [1, 2, 4, 8, 16, 30, 30, 30])
+
+    def test_idle_gap_before_an_outage_does_not_count_as_blind(self):
+        self.sample(["101 100\n"])
+        self.at_age(3600)  # the worker sat idle for an hour
+        self.assertEqual(self.sample([SLOW_PS], group_id=202), ((0, 0), 1))
+        self.assertEqual(worker._PROCESS_TABLE_BLIND_SINCE, 1000.0 + 3600)
 
     def test_waiting_callers_share_a_failed_probe(self):
         self.sample(["101 100\n"])
-        self.at_age(worker.PROCESS_TABLE_BLIND_LIMIT - 2)
-        worker._PROCESS_TABLE_BLIND_SINCE = 1000.0
+        self.at_age(10)
+        worker._PROCESS_TABLE_BLIND_SINCE = 10.0 + 1000.0 - worker.PROCESS_TABLE_BLIND_LIMIT + 2
         worker._PROCESS_TABLE_TIMEOUTS = 4
         with self.assertRaisesRegex(worker.WorkerError, "could not run ps"):
             self.sample([SLOW_PS])

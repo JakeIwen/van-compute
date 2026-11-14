@@ -774,8 +774,14 @@ fixtures must remain byte-identical.
    table (an unseen group, or a first sample, reads as empty), and after each
    timeout every slot shares that outcome without probing until a backoff of
    1, 2, 4 ... seconds, capped at 30, expires. Jobs fail with exit 125 only
-   once 180 seconds pass with no fresh table, so RSS and process limits go
-   unenforced for at most that long while `ps` is stalled. A nonzero `ps`
+   once 180 seconds pass from the first timed-out probe without a fresh table
+   (idle time before the outage does not count). A probe that starts just
+   before that boundary holds the lock for its 5-second timeout, so RSS and
+   process limits can go unenforced for about 185 seconds plus scheduling
+   delay while `ps` is stalled, and a group first seen during the outage is
+   unmonitored throughout: Darwin address-space limits are best-effort and no
+   process-count rlimit backs the watchdog, so a runaway job can strain the
+   Mac in that window. That availability tradeoff is deliberate. A nonzero `ps`
    exit or an OSError still fails the job at once. A 15-second tolerance still
    killed healthy suites on a busy Mac (Time Machine plus several agent
    sessions). Exit 125 with `resource_monitor_error` set in `execution.json`
