@@ -108,19 +108,32 @@ quiet chain). The first stop cause latched wins:
   started.
 - Any exception while waiting on a child (or while cleaning up after it) must
   end with the job's process group confirmed gone before the cache lock is
-  released or the work directory removed. If it cannot be confirmed, the
-  broker holds both: it SIGKILLs the group and rechecks about once a second,
-  logging a `cleanup-hold` JSON line when the hold starts and about every 60 s.
-  The running manifest carries a `cleanup_unconfirmed` marker (and a
-  `cleanup-unconfirmed` attempt-history entry) for the duration; the hold ends
-  when the group is gone (marker cleared, the original error then takes the
-  normal failure path) or when the broker is told to stop, which raises
-  `TerminationUnconfirmed` and publishes and requeues nothing. Releasing at
-  that point is deliberate: `KillMode=control-group` kills the unit's whole
-  cgroup and a restarted broker cannot start until it is empty. There is no
-  timeout-based release. A restarted broker that finds a running Pi-local job
-  with the marker fails it (not re-executed) instead of resuming it, so a
-  persistent fault cannot loop under `Restart=always`.
+  released or the work directory removed. Cleanup never makes a blocking wait:
+  it SIGKILLs the group and polls non-blockingly for about a second, then
+  holds: it keeps re-killing and checking about once a second, logging a
+  `cleanup-hold` JSON line when the hold starts and about every 60 s (every
+  log call is best-effort and cannot end the hold). Once the hold starts, the
+  running manifest carries `cleanup_unconfirmed`, `cleanup_group` and
+  `cleanup_boot_id` (and a `cleanup-unconfirmed` attempt-history entry); the
+  write is retried every iteration. When the group is gone the marker is
+  cleared (retried until it is) and the original error takes the normal
+  failure or requeue path. If the broker is told to stop first (SIGTERM or
+  SIGINT; foreground `--once` installs the same handlers), the hold raises
+  `TerminationUnconfirmed` and publishes and requeues nothing. A stop exit does
+  not prove the group is gone: systemd only logs "Processes still around after
+  SIGKILL" for uninterruptible descendants and may restart the unit, and a
+  foreground `--once` run has no cgroup containment at all.
+- So a marked running job is handled before any health gate or new claim. On
+  the same boot (`cleanup_boot_id` matches `/proc/sys/kernel/random/boot_id`)
+  while `cleanup_group` still has members, the broker holds that group the
+  same way and claims nothing else. It then discards the job's task-cache
+  entry under the cache's exclusive lock (never holding the queue lock), so a
+  late write by a surviving process lands in unlinked files, and fails the job
+  without running it. A missing or different boot id means a reboot ended the
+  group, so the hold is skipped; the cache entry is still discarded. There is
+  no timeout-based release. Residual case: a marker that could not be written
+  (the queue write kept failing until the stop) leaves nothing for the next run
+  to find; the stop then logs that it could not write the marker.
 
 The guarantee is bounded, and covers only senders that take the lock (the
 `vonstar` unlock goes through `can_handoff.active_turn` and radar through

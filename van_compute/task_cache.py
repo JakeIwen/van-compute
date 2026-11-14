@@ -338,6 +338,15 @@ class TaskCacheStore:
             os.close(root_fd)
         return report
 
+    def discard(self, request: CacheRequest) -> bool:
+        """Delete one cache under its exclusive lock; True once it is gone.
+
+        A late write by a surviving process of a failed job can then only land
+        in unlinked files.  Takes the cache lock only (never the queue lock).
+        """
+        report = self.clear(request.namespace, request.name)
+        return not report["busy"] and not report["failed"]
+
     def caches(self) -> list[CacheInfo]:
         if not self.root.is_dir():
             return []

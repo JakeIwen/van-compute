@@ -42,9 +42,11 @@ from van_compute.config import BrokerConfig, MissedOffloadRecord
 from van_compute.can_activity import CanObserver
 from van_compute.job_requeue import requeue_running_job
 from van_compute.job_cleanup_marker import (
-    clear_cleanup_unconfirmed, mark_cleanup_unconfirmed,
+    clear_cleanup_unconfirmed, mark_cleanup_unconfirmed, read_boot_id,
 )
-from van_compute.pi_cleanup_hold import CleanupHold
+from van_compute.pi_cleanup_hold import (
+    CleanupHold, log_best_effort, stop_flag_signals,
+)
 from van_compute.pi_can_stop import CanStopped, StopLatch, requeue_after_can_stop
 from van_compute.pi_gate_flags import add_gate_arguments, validated_thresholds
 from van_compute.pi_health_monitor import HealthMonitor
@@ -1085,6 +1087,23 @@ def _supervise_child(
         raise
 
 
+def _cleanup_hold(root, job_id, lease_token, should_stop) -> CleanupHold:
+    return CleanupHold(
+        job=job_id,
+        group_exists=lambda group: _process_group_exists(group),
+        service_stopping=should_stop,
+        mark=lambda group: mark_cleanup_unconfirmed(
+            root, job_id, lease_token, worker=LOCAL_WORKER,
+            now=dt.datetime.now(dt.timezone.utc), group=group,
+            boot_id=read_boot_id(),
+        ),
+        unmark=lambda: clear_cleanup_unconfirmed(
+            root, job_id, lease_token, worker=LOCAL_WORKER
+        ),
+        unconfirmed_error=TerminationUnconfirmed,
+    )
+
+
 def _requeue_for_can(root, job_id, lease_token, stop, work):
     return requeue_after_can_stop(
         root,
@@ -1138,6 +1157,7 @@ def execute_claimed_job(
         None if args.task_cache_root is None
         else task_cache.TaskCacheStore(args.task_cache_root, args.task_cache_max_bytes)
     )
+    hold = _cleanup_hold(root, job_id, lease_token, should_stop)
     with tempfile.TemporaryDirectory(prefix=f"{job_id}-", dir=work_root) as temporary:
         work = Path(temporary)
         source_root = work / "source"
@@ -1146,6 +1166,15 @@ def execute_claimed_job(
         artifacts: dict[str, str] = {}
         try:
             if marked:
+                # Before anything else: hold the group a previous run left
+                # (same boot only), then discard the job's cache entry so a
+                # late write from a survivor lands in unlinked files.
+                hold.hold_previous_group(manifest, read_boot_id)
+                request = task_cache.request_for_manifest(manifest)
+                if cache_store is not None and request is not None:
+                    hold.until_done(
+                        "cache discard", lambda: cache_store.discard(request)
+                    )
                 raise BrokerError(
                     "cleanup was unconfirmed in a previous broker instance; "
                     "the job is not re-executed"
@@ -1213,19 +1242,6 @@ def execute_claimed_job(
             started = utc_now()
             started_monotonic = time.monotonic()
 
-            hold = CleanupHold(
-                job=job_id,
-                group_exists=lambda group: _process_group_exists(group),
-                service_stopping=should_stop,
-                mark=lambda: mark_cleanup_unconfirmed(
-                    root, job_id, lease_token, worker=LOCAL_WORKER,
-                    now=dt.datetime.now(dt.timezone.utc),
-                ),
-                unmark=lambda: clear_cleanup_unconfirmed(
-                    root, job_id, lease_token, worker=LOCAL_WORKER
-                ),
-                unconfirmed_error=TerminationUnconfirmed,
-            )
             # The cache stays locked until the child and its process group are reaped.
             with cache_scope:
                 if stop.clear_to_launch():
@@ -1416,6 +1432,33 @@ def _observe_and_pick_reader(monitor, health_reader):
     return monitor.snapshot
 
 
+def _gate_deferral(args, root, work_root, health_reader, recovered):
+    """The deferral result when the health gate or sandbox self-test says no."""
+    try:
+        assessment = assess_health(health_reader(), args.health_thresholds)
+    except (BrokerError, HealthProbeError) as exc:
+        return {"action": "deferred", "reason": f"health probe failed: {exc}"}
+    if not assessment.ok:
+        return {
+            "action": "deferred",
+            "reason": "Pi health gate",
+            "health": asdict(assessment),
+        }
+    sandbox_ok, sandbox_reason = bubblewrap_self_test(
+        args.bwrap,
+        args.python,
+        str(work_root),
+        str(root),
+    )
+    if not sandbox_ok:
+        return {
+            "action": "deferred",
+            "reason": f"sandbox self-test failed: {sandbox_reason}",
+            "recovered_jobs": recovered,
+        }
+    return None
+
+
 def run_once(
     args: BrokerConfig,
     *,
@@ -1449,28 +1492,14 @@ def run_once(
                 "remote_workers": [str(item.get("worker")) for item in remotes],
                 "recovered_jobs": recovered,
             }
-    try:
-        assessment = assess_health(health_reader(), args.health_thresholds)
-    except (BrokerError, HealthProbeError) as exc:
-        return {"action": "deferred", "reason": f"health probe failed: {exc}"}
-    if not assessment.ok:
-        return {
-            "action": "deferred",
-            "reason": "Pi health gate",
-            "health": asdict(assessment),
-        }
-    sandbox_ok, sandbox_reason = bubblewrap_self_test(
-        args.bwrap,
-        args.python,
-        str(work_root),
-        str(root),
-    )
-    if not sandbox_ok:
-        return {
-            "action": "deferred",
-            "reason": f"sandbox self-test failed: {sandbox_reason}",
-            "recovered_jobs": recovered,
-        }
+    # A marked job (cleanup unconfirmed) is handled before any gate or new
+    # claim, so a deferral can never leave its group unattended.
+    if running is None or not running.get("cleanup_unconfirmed"):
+        deferral = _gate_deferral(
+            args, root, work_root, health_reader, recovered
+        )
+        if deferral is not None:
+            return deferral
     manifest, reason = claim_local_job(
         root,
         grace_seconds=args.remote_grace,
@@ -1674,8 +1703,7 @@ def serve(args: BrokerConfig, monitor: HealthMonitor) -> None:
             result = run_once(args, should_stop=lambda: stopping, monitor=monitor)
         except TerminationUnconfirmed as exc:
             # Only raised when the stop flag ended a cleanup hold: a clean exit.
-            print(json.dumps({"action": "cleanup-hold", "reason": str(exc)}),
-                  flush=True)
+            log_best_effort({"action": "cleanup-hold", "reason": str(exc)})
             break
         rendered = json.dumps(result, sort_keys=True)
         if (
@@ -1725,7 +1753,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif config.once:
                 waited = monitor.wait_for_quiet(config.can_quiet_seconds)
                 if waited.quiet:
-                    result = run_once(config, monitor=monitor)
+                    # Stop signals set a flag (as under serve) so a Ctrl-C during
+                    # a cleanup hold ends it cleanly instead of unwinding.
+                    with stop_flag_signals() as stopping:
+                        result = run_once(
+                            config, monitor=monitor, should_stop=stopping
+                        )
                 else:
                     # The wait ended on a lock or probe failure; observing again
                     # inside run_once could see a transient quiet and run anyway.
@@ -1745,7 +1778,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         protocol.ProtocolError,
         OSError,
     ) as exc:
-        print(f"van-compute-broker: {exc}", file=sys.stderr)
+        try:
+            print(f"van-compute-broker: {exc}", file=sys.stderr)
+        except Exception:  # best-effort: the exit code carries the failure
+            pass
         return 2
 
 
