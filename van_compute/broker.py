@@ -39,14 +39,12 @@ from typing import Callable, Mapping, Sequence
 
 from van_compute import engine, limited_child, queue, task_cache
 from van_compute.config import BrokerConfig, MissedOffloadRecord
-from van_compute.can_activity import CanObserver, CanProbe
+from van_compute.can_activity import CanObserver
 from van_compute.job_requeue import requeue_running_job
-from van_compute.job_cleanup_marker import (
-    clear_cleanup_unconfirmed, mark_cleanup_unconfirmed, read_boot_id,
-)
-from van_compute.pi_cleanup_hold import (
-    CleanupHold, log_best_effort, stop_flag_signals,
-)
+from van_compute.job_cleanup_marker import read_boot_id
+from van_compute import pi_marked_recovery
+from van_compute.pi_cleanup_hold import CleanupHold, log_best_effort
+from van_compute.pi_once import run_once_command
 from van_compute.pi_can_stop import CanStopped, StopLatch, requeue_after_can_stop
 from van_compute.pi_gate_flags import add_gate_arguments, validated_thresholds
 from van_compute.pi_health_monitor import HealthMonitor
@@ -58,6 +56,7 @@ from van_compute.pi_health import (
     _read_temperature,
     _read_throttled,
     assess_health,
+    gate_deferral,
     read_health_snapshot,
 )
 
@@ -103,7 +102,9 @@ class BrokerError(RuntimeError):
 
 class TerminationUnconfirmed(BrokerError):
     """The broker was stopped while a job's process group could not be confirmed
-    gone; nothing may be published, uploaded or requeued from its directories."""
+    gone; nothing may be published, uploaded or requeued from its directories.
+    The manifest's cleanup marker makes a restarted broker fail the job instead
+    of re-running it."""
 
 
 @dataclass(frozen=True)
@@ -1087,39 +1088,17 @@ def _supervise_child(
         raise
 
 
-def _cleanup_hold(root, job_id, lease_token, should_stop) -> CleanupHold:
-    return CleanupHold(
-        job=job_id,
+def _recovery_tools() -> pi_marked_recovery.RecoveryTools:
+    return pi_marked_recovery.RecoveryTools(
+        hold_class=CleanupHold,
         group_exists=lambda group: _process_group_exists(group),
-        service_stopping=should_stop,
-        mark=lambda group: mark_cleanup_unconfirmed(
-            root, job_id, lease_token, worker=LOCAL_WORKER,
-            now=dt.datetime.now(dt.timezone.utc), group=group,
-            boot_id=read_boot_id(),
-        ),
-        unmark=lambda: clear_cleanup_unconfirmed(
-            root, job_id, lease_token, worker=LOCAL_WORKER
-        ),
+        read_boot_id=read_boot_id,
         unconfirmed_error=TerminationUnconfirmed,
+        error_type=BrokerError,
+        worker=LOCAL_WORKER,
+        local_eligibility=local_eligibility,
+        capacity_check=work_capacity_eligibility,
     )
-
-
-def _recover_marked_job(args, manifest, hold: CleanupHold, cache_store) -> None:
-    """Hold a previous run's group, discard the job's cache entry, then wait
-    (logged) for the staging space the failure's publication needs."""
-    hold.hold_previous_group(manifest, read_boot_id)
-    request = task_cache.request_for_manifest(manifest)
-    if cache_store is not None and request is not None:
-        hold.until_done(
-            "cache-discard",
-            lambda: cache_store.discard(request),
-            entry=f"{request.namespace}/{request.name}",
-        )
-    def space_reason() -> str | None:
-        ok, reason = work_capacity_eligibility(manifest, args)
-        return None if ok else reason
-
-    hold.until_done("failure-publication", space_reason)
 
 
 def _requeue_for_can(root, job_id, lease_token, stop, work):
@@ -1151,30 +1130,11 @@ def execute_claimed_job(
     if job_path.name != job_id or authoritative.get("id") != job_id:
         raise BrokerError("claimed manifest id does not match its running directory")
     manifest = authoritative
-    marked = bool(manifest.get("cleanup_unconfirmed"))
-    cache_store = (
-        None if args.task_cache_root is None
-        else task_cache.TaskCacheStore(args.task_cache_root, args.task_cache_max_bytes)
+    marked, cache_store, hold = pi_marked_recovery.prepare_claim(
+        _recovery_tools(), args, root, manifest, job_id, lease_token, should_stop
     )
-    hold = _cleanup_hold(root, job_id, lease_token, should_stop)
-    if marked:
-        # Before every eligibility, capacity and staging step: killing the old
-        # group and discarding its cache entry must not depend on disk space or
-        # on anything else that could make this job fail early and repeat.
-        _recover_marked_job(args, manifest, hold, cache_store)
-    else:
-        eligible, reason = local_eligibility(manifest)
-        if not eligible:
-            raise BrokerError(reason)
-        if manifest.get("placement") != "pi-local":
-            raise BrokerError("local job is missing pi-local placement metadata")
-        capacity_ok, capacity_reason = work_capacity_eligibility(manifest, args)
-        if not capacity_ok:
-            raise BrokerError(capacity_reason)
     stop = StopLatch(
-        should_stop,
-        observe_can,
-        quiet_seconds=quiet_seconds,
+        should_stop, observe_can, quiet_seconds=quiet_seconds,
         required_quiet_seconds=args.health_thresholds.can_quiet_seconds,
     )
     # A marked job fails below instead of requeueing, so it is never run again.
@@ -1190,10 +1150,7 @@ def execute_claimed_job(
         artifacts: dict[str, str] = {}
         try:
             if marked:
-                raise BrokerError(
-                    "cleanup was unconfirmed in a previous broker instance; "
-                    "the job is not re-executed"
-                )
+                raise BrokerError(pi_marked_recovery.MARKED_JOB_MESSAGE)
             source_preparation_started = time.monotonic()
             _copy_sources(job_path, manifest, source_root)
             source_preparation_seconds = time.monotonic() - source_preparation_started
@@ -1360,10 +1317,7 @@ def execute_claimed_job(
             )
         except CanStopped:
             pass
-        except TerminationUnconfirmed:
-            # Stopped while descendants may still be alive: publish nothing and
-            # requeue nothing.  The manifest's cleanup marker makes a restarted
-            # broker fail the job instead of re-running it.
+        except TerminationUnconfirmed:  # nothing published or requeued; marker set
             raise
         except Exception as exc:
             exit_code, execution = _failure_results(result_root, manifest, exc)
@@ -1447,33 +1401,6 @@ def _observe_and_pick_reader(monitor, health_reader):
     return monitor.snapshot
 
 
-def _gate_deferral(args, root, work_root, health_reader, recovered):
-    """The deferral result when the health gate or sandbox self-test says no."""
-    try:
-        assessment = assess_health(health_reader(), args.health_thresholds)
-    except (BrokerError, HealthProbeError) as exc:
-        return {"action": "deferred", "reason": f"health probe failed: {exc}"}
-    if not assessment.ok:
-        return {
-            "action": "deferred",
-            "reason": "Pi health gate",
-            "health": asdict(assessment),
-        }
-    sandbox_ok, sandbox_reason = bubblewrap_self_test(
-        args.bwrap,
-        args.python,
-        str(work_root),
-        str(root),
-    )
-    if not sandbox_ok:
-        return {
-            "action": "deferred",
-            "reason": f"sandbox self-test failed: {sandbox_reason}",
-            "recovered_jobs": recovered,
-        }
-    return None
-
-
 def run_once(
     args: BrokerConfig,
     *,
@@ -1510,8 +1437,10 @@ def run_once(
     # A marked job (cleanup unconfirmed) is handled before any gate or new
     # claim, so a deferral can never leave its group unattended.
     if running is None or not running.get("cleanup_unconfirmed"):
-        deferral = _gate_deferral(
-            args, root, work_root, health_reader, recovered
+        deferral = gate_deferral(
+            args, root, work_root, health_reader, recovered,
+            sandbox_self_test=bubblewrap_self_test,
+            unreadable_errors=(BrokerError,),
         )
         if deferral is not None:
             return deferral
@@ -1766,27 +1695,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             if config.self_test:
                 print(json.dumps(run_self_test(config), indent=2, sort_keys=True))
             elif config.once:
-                running = _running_local_job(queue.safe_root(config.root))
-                if running is not None and running.get("cleanup_unconfirmed"):
-                    # Recovery of a marked job must not wait on, or defer for, CAN.
-                    waited = CanProbe(False, (), None)
-                else:
-                    waited = monitor.wait_for_quiet(config.can_quiet_seconds)
-                if waited.quiet:
-                    # Stop signals set a flag (as under serve) so a Ctrl-C during
-                    # a cleanup hold ends it cleanly instead of unwinding.
-                    with stop_flag_signals() as stopping:
-                        result = run_once(
-                            config, monitor=monitor, should_stop=stopping
-                        )
-                else:
-                    # The wait ended on a lock or probe failure; observing again
-                    # inside run_once could see a transient quiet and run anyway.
-                    result = {
-                        "action": "deferred",
-                        "reason": "CAN not quiet while waiting: "
-                        + (waited.error or ", ".join(waited.held_locks)),
-                    }
+                result = run_once_command(
+                    config, monitor, run_once=run_once,
+                    running_job=lambda: _running_local_job(
+                        queue.safe_root(config.root)
+                    ),
+                )
                 print(json.dumps(result, indent=2, sort_keys=True))
             else:
                 serve(config, monitor)

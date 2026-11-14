@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import os
 from pathlib import Path
 import subprocess
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from van_compute.config import HealthThresholds
 
@@ -172,3 +172,39 @@ def assess_health(
             f"current Raspberry Pi throttle flags are 0x{snapshot.throttled_flags:x}"
         )
     return HealthAssessment(not reasons, tuple(reasons), snapshot)
+
+
+def gate_deferral(
+    args,
+    root: Path,
+    work_root: Path,
+    health_reader: Callable[[], HealthSnapshot],
+    recovered: list[str],
+    *,
+    sandbox_self_test: Callable[..., tuple[bool, str]],
+    unreadable_errors: tuple[type[BaseException], ...],
+) -> dict[str, object] | None:
+    """The deferral result when the health gate or sandbox self-test says no."""
+    try:
+        assessment = assess_health(health_reader(), args.health_thresholds)
+    except (HealthProbeError, *unreadable_errors) as exc:
+        return {"action": "deferred", "reason": f"health probe failed: {exc}"}
+    if not assessment.ok:
+        return {
+            "action": "deferred",
+            "reason": "Pi health gate",
+            "health": asdict(assessment),
+        }
+    sandbox_ok, sandbox_reason = sandbox_self_test(
+        args.bwrap,
+        args.python,
+        str(work_root),
+        str(root),
+    )
+    if not sandbox_ok:
+        return {
+            "action": "deferred",
+            "reason": f"sandbox self-test failed: {sandbox_reason}",
+            "recovered_jobs": recovered,
+        }
+    return None
