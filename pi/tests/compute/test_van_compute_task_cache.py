@@ -374,9 +374,9 @@ class StoreTests(unittest.TestCase):
         with mock.patch.object(task_cache.os, "listdir", side_effect=listdir_then_delete):
             info = next(i for i in self.store.caches() if i.name == "live")
         self.assertIsNone(info.size_bytes)
-        self.assertEqual(
-            task_cache._measure(os.open(self.root / "ns", os.O_RDONLY), "missing", 0), 0
-        )
+        namespace_fd = os.open(self.root / "ns", os.O_RDONLY)
+        self.addCleanup(os.close, namespace_fd)
+        self.assertEqual(task_cache._measure(namespace_fd, "missing", 0), 0)
 
     def test_pi_default_cache_root_follows_the_selected_queue_root(self):
         parsed = broker.build_parser().parse_args(["--root", "/srv/queue"])
