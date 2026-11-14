@@ -858,14 +858,17 @@ fixtures must remain byte-identical.
    the engine.
 4. **Isolation:** Pi requires bwrap, `/job/...` mappings, dedicated runtime
    bindings, read-only source/input mounts and no network. Mac retains real
-   paths, its installed sandbox-exec profile and JOB_ROOT write scope. Legacy
+   paths, its installed sandbox-exec profile and JOB_ROOT write scope, and
+   sandboxed Mac jobs alone reach the package registries through the worker's
+   proxy. Legacy
    unsandboxed jobs and the explicit dynamic escape hatch remain unchanged.
    Process-group cleanup is not a container boundary: descendants that create
    another session can escape that cleanup, but still inherit the sandbox.
 5. **Environment/cwd:** Pi keeps Linux PATH, C.UTF-8, outer workspace cwd,
    inner source cwd, placement variables and pytest cache suppression. Mac
    keeps Homebrew PATH, en_US.UTF-8, source cwd and delayed
-   VAN_COMPUTE_CHILD_PYTHONPATH. The standalone limit helper remains
+   VAN_COMPUTE_CHILD_PYTHONPATH, plus HTTPS_PROXY/https_proxy while the
+   registry proxy runs. The standalone limit helper remains
    package-import-free; untrusted sitecustomize cannot run ahead of limits.
 6. **Limits:** Pi keeps 1800-second wall/1200-second CPU defaults, 768 MiB
    memory, hard-limit clamping and failure on limit refusal. Mac keeps
