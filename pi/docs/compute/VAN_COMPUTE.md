@@ -128,7 +128,9 @@ DNS, no UDP). Pi jobs still have no network, and an unsandboxed Mac worker
   buffered per direction, so a client that stops reading loses its slot at
   the deadline. Lookups run on a fixed pool of 4 daemon threads because
   `getaddrinfo` cannot be interrupted; a tunnel stops waiting at its deadline
-  or at `stop()` and a late answer is discarded. Each socket a tunnel opens
+  or at `stop()`, its queued lookup leaves the queue, and a late answer is
+  discarded. The queue holds at most 64 lookups (a full queue gets 503), so
+  stuck resolvers retain at most that plus one lookup per thread. Each socket a tunnel opens
   is closed on every exit path, and `stop()` closes any a stuck handler
   still holds. Each tunnel is logged to the worker log with host, bytes each
   way, duration and how it ended; refusals are logged with their reason.

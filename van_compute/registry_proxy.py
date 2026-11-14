@@ -82,8 +82,9 @@ class ProxyLimits:
     max_tunnels: int = 64
     head_timeout: float = 10.0
     resolve_timeout: float = 10.0
-    # A fixed pool: a stalled resolver can hold at most this many threads,
-    # and waiting lookups beyond it are bounded by max_tunnels.
+    # A fixed pool: a stalled resolver can hold at most this many threads.
+    # Queued lookups are capped at max_tunnels and leave the queue when their
+    # tunnel gives up, so stuck resolvers never accumulate work.
     resolver_threads: int = 4
     hello_timeout: float = 10.0
     # Shared by every vetted address of one tunnel, not per attempt.
@@ -400,7 +401,9 @@ class RegistryProxy:
         self.port = self._listeners[0].getsockname()[1]
         self._wake_reader, self._wake_writer = socket.socketpair()
         self._wake_reader.setblocking(False)
-        self._resolvers = ResolverPool(self._resolver, self._limits.resolver_threads)
+        self._resolvers = ResolverPool(
+            self._resolver, self._limits.resolver_threads, self._limits.max_tunnels
+        )
         self._accept_thread = threading.Thread(
             target=self._accept_loop, name="van-compute-registry-proxy", daemon=True
         )
@@ -438,6 +441,11 @@ class RegistryProxy:
                 item.close()
         if self._resolvers is not None:
             self._resolvers.close()
+
+    @property
+    def pending_lookups(self) -> int:
+        """Name lookups queued behind busy resolver threads."""
+        return 0 if self._resolvers is None else self._resolvers.pending
 
     def _accept_loop(self) -> None:
         selector = selectors.DefaultSelector()
@@ -566,6 +574,8 @@ class RegistryProxy:
         if self._resolvers is None:
             raise RuntimeError("registry proxy is not started")
         future = self._resolvers.submit(host, REGISTRY_PORT)
+        if future is None:
+            raise ProxyRefusal(503, "name lookup queue is full")
         try:
             while True:
                 remaining = deadline - time.monotonic()
@@ -578,7 +588,7 @@ class RegistryProxy:
                 except FutureTimeout:
                     continue
         finally:
-            future.cancel()  # a still-queued lookup never runs; a late one is discarded
+            self._resolvers.abandon(future)
 
     def _reply(self, client: socket.socket, status: int, deadline: float) -> None:
         try:

@@ -19,6 +19,7 @@ from pi.tests.compute.van_compute_test_fixtures import (
 )
 
 from van_compute import registry_proxy
+from van_compute.registry_resolver_pool import ResolverPool
 from van_compute.registry_proxy import (
     ProxyLimits, RegistryProxy, client_hello_record, resolve_public,
 )
@@ -176,6 +177,29 @@ def resolver_threads() -> int:
     return sum(
         thread.name == "van-compute-registry-resolver" for thread in threading.enumerate()
     )
+
+
+class ResolverPoolTests(unittest.TestCase):
+    def test_queue_is_bounded_and_abandoned_lookups_leave_it(self):
+        stalled = StalledResolver(443)
+        self.addCleanup(stalled.release.set)
+        pool = ResolverPool(stalled, threads=1, max_pending=2)
+        self.addCleanup(pool.close)
+        running = pool.submit("pypi.org", 443)
+        self.assertTrue(stalled.entered.wait(5))
+        first, second = pool.submit("pypi.org", 443), pool.submit("pypi.org", 443)
+        self.assertEqual(pool.pending, 2)
+        self.assertIsNone(pool.submit("pypi.org", 443))  # full: refused, not queued
+        pool.abandon(first)
+        self.assertEqual(pool.pending, 1)
+        self.assertTrue(first.cancelled())
+        pool.close()
+        self.assertEqual(pool.pending, 0)
+        self.assertTrue(second.cancelled())
+        self.assertIsNone(pool.submit("pypi.org", 443))
+        stalled.release.set()
+        self.assertEqual(running.result(5), [("127.0.0.1", 443)])
+        pool.abandon(running)  # abandoning a finished lookup is harmless
 
 
 @unittest.skipUnless(ipv6_loopback_available(), IPV6_LOOPBACK_SKIP)
@@ -522,6 +546,38 @@ class RegistryProxyTests(unittest.TestCase):
         stalled.release.set()
         time.sleep(0.2)
         self.assertEqual(self.upstream.accepted, 0)  # the late answer was discarded
+
+    def test_stuck_resolvers_never_accumulate_abandoned_lookups(self):
+        stalled = StalledResolver(self.upstream.port)
+        self.addCleanup(stalled.release.set)
+        proxy = RegistryProxy(
+            resolver=stalled,
+            limits=ProxyLimits(max_tunnels=2, resolve_timeout=0.01, resolver_threads=1),
+            log=self.log.append,
+        )
+        proxy.start()
+        self.addCleanup(proxy.stop)
+        started = time.monotonic()
+        for attempt in range(120):
+            request_started = time.monotonic()
+            with socket.create_connection(("127.0.0.1", proxy.port), timeout=5) as client:
+                client.sendall(b"CONNECT pypi.org:443 HTTP/1.1\r\n\r\n")
+                status = read_status(client)
+            self.assertEqual(status, b"HTTP/1.1 504 Gateway Timeout", attempt)
+            self.assertLess(time.monotonic() - request_started, 1.0, attempt)
+            self.assertLessEqual(proxy.pending_lookups, 2, attempt)
+        self.assertLess(time.monotonic() - started, 30.0)
+        self.assertTrue(stalled.entered.is_set())
+        stopped = time.monotonic()
+        proxy.stop()
+        self.assertLess(time.monotonic() - stopped, 2.0)
+        self.assertEqual(proxy.pending_lookups, 0)
+        stalled.release.set()
+        deadline = time.monotonic() + 5
+        while resolver_threads() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(resolver_threads(), 0)
+        self.assertEqual(self.upstream.accepted, 0)
 
     def test_stop_abandons_a_stalled_lookup(self):
         stalled = StalledResolver(self.upstream.port)
