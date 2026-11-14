@@ -23,16 +23,20 @@ other service can hold the granted port in either family.
 
 from __future__ import annotations
 
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
 import ipaddress
+import queue
 import selectors
 import socket
 import sys
 import threading
 import time
 from typing import Callable, Iterator, Sequence
+
+from van_compute.registry_relay import relay
 
 REGISTRY_HOSTS = frozenset(
     {"pypi.org", "files.pythonhosted.org", "registry.npmjs.org"}
@@ -55,8 +59,9 @@ REFUSED_TLS_EXTENSIONS = {
 }
 BIND_ATTEMPTS = 16
 LISTEN_BACKLOG = 128
-RELAY_CHUNK_BYTES = 64 * 1024
 STOP_JOIN_SECONDS = 5.0
+# How often a handler waiting on a lookup rechecks for shutdown.
+RESOLVE_POLL_SECONDS = 0.05
 STATUS_REASONS = {
     200: "Connection Established",
     400: "Bad Request",
@@ -66,6 +71,7 @@ STATUS_REASONS = {
     431: "Request Header Fields Too Large",
     502: "Bad Gateway",
     503: "Service Unavailable",
+    504: "Gateway Timeout",
 }
 
 Resolver = Callable[[str, int], Sequence[tuple[str, int]]]
@@ -76,7 +82,12 @@ AddressLookup = Callable[..., Sequence[tuple]]
 class ProxyLimits:
     max_tunnels: int = 64
     head_timeout: float = 10.0
+    resolve_timeout: float = 10.0
+    # A fixed pool: a stalled resolver can hold at most this many threads,
+    # and waiting lookups beyond it are bounded by max_tunnels.
+    resolver_threads: int = 4
     hello_timeout: float = 10.0
+    # Shared by every vetted address of one tunnel, not per attempt.
     connect_timeout: float = 10.0
     # No bytes in either direction for this long ends a tunnel; clients
     # reconnect pooled keep-alive connections.
@@ -347,6 +358,51 @@ def bind_dual_stack() -> list[socket.socket]:
     )
 
 
+class ResolverPool:
+    """Run name lookups on a fixed set of daemon threads.
+
+    ``getaddrinfo`` cannot be interrupted, so callers wait on a Future with a
+    deadline and walk away; a late answer lands in an abandoned Future and is
+    discarded. Daemon threads keep a lookup that never returns from blocking
+    worker exit.
+    """
+
+    def __init__(self, resolver: Resolver, threads: int) -> None:
+        self._resolver = resolver
+        self._jobs: "queue.Queue[tuple[Future, str, int] | None]" = queue.Queue()
+        self._threads = [
+            threading.Thread(
+                target=self._work, name="van-compute-registry-resolver", daemon=True
+            )
+            for _ in range(threads)
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def submit(self, host: str, port: int) -> Future:
+        future: Future = Future()
+        self._jobs.put((future, host, port))
+        return future
+
+    def close(self) -> None:
+        for _thread in self._threads:
+            self._jobs.put(None)
+
+    def _work(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            future, host, port = job
+            # False once a caller gave up and cancelled it while queued.
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(self._resolver(host, port))
+            except BaseException as exc:  # handed to the waiting caller
+                future.set_exception(exc)
+
+
 class RegistryProxy:
     """Threaded CONNECT proxy; ``start()`` binds, ``stop()`` closes everything."""
 
@@ -356,8 +412,12 @@ class RegistryProxy:
         resolver: Resolver = resolve_public,
         limits: ProxyLimits = ProxyLimits(),
         log: Callable[[str], None] = _default_log,
+        socket_factory: Callable[[int, int], socket.socket] = socket.socket,
     ) -> None:
         self._resolver = resolver
+        # Upstream sockets come from here so tests can substitute ones whose
+        # connect stalls; nothing else uses it.
+        self._socket_factory = socket_factory
         self._limits = limits
         self._log = log
         self._slots = threading.BoundedSemaphore(limits.max_tunnels)
@@ -369,6 +429,7 @@ class RegistryProxy:
         self._wake_reader: socket.socket | None = None
         self._wake_writer: socket.socket | None = None
         self._stopping = threading.Event()
+        self._resolvers: ResolverPool | None = None
         self.port: int | None = None
 
     def __enter__(self) -> "RegistryProxy":
@@ -385,6 +446,7 @@ class RegistryProxy:
         self.port = self._listeners[0].getsockname()[1]
         self._wake_reader, self._wake_writer = socket.socketpair()
         self._wake_reader.setblocking(False)
+        self._resolvers = ResolverPool(self._resolver, self._limits.resolver_threads)
         self._accept_thread = threading.Thread(
             target=self._accept_loop, name="van-compute-registry-proxy", daemon=True
         )
@@ -412,9 +474,16 @@ class RegistryProxy:
         deadline = time.monotonic() + STOP_JOIN_SECONDS
         for handler in handlers:
             handler.join(max(0.0, deadline - time.monotonic()))
-        for item in (*self._listeners, self._wake_reader, self._wake_writer):
+        # Handlers close what they own; this catches any still stuck after
+        # the join, so stop() never leaves a descriptor open.
+        with self._lock:
+            leftover = list(self._active)
+            self._active.clear()
+        for item in (*leftover, *self._listeners, self._wake_reader, self._wake_writer):
             if item is not None:
                 item.close()
+        if self._resolvers is not None:
+            self._resolvers.close()
 
     def _accept_loop(self) -> None:
         selector = selectors.DefaultSelector()
@@ -487,49 +556,79 @@ class RegistryProxy:
                 self._handlers.discard(handler)
 
     def _serve_admitted(self, client: socket.socket) -> None:
-        upstream: socket.socket | None = None
+        # Every socket this tunnel opens joins ``owned`` the moment it exists,
+        # so each exit path, an exception included, closes it here.
+        owned = [client]
         try:
-            upstream = self._handle(client)
+            self._handle(client, owned)
         except Exception as exc:  # one bad tunnel never reaches the worker
             self._log(f"tunnel error: {type(exc).__name__}: {exc}")
         finally:
-            self._forget([client, upstream], threading.current_thread())
-            for item in (client, upstream):
-                if item is not None:
-                    item.close()
+            self._forget(owned, threading.current_thread())
+            for item in owned:
+                item.close()
             self._slots.release()
 
-    def _handle(self, client: socket.socket) -> socket.socket | None:
+    def _handle(self, client: socket.socket, owned: list[socket.socket]) -> None:
         started = time.monotonic()
+        # One absolute deadline caps every phase; phase timeouts only shorten it.
+        lifetime_ends = started + self._limits.max_lifetime
         try:
-            head, early = self._read_head(client)
+            head, early = self._read_head(client, lifetime_ends)
             host = parse_connect_head(head)
-            addresses = self._resolver(host, REGISTRY_PORT)
+            addresses = self._resolve(host, min(
+                lifetime_ends, time.monotonic() + self._limits.resolve_timeout
+            ))
         except ProxyRefusal as refusal:
-            self._reply(client, refusal.status)
+            self._reply(client, refusal.status, lifetime_ends)
             self._log(f"refused {refusal.status}: {refusal.reason}")
-            return None
+            return
+        client.settimeout(max(0.001, lifetime_ends - time.monotonic()))
         client.sendall(_status_reply(200))
         try:
-            hello = self._read_hello(client, early)
+            hello = self._read_hello(client, early, lifetime_ends)
             server_name = client_hello_server_name(hello)
             if server_name != host:
                 raise ProxyRefusal(0, f"SNI {server_name[:80]!r} does not match {host}")
         except ProxyRefusal as refusal:
             self._log(f"closed {host}: {refusal.reason}")
-            return None
-        upstream = self._connect_upstream(host, addresses)
+            return
+        upstream = self._connect_upstream(host, addresses, owned, min(
+            lifetime_ends, time.monotonic() + self._limits.connect_timeout
+        ))
         if upstream is None:
-            return None
-        sent, received, ending = self._relay(client, upstream, hello, started)
-        self._log(
-            f"tunnel host={host} sent={sent} received={received} "
-            f"seconds={time.monotonic() - started:.1f} end={ending}"
+            return
+        outcome = relay(
+            client, upstream, hello, deadline=lifetime_ends,
+            idle_timeout=self._limits.idle_timeout, stopping=self._stopping,
         )
-        return upstream
+        self._log(
+            f"tunnel host={host} sent={outcome.sent} received={outcome.received} "
+            f"seconds={time.monotonic() - started:.1f} end={outcome.ending}"
+        )
 
-    def _reply(self, client: socket.socket, status: int) -> None:
+    def _resolve(self, host: str, deadline: float) -> Sequence[tuple[str, int]]:
+        """Wait for a pooled lookup until ``deadline`` or shutdown, then give up."""
+        if self._resolvers is None:
+            raise RuntimeError("registry proxy is not started")
+        future = self._resolvers.submit(host, REGISTRY_PORT)
         try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if self._stopping.is_set():
+                    raise ProxyRefusal(503, "proxy stopping")
+                if remaining <= 0:
+                    raise ProxyRefusal(504, f"resolving {host} timed out")
+                try:
+                    return future.result(min(remaining, RESOLVE_POLL_SECONDS))
+                except FutureTimeout:
+                    continue
+        finally:
+            future.cancel()  # a still-queued lookup never runs; a late one is discarded
+
+    def _reply(self, client: socket.socket, status: int, deadline: float) -> None:
+        try:
+            client.settimeout(max(0.001, deadline - time.monotonic()))
             client.sendall(_status_reply(status))
         except OSError:
             pass
@@ -558,16 +657,20 @@ class RegistryProxy:
             buffer += chunk
         return buffer
 
-    def _read_head(self, client: socket.socket) -> tuple[bytes, bytes]:
-        deadline = time.monotonic() + self._limits.head_timeout
+    def _read_head(
+        self, client: socket.socket, lifetime_ends: float
+    ) -> tuple[bytes, bytes]:
+        deadline = min(lifetime_ends, time.monotonic() + self._limits.head_timeout)
         buffer = self._read_until(
             client, b"", deadline, lambda data: b"\r\n\r\n" in data, MAX_HEAD_BYTES
         )
         head, _separator, early = buffer.partition(b"\r\n\r\n")
         return head, early
 
-    def _read_hello(self, client: socket.socket, early: bytes) -> bytes:
-        deadline = time.monotonic() + self._limits.hello_timeout
+    def _read_hello(
+        self, client: socket.socket, early: bytes, lifetime_ends: float
+    ) -> bytes:
+        deadline = min(lifetime_ends, time.monotonic() + self._limits.hello_timeout)
         limit = TLS_RECORD_HEADER_BYTES + MAX_TLS_RECORD_PAYLOAD
 
         def complete(data: bytes) -> bool:
@@ -579,80 +682,42 @@ class RegistryProxy:
         return self._read_until(client, early, deadline, complete, limit)
 
     def _connect_upstream(
-        self, host: str, addresses: Sequence[tuple[str, int]]
+        self,
+        host: str,
+        addresses: Sequence[tuple[str, int]],
+        owned: list[socket.socket],
+        deadline: float,
     ) -> socket.socket | None:
-        """Connect to the first vetted address that answers; never re-resolve."""
+        """Connect to the first vetted address that answers before ``deadline``;
+        never re-resolve. Each socket is owned by the tunnel as soon as it exists."""
         for address, port in addresses:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._log(f"upstream {host} connect deadline passed")
+                return None
             family = (
                 socket.AF_INET6
                 if ipaddress.ip_address(address).version == 6
                 else socket.AF_INET
             )
-            upstream = socket.socket(family, socket.SOCK_STREAM)
+            upstream = self._socket_factory(family, socket.SOCK_STREAM)
+            owned.append(upstream)
             # Registered under the lock stop() snapshots with, after the stop
             # flag check, so stop() always sees and shuts down this socket.
             with self._lock:
                 if self._stopping.is_set():
-                    upstream.close()
                     return None
                 self._active.add(upstream)
-            upstream.settimeout(self._limits.connect_timeout)
+            upstream.settimeout(remaining)
             try:
                 upstream.connect((address, port))
                 return upstream
             except OSError as exc:
                 self._log(f"upstream {host} {address} failed: {exc}")
                 self._forget([upstream])
+                owned.remove(upstream)
                 upstream.close()
         return None
-
-    def _relay(
-        self,
-        client: socket.socket,
-        upstream: socket.socket,
-        first: bytes,
-        started: float,
-    ) -> tuple[int, int, str]:
-        """Copy bytes both ways, honouring half-close, idle and lifetime limits."""
-        limits = self._limits
-        for side in (client, upstream):
-            side.settimeout(limits.idle_timeout)
-        upstream.sendall(first)
-        counts = {client: len(first), upstream: 0}
-        peers = {client: upstream, upstream: client}
-        lifetime_ends = started + limits.max_lifetime
-        idle_ends = time.monotonic() + limits.idle_timeout
-        selector = selectors.DefaultSelector()
-        try:
-            for side in peers:
-                selector.register(side, selectors.EVENT_READ)
-            while peers:
-                now = time.monotonic()
-                if self._stopping.is_set():
-                    return counts[client], counts[upstream], "proxy stopped"
-                if now >= lifetime_ends:
-                    return counts[client], counts[upstream], "lifetime limit"
-                if now >= idle_ends:
-                    return counts[client], counts[upstream], "idle timeout"
-                for key, _events in selector.select(min(lifetime_ends, idle_ends) - now):
-                    source = key.fileobj
-                    data = source.recv(RELAY_CHUNK_BYTES)
-                    if not data:
-                        selector.unregister(source)
-                        destination = peers.pop(source)
-                        try:
-                            destination.shutdown(socket.SHUT_WR)
-                        except OSError:
-                            pass
-                        continue
-                    peers[source].sendall(data)
-                    counts[source] += len(data)
-                    idle_ends = time.monotonic() + limits.idle_timeout
-            return counts[client], counts[upstream], "closed"
-        except OSError as exc:
-            return counts[client], counts[upstream], f"{type(exc).__name__}"
-        finally:
-            selector.close()
 
 
 @contextmanager

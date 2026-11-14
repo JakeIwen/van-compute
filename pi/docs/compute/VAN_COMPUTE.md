@@ -105,48 +105,55 @@ DNS, no UDP). Pi jobs still have no network, and an unsandboxed Mac worker
 (`--allow-unsandboxed-dynamic`) runs no proxy and keeps full network.
 
 - **Allowlist.** `CONNECT <host>:443` only, for `pypi.org`,
-    `files.pythonhosted.org` and `registry.npmjs.org` (`REGISTRY_HOSTS`, defined
-    once in that module). IP literals, other ports, trailing dots and plain-HTTP
-    or absolute-URI requests are refused. Adding a registry means editing that
-    set and reviewing the risk below.
+  `files.pythonhosted.org` and `registry.npmjs.org` (`REGISTRY_HOSTS`, defined
+  once in that module). IP literals, other ports, trailing dots and plain-HTTP
+  or absolute-URI requests are refused. Adding a registry means editing that
+  set and reviewing the risk below.
 - **Addresses.** The proxy resolves the name itself and refuses it if any
-    answer is not global unicast (private, loopback, link-local, CGNAT,
-    multicast, or an IPv6 form embedding one), so a poisoned or rebound name
-    cannot reach the LAN (router, Pi, UBNT) or loopback services. It connects to
-    the address it vetted and never re-resolves.
+  answer is not global unicast (private, loopback, link-local, CGNAT,
+  multicast, or an IPv6 form embedding one), so a poisoned or rebound name
+  cannot reach the LAN (router, Pi, UBNT) or loopback services. It connects to
+  the address it vetted and never re-resolves.
 - **SNI.** The registries share CDN addresses with other sites, so a tunnel
-    bounded by address alone could reach them. Before connecting upstream the
-    proxy reads the client's first TLS record and requires a ClientHello, whole
-    in that record, whose SNI equals the CONNECT host and that has no encrypted
-    ClientHello extension; it then forwards that record and relays opaquely.
+  bounded by address alone could reach them. Before connecting upstream the
+  proxy reads the client's first TLS record and requires a ClientHello, whole
+  in that record, whose SNI equals the CONNECT host and that has no encrypted
+  ClientHello extension; it then forwards that record and relays opaquely.
 - **Bounds.** At most 64 tunnels (excess connections get 503 and are closed
-    before any thread or lookup); 8 KiB request head; timeouts for the head and
-    ClientHello (10 s each), upstream connect (10 s), idle tunnels (120 s) and a
-    tunnel's whole life (1 hour). Each tunnel is logged to the worker log with
-    host, bytes each way, duration and how it ended; refusals are logged with
-    their reason.
+  before any thread or lookup); 8 KiB request head. Every phase has a
+  timeout: head and ClientHello (10 s each), name lookup (10 s, then 504),
+  upstream connect (10 s shared by all of a name's addresses), idle tunnels
+  (120 s). One absolute deadline, a tunnel's whole life (1 hour), caps all of
+  them, sends included: relaying is nonblocking with at most 256 KiB
+  buffered per direction, so a client that stops reading loses its slot at
+  the deadline. Lookups run on a fixed pool of 4 daemon threads because
+  `getaddrinfo` cannot be interrupted; a tunnel stops waiting at its deadline
+  or at `stop()` and a late answer is discarded. Each socket a tunnel opens
+  is closed on every exit path, and `stop()` closes any a stuck handler
+  still holds. Each tunnel is logged to the worker log with host, bytes each
+  way, duration and how it ended; refusals are logged with their reason.
 - **Lifecycle.** `main()` starts the proxy only with `--sandbox-profile`,
-    around both `--run-once` and the persistent scheduler, and stops it after
-    every job child is reaped, drain included. It holds the same port on
-    127.0.0.1 and ::1 (Seatbelt's `localhost` covers both), retrying a fresh
-    port if ::1 has it taken, so no other service can sit on the granted port.
-    A proxy that cannot bind fails worker startup. The port is threaded
-    explicitly through `WorkerConfig.registry_proxy_port` to the job; jobs get
-    `HTTPS_PROXY`/`https_proxy` (no `HTTP_PROXY`, no `NO_PROXY`) only then, and
-    the profile is never applied without a live port (`PROXY_PORT=0` would make
-    `sandbox-exec` fail). Children orphaned by a worker crash lose their network
-    when the next start picks a new port.
+  around both `--run-once` and the persistent scheduler, and stops it after
+  every job child is reaped, drain included. It holds the same port on
+  127.0.0.1 and ::1 (Seatbelt's `localhost` covers both), retrying a fresh
+  port if ::1 has it taken, so no other service can sit on the granted port.
+  A proxy that cannot bind fails worker startup. The port is threaded
+  explicitly through `WorkerConfig.registry_proxy_port` to the job; jobs get
+  `HTTPS_PROXY`/`https_proxy` (no `HTTP_PROXY`, no `NO_PROXY`) only then, and
+  the profile is never applied without a live port (`PROXY_PORT=0` would make
+  `sandbox-exec` fail). Children orphaned by a worker crash lose their network
+  when the next start picks a new port.
 - **Accepted risk.** No TLS interception: inside the tunnel a job can talk to
-    an allowed registry for any purpose, such as publishing with a token it
-    holds, and HTTP domain fronting inside the encrypted channel is refused only
-    by the CDNs' own SNI/Host matching.
+  an allowed registry for any purpose, such as publishing with a token it
+  holds, and HTTP domain fronting inside the encrypted channel is refused only
+  by the CDNs' own SNI/Host matching.
 - **Installer probe.** Offline: the installer runs the staged release's proxy
-    (staged venv Python, outside the sandbox) with every allowlisted name mapped
-    to a local echo server, and keeps it up for every sandbox check. Inside the
-    sandbox the probe tunnels through the proxy on 127.0.0.1 and ::1 with both
-    directions relayed, sees an unlisted host and port 80 refused, and gets
-    EPERM for TCP to another loopback port and to a public address and for UDP
-    to the proxy port. The echo server must see exactly the two good tunnels.
+  (staged venv Python, outside the sandbox) with every allowlisted name mapped
+  to a local echo server, and keeps it up for every sandbox check. Inside the
+  sandbox the probe tunnels through the proxy on 127.0.0.1 and ::1 with both
+  directions relayed, sees an unlisted host and port 80 refused, and gets
+  EPERM for TCP to another loopback port and to a public address and for UDP
+  to the proxy port. The echo server must see exactly the two good tunnels.
 
 ## Persistent task caches
 

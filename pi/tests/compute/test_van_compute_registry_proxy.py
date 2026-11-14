@@ -6,7 +6,9 @@ from contextlib import redirect_stderr
 import errno
 import functools
 import io
+import os
 import socket
+import struct
 import threading
 import time
 import unittest
@@ -105,6 +107,77 @@ def read_status(connection: socket.socket) -> bytes:
     return buffer.split(b"\r\n", 1)[0]
 
 
+class ResettingUpstream:
+    """Accepts and immediately resets, so the proxy's first write can fail."""
+
+    def __init__(self) -> None:
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.port = self.listener.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                connection, _peer = self.listener.accept()
+            except OSError:
+                return
+            connection.setsockopt(
+                socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+            )
+            connection.close()
+
+
+class FloodingUpstream:
+    """Reads the ClientHello, then writes as fast as the tunnel accepts."""
+
+    def __init__(self) -> None:
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.port = self.listener.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                connection, _peer = self.listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._flood, args=(connection,), daemon=True).start()
+
+    @staticmethod
+    def _flood(connection: socket.socket) -> None:
+        with connection:
+            try:
+                connection.recv(65536)
+                while True:
+                    connection.sendall(b"x" * 65536)
+            except OSError:
+                pass
+
+
+class StalledResolver:
+    """Blocks every lookup until released, as a hung getaddrinfo would."""
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, host, port):
+        self.entered.set()
+        self.release.wait(30)
+        return [("127.0.0.1", self.port)]
+
+
+def open_descriptors() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+def resolver_threads() -> int:
+    return sum(
+        thread.name == "van-compute-registry-resolver" for thread in threading.enumerate()
+    )
+
+
 @unittest.skipUnless(ipv6_loopback_available(), IPV6_LOOPBACK_SKIP)
 class RegistryProxyTests(unittest.TestCase):
     def setUp(self):
@@ -112,12 +185,13 @@ class RegistryProxyTests(unittest.TestCase):
         self.addCleanup(self.upstream.close)
         self.log: list[str] = []
 
-    def start_proxy(self, resolver=None, limits=FAST):
+    def start_proxy(self, resolver=None, limits=FAST, **options):
         upstream_port = self.upstream.port
         proxy = RegistryProxy(
             resolver=resolver or (lambda host, port: [("127.0.0.1", upstream_port)]),
             limits=limits,
             log=self.log.append,
+            **options,
         )
         proxy.start()
         self.addCleanup(proxy.stop)
@@ -380,6 +454,134 @@ class RegistryProxyTests(unittest.TestCase):
                 with self.assertRaises(OSError) as raised:
                     rival.bind((address, proxy.port))
                 self.assertEqual(raised.exception.errno, errno.EADDRINUSE)
+
+    def test_upstream_that_resets_leaves_no_descriptor_open(self):
+        resetting = ResettingUpstream()
+        self.addCleanup(resetting.listener.close)
+        before = open_descriptors()
+        proxy = RegistryProxy(
+            resolver=lambda host, _port: [("127.0.0.1", resetting.port)],
+            limits=FAST, log=self.log.append,
+        )
+        proxy.start()
+        for _attempt in range(5):
+            with socket.create_connection(("127.0.0.1", proxy.port), timeout=5) as client:
+                client.sendall(b"CONNECT pypi.org:443 HTTP/1.1\r\n\r\n")
+                self.assertEqual(read_status(client), b"HTTP/1.1 200 Connection Established")
+                client.sendall(client_hello_record("pypi.org"))
+                read_all(client)
+        proxy.stop()
+        self.assertLessEqual(open_descriptors(), before)
+
+    def test_failed_first_upstream_write_closes_the_upstream_socket(self):
+        # Deterministic form of the reset race: the first write always fails,
+        # with a socket error and with an unexpected exception.
+        for failure in (ConnectionResetError(54, "reset"), RuntimeError("boom")):
+            with self.subTest(failure=type(failure).__name__):
+                created = []
+
+                class FailingSocket(socket.socket):
+                    def send(self, *_args):
+                        raise failure
+
+                    sendall = send
+
+                def factory(family, kind):
+                    created.append(FailingSocket(family, kind))
+                    return created[-1]
+
+                before = open_descriptors()
+                proxy = RegistryProxy(
+                    resolver=lambda host, _port: [("127.0.0.1", self.upstream.port)],
+                    limits=FAST, log=self.log.append, socket_factory=factory,
+                )
+                proxy.start()
+                with socket.create_connection(("127.0.0.1", proxy.port), timeout=5) as client:
+                    client.sendall(b"CONNECT pypi.org:443 HTTP/1.1\r\n\r\n")
+                    self.assertEqual(read_status(client), b"HTTP/1.1 200 Connection Established")
+                    client.sendall(client_hello_record("pypi.org"))
+                    self.assertEqual(read_all(client), b"")
+                proxy.stop()
+                self.assertEqual([item.fileno() for item in created], [-1])
+                self.assertLessEqual(open_descriptors(), before)
+
+    def test_stalled_lookup_releases_its_slot_at_the_resolve_deadline(self):
+        stalled = StalledResolver(self.upstream.port)
+        self.addCleanup(stalled.release.set)
+        proxy = self.start_proxy(
+            resolver=stalled,
+            limits=ProxyLimits(max_tunnels=1, resolve_timeout=0.3, resolver_threads=1),
+        )
+        for _attempt in range(3):
+            started = time.monotonic()
+            _connection, status = self.request(proxy, "CONNECT pypi.org:443 HTTP/1.1")
+            # Admitted every time (never 503): the stalled lookup gave its slot back.
+            self.assertEqual(status, b"HTTP/1.1 504 Gateway Timeout")
+            self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(resolver_threads(), 1)
+        stalled.release.set()
+        time.sleep(0.2)
+        self.assertEqual(self.upstream.accepted, 0)  # the late answer was discarded
+
+    def test_stop_abandons_a_stalled_lookup(self):
+        stalled = StalledResolver(self.upstream.port)
+        self.addCleanup(stalled.release.set)
+        proxy = self.start_proxy(
+            resolver=stalled, limits=ProxyLimits(resolve_timeout=30.0)
+        )
+        connection = self.connect(proxy)
+        connection.sendall(b"CONNECT pypi.org:443 HTTP/1.1\r\n\r\n")
+        self.assertTrue(stalled.entered.wait(5))
+        started = time.monotonic()
+        proxy.stop()
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertIn(read_status(connection), (b"HTTP/1.1 503 Service Unavailable", b""))
+        stalled.release.set()
+        time.sleep(0.2)
+        self.assertEqual(self.upstream.accepted, 0)
+
+    def test_client_that_stops_reading_loses_its_slot_at_the_lifetime_limit(self):
+        flooding = FloodingUpstream()
+        self.addCleanup(flooding.listener.close)
+        proxy = self.start_proxy(
+            resolver=lambda host, _port: [("127.0.0.1", flooding.port)],
+            limits=ProxyLimits(max_tunnels=1, idle_timeout=5.0, max_lifetime=0.5),
+        )
+        stalled_reader = self.tunnel(proxy)
+        stalled_reader.sendall(client_hello_record("pypi.org"))
+        started = time.monotonic()
+        self.wait_for_log("end=lifetime limit", timeout=3.0)
+        self.assertLess(time.monotonic() - started, 2.0)
+        deadline = time.monotonic() + 3
+        while True:  # the slot is free again for the next client
+            connection, status = self.request(proxy, "CONNECT pypi.org:443 HTTP/1.1")
+            if status.startswith(b"HTTP/1.1 200") or time.monotonic() > deadline:
+                break
+            connection.close()
+            time.sleep(0.05)
+        self.assertEqual(status, b"HTTP/1.1 200 Connection Established")
+
+    def test_connect_attempts_share_one_deadline(self):
+        timeouts = []
+
+        class StallingSocket(socket.socket):
+            def connect(self, address):
+                timeouts.append(self.gettimeout())
+                time.sleep(self.gettimeout())
+                raise TimeoutError("timed out")
+
+        proxy = self.start_proxy(
+            resolver=lambda host, _port: [("127.0.0.1", 9), ("127.0.0.2", 9), ("::1", 9)],
+            limits=ProxyLimits(connect_timeout=0.6),
+            socket_factory=StallingSocket,
+        )
+        connection = self.tunnel(proxy)
+        connection.sendall(client_hello_record("pypi.org"))
+        started = time.monotonic()
+        self.assertEqual(read_all(connection), b"")
+        self.assertLess(time.monotonic() - started, 1.2)
+        self.assertLessEqual(sum(timeouts), 0.6 + 0.05)
+        self.wait_for_log("connect deadline passed")
 
     def test_child_environment_names_the_proxy_only_when_it_runs(self):
         self.assertEqual(registry_proxy.child_environment(None), {})

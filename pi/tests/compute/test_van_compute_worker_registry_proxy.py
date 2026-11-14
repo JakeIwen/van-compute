@@ -35,7 +35,7 @@ TUNNEL_JOB = """import json, os, socket, sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from registry_proxy import client_hello_record
+from van_compute.registry_proxy import client_hello_record
 
 proxy = urlsplit(os.environ["HTTPS_PROXY"])
 report = {"https_proxy": os.environ.get("https_proxy"), "no_proxy": "NO_PROXY" in os.environ}
@@ -272,7 +272,10 @@ class MacSandboxRegistryProxyTests(unittest.TestCase):
         source = self.base / "job" / "source"
         source.mkdir(parents=True)
         (source / "tunnel.py").write_text(TUNNEL_JOB, encoding="utf-8")
-        shutil.copy(REPO / "van_compute/registry_proxy.py", source / "registry_proxy.py")
+        shutil.copytree(
+            REPO / "van_compute", source / "van_compute",
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
         result = source.parent / "result"
         with mock.patch.object(worker, "process_group_resources", return_value=(0, 1)):
             exit_code, _execution = worker.execute_job(
