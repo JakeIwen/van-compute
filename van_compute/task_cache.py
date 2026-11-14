@@ -10,7 +10,8 @@ the job and becomes its ``XDG_CACHE_HOME``.  Layout under a host root::
 The lock file lives beside the cache directory, outside what the job can see
 or rename.  Jobs hold a shared flock for their whole run; initialization,
 eviction and ``clear`` need the exclusive flock, so a cache in use is never
-touched.  Caches are never trusted inputs: a job can leave anything in one,
+touched.  A flock on the namespace directory spans setup's exclusive-to-shared
+handoff, and eviction must win it too, so a cache cannot vanish in that gap.  Caches are never trusted inputs: a job can leave anything in one,
 and the store treats its contents as hostile (descriptor-relative, no-follow
 traversal everywhere below the root).
 """
@@ -41,6 +42,7 @@ PRUNE_LOCK_NAME = ".prune.lock"
 # A cache whose directory is swapped under a shared lock is retried after the
 # holders finish; this bounds how long a hostile job can keep others waiting.
 SETUP_ATTEMPTS = 5
+LOCK_CREATE_ATTEMPTS = 20
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
 _LOCK_FLAGS = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -192,19 +194,24 @@ class TaskCacheStore:
     def _acquire_shared(self, namespace_fd: int, request: CacheRequest) -> int:
         lock_name = request.name + LOCK_SUFFIX
         for _ in range(SETUP_ATTEMPTS):
-            lock_fd = os.open(
-                lock_name, _LOCK_FLAGS | os.O_CREAT, 0o600, dir_fd=namespace_fd
-            )
+            lock_fd = _open_lock_file(namespace_fd, lock_name)
             try:
+                # flock cannot downgrade EX to SH atomically, so the namespace
+                # lock (which eviction must also win) spans the handoff;
+                # otherwise a pruner can delete the cache in the gap.
+                fcntl.flock(namespace_fd, fcntl.LOCK_EX)
                 try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    _initialize_directory(namespace_fd, request.name)
-                    # Not an atomic downgrade: a pruner may slip in between,
-                    # which the re-check below turns into another attempt.
-                    fcntl.flock(lock_fd, fcntl.LOCK_SH)
-                except BlockingIOError:
-                    # Other jobs hold it shared, so it is already initialized.
-                    fcntl.flock(lock_fd, fcntl.LOCK_SH)
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        _initialize_directory(namespace_fd, request.name)
+                        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+                    except BlockingIOError:
+                        # Other jobs hold it shared, so it is already initialized.
+                        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+                finally:
+                    fcntl.flock(namespace_fd, fcntl.LOCK_UN)
+                # Still re-checked: a job holding it shared may have swapped
+                # its own cache directory for something else.
                 if _is_real_directory(namespace_fd, request.name):
                     return lock_fd
             except BaseException:
@@ -228,9 +235,7 @@ class TaskCacheStore:
             return PruneReport()
         root_fd = os.open(self.root, _DIR_FLAGS)
         try:
-            prune_fd = os.open(
-                PRUNE_LOCK_NAME, _LOCK_FLAGS | os.O_CREAT, 0o600, dir_fd=root_fd
-            )
+            prune_fd = _open_lock_file(root_fd, PRUNE_LOCK_NAME)
             try:
                 try:
                     fcntl.flock(prune_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -288,9 +293,12 @@ class TaskCacheStore:
         """
         namespace_fd = _open_child_directory(root_fd, namespace, create=False)
         try:
-            lock_fd = os.open(
-                name + LOCK_SUFFIX, _LOCK_FLAGS | os.O_CREAT, 0o600, dir_fd=namespace_fd
-            )
+            try:
+                # Held until namespace_fd closes; see _acquire_shared.
+                fcntl.flock(namespace_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return "busy"
+            lock_fd = _open_lock_file(namespace_fd, name + LOCK_SUFFIX)
             try:
                 try:
                     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -369,6 +377,27 @@ def _open_child_directory(parent_fd: int, name: str, *, create: bool) -> int:
         return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
     except OSError as exc:
         raise TaskCacheError(f"task cache namespace {name!r} is unusable: {exc}") from None
+
+
+def _open_lock_file(parent_fd: int, name: str) -> int:
+    """Open (creating if needed) a lock file under a directory descriptor.
+
+    macOS openat(O_CREAT) returns a spurious ENOENT to every loser when
+    several processes create the same missing file at once, although the
+    directory is intact.  Opening without O_CREAT first keeps the steady
+    state clear of that; the retry only runs while the file is first made.
+    """
+    for _ in range(LOCK_CREATE_ATTEMPTS):
+        try:
+            return os.open(name, _LOCK_FLAGS, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        try:
+            return os.open(name, _LOCK_FLAGS | os.O_CREAT, 0o600, dir_fd=parent_fd)
+        except FileNotFoundError:
+            continue
+    # Still missing: the directory really is gone, so let the error surface.
+    return os.open(name, _LOCK_FLAGS | os.O_CREAT, 0o600, dir_fd=parent_fd)
 
 
 def _is_real_directory(namespace_fd: int, name: str) -> bool:

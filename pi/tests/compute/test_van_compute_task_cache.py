@@ -132,6 +132,19 @@ for index in range(600):
 """
 
 
+FIRST_USE = """
+import sys, time
+from pathlib import Path
+from van_compute import task_cache
+root, start = sys.argv[1:3]
+store = task_cache.TaskCacheStore(Path(root), 0)
+while time.time() < float(start):
+    pass
+with store.use(task_cache.CacheRequest("ns", "shared")):
+    pass
+"""
+
+
 def run_python(code, *arguments):
     environment = {**os.environ, "PYTHONPATH": str(REPO)}
     return subprocess.Popen(
@@ -282,6 +295,17 @@ class StoreTests(unittest.TestCase):
         for process in (*hammers, pruner):
             _out, error = process.communicate(timeout=120)
             self.assertEqual(process.returncode, 0, error)
+
+    def test_simultaneous_first_use_of_a_new_cache(self):
+        # macOS openat(O_CREAT) fails the losers of a creation race with ENOENT.
+        for round_number in range(8):
+            root = self.root / f"round{round_number}"
+            start = str(time.time() + 0.5)
+            workers = [run_python(FIRST_USE, str(root), start) for _ in range(4)]
+            self.processes.extend(workers)
+            for process in workers:
+                _out, error = process.communicate(timeout=60)
+                self.assertEqual(process.returncode, 0, error)
 
     def test_command_line_lists_and_clears(self):
         self.fill("ns", "one", 1024, age=10)
