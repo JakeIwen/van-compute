@@ -6,8 +6,13 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import subprocess
+from typing import TYPE_CHECKING
 
 from van_compute.config import HealthThresholds
+
+if TYPE_CHECKING:
+    from van_compute.can_activity import CanProbe
+    from van_compute.pi_rates import Rates
 
 
 class HealthProbeError(RuntimeError):
@@ -17,12 +22,19 @@ class HealthProbeError(RuntimeError):
 @dataclass(frozen=True)
 class HealthSnapshot:
     memory_available_bytes: int
+    # Swap totals, used and load stay in the report only; they do not gate.
     swap_total_bytes: int
     swap_used_bytes: int
     load_1m: float
     cpu_count: int
     temperature_c: float | None
     throttled_flags: int | None
+    can_active: bool
+    can_held_locks: tuple[str, ...]
+    can_quiet_seconds: float
+    can_error: str | None
+    swap_pages_per_second: float
+    cpu_busy_fraction: float
 
 
 @dataclass(frozen=True)
@@ -89,7 +101,9 @@ def _read_throttled(executable: Path = Path("/usr/bin/vcgencmd")) -> int | None:
         return None
 
 
-def read_health_snapshot() -> HealthSnapshot:
+def read_health_snapshot(
+    rates: "Rates", can: "CanProbe", can_quiet_seconds: float
+) -> HealthSnapshot:
     memory = _read_meminfo()
     swap_total = memory.get("SwapTotal", 0)
     swap_free = memory.get("SwapFree", 0)
@@ -101,38 +115,47 @@ def read_health_snapshot() -> HealthSnapshot:
         cpu_count=max(1, os.cpu_count() or 1),
         temperature_c=_read_temperature(),
         throttled_flags=_read_throttled(),
+        can_active=can.active,
+        can_held_locks=can.held_locks,
+        can_quiet_seconds=can_quiet_seconds,
+        can_error=can.error,
+        swap_pages_per_second=rates.swap_pages_per_second,
+        cpu_busy_fraction=rates.cpu_busy_fraction,
     )
+
+
+def _can_reasons(snapshot: HealthSnapshot, thresholds: HealthThresholds) -> list[str]:
+    if snapshot.can_error is not None:
+        return [snapshot.can_error]
+    if snapshot.can_active:
+        return [f"CAN transmit lock held: {', '.join(snapshot.can_held_locks)}"]
+    if snapshot.can_quiet_seconds < thresholds.can_quiet_seconds:
+        return [
+            f"CAN quiet for {snapshot.can_quiet_seconds:.0f} s, "
+            f"below {thresholds.can_quiet_seconds:.0f} s"
+        ]
+    return []
 
 
 def assess_health(
     snapshot: HealthSnapshot,
     thresholds: HealthThresholds,
 ) -> HealthAssessment:
-    reasons: list[str] = []
+    reasons = _can_reasons(snapshot, thresholds)
     if snapshot.memory_available_bytes < thresholds.minimum_available_bytes:
         reasons.append(
             "available memory is below "
             f"{thresholds.minimum_available_bytes // (1024 * 1024)} MiB"
         )
-    if snapshot.swap_total_bytes > 0:
-        fraction = snapshot.swap_used_bytes / snapshot.swap_total_bytes
-        # Small Pi swap partitions can stay nearly full with cold historical
-        # pages even when there is no current pressure.  MemAvailable and the
-        # service's MemorySwapMax=0 are primary; this secondary gate triggers
-        # only after both a relative and a meaningful absolute threshold.
-        swap_limit = max(
-            thresholds.maximum_swap_used_bytes,
-            int(snapshot.swap_total_bytes * thresholds.maximum_swap_used_fraction),
-        )
-        if snapshot.swap_used_bytes > swap_limit:
-            reasons.append(
-                f"swap use is {fraction:.1%} ({snapshot.swap_used_bytes // (1024 * 1024)} MiB), "
-                f"above {swap_limit // (1024 * 1024)} MiB"
-            )
-    maximum_load = snapshot.cpu_count * thresholds.maximum_load_per_cpu
-    if snapshot.load_1m > maximum_load:
+    if snapshot.swap_pages_per_second > thresholds.maximum_swap_pages_per_second:
         reasons.append(
-            f"1-minute load {snapshot.load_1m:.2f} exceeds {maximum_load:.2f}"
+            f"swap paging {snapshot.swap_pages_per_second:.0f} pages/s exceeds "
+            f"{thresholds.maximum_swap_pages_per_second:.0f}"
+        )
+    if snapshot.cpu_busy_fraction > thresholds.maximum_cpu_busy_fraction:
+        reasons.append(
+            f"CPU busy {snapshot.cpu_busy_fraction:.0%} exceeds "
+            f"{thresholds.maximum_cpu_busy_fraction:.0%}"
         )
     if (
         snapshot.temperature_c is not None

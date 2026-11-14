@@ -9,13 +9,22 @@ import threading
 from typing import Mapping, Protocol
 
 
+# The obd-things CAN transmitters take exclusive flocks on files here.
+DEFAULT_CAN_LOCK_DIR = Path("/home/pi/dev/obd-things/tmp/locks")
+
+
 @dataclass(frozen=True)
 class HealthThresholds:
-    minimum_available_bytes: int = 1536 * 1024 * 1024
-    maximum_swap_used_fraction: float = 0.20
-    maximum_swap_used_bytes: int = 512 * 1024 * 1024
-    maximum_load_per_cpu: float = 1.25
+    """The one definition of the Pi fallback gate's defaults."""
+
+    # The job's 768 MiB address-space ceiling plus 256 MiB for other services.
+    minimum_available_bytes: int = 1024 * 1024 * 1024
+    # 4 MiB/s at 4 KiB pages: sustained thrash, not cold pages parked in swap.
+    maximum_swap_pages_per_second: float = 1024.0
+    # Idle and iowait are excluded, so Time Machine backup waits never block.
+    maximum_cpu_busy_fraction: float = 0.90
     maximum_temperature_c: float = 75.0
+    can_quiet_seconds: float = 60.0
 
 
 @dataclass
@@ -39,14 +48,16 @@ class BrokerConfig:
     sqlite3: str
     bwrap: str
     min_available_memory_mb: int
-    max_swap_used: float
-    max_swap_used_mb: int
-    max_load_per_cpu: float
+    max_swap_pages_per_second: float
+    max_cpu_busy: float
     max_temperature_c: float
     health_thresholds: HealthThresholds = field(default_factory=HealthThresholds)
     # None: this host has no cache root, so a job that asks for one fails.
     task_cache_root: Path | None = None
     task_cache_max_bytes: int = 0
+    can_lock_dir: Path = DEFAULT_CAN_LOCK_DIR
+    can_quiet_seconds: float = HealthThresholds.can_quiet_seconds
+    health: bool = False
 
     @classmethod
     def from_namespace(
@@ -75,12 +86,16 @@ class BrokerConfig:
             sqlite3=args.sqlite3,
             bwrap=args.bwrap,
             min_available_memory_mb=args.min_available_memory_mb,
-            max_swap_used=args.max_swap_used,
-            max_swap_used_mb=args.max_swap_used_mb,
-            max_load_per_cpu=args.max_load_per_cpu,
+            max_swap_pages_per_second=args.max_swap_pages_per_second,
+            max_cpu_busy=args.max_cpu_busy,
             max_temperature_c=args.max_temperature_c,
             task_cache_root=getattr(args, "task_cache_root", None),
             task_cache_max_bytes=getattr(args, "task_cache_max_bytes", 0),
+            can_lock_dir=getattr(args, "can_lock_dir", DEFAULT_CAN_LOCK_DIR),
+            can_quiet_seconds=getattr(
+                args, "can_quiet_seconds", HealthThresholds.can_quiet_seconds
+            ),
+            health=getattr(args, "health", False),
             health_thresholds=(
                 HealthThresholds() if health_thresholds is None else health_thresholds
             ),
@@ -197,6 +212,7 @@ class MissedOffloadRecord:
 
 __all__ = [
     "BrokerConfig",
+    "DEFAULT_CAN_LOCK_DIR",
     "HealthThresholds",
     "MissedOffloadRecord",
     "Reservation",

@@ -179,6 +179,12 @@ GOOD_HEALTH = broker.HealthSnapshot(
     cpu_count=4,
     temperature_c=45.0,
     throttled_flags=0,
+    can_active=False,
+    can_held_locks=(),
+    can_quiet_seconds=3600.0,
+    can_error=None,
+    swap_pages_per_second=0.0,
+    cpu_busy_fraction=0.1,
 )
 
 
@@ -321,15 +327,11 @@ class BrokerHarness:
             sqlite3="/usr/bin/sqlite3",
             bwrap=sys.executable,
             min_available_memory_mb=512,
-            max_swap_used=0.20,
-            max_swap_used_mb=512,
-            max_load_per_cpu=1.25,
+            max_swap_pages_per_second=1024.0,
+            max_cpu_busy=0.90,
             max_temperature_c=75.0,
             health_thresholds=config.HealthThresholds(
                 minimum_available_bytes=512 * 1024 * 1024,
-                maximum_swap_used_fraction=0.20,
-                maximum_load_per_cpu=1.25,
-                maximum_temperature_c=75.0,
             ),
         )
 

@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 from contextlib import redirect_stderr, redirect_stdout
 import datetime as dt
 from io import BytesIO, StringIO
@@ -266,12 +267,10 @@ class PlacementTests(BrokerHarness, unittest.TestCase):
 
     def test_health_gate_defers_without_claiming(self):
         submitted = self.submit()
-        unhealthy = broker.HealthSnapshot(
+        unhealthy = dataclasses.replace(
+            GOOD_HEALTH,
             memory_available_bytes=128 * 1024 * 1024,
-            swap_total_bytes=1024,
-            swap_used_bytes=1024,
             load_1m=50,
-            cpu_count=4,
             temperature_c=82,
             throttled_flags=0x5,
         )
@@ -394,15 +393,12 @@ class PlacementTests(BrokerHarness, unittest.TestCase):
         event = json.loads(event_path.read_text(encoding="utf-8"))
         self.assertEqual(event["profile"], "can-log-batch")
 
-    def test_small_full_swap_is_not_treated_as_current_pressure(self):
-        snapshot = broker.HealthSnapshot(
-            memory_available_bytes=1600 * 1024 * 1024,
+    def test_full_swap_and_high_load_are_not_current_pressure(self):
+        snapshot = dataclasses.replace(
+            GOOD_HEALTH,
             swap_total_bytes=199 * 1024 * 1024,
             swap_used_bytes=198 * 1024 * 1024,
-            load_1m=0.5,
-            cpu_count=4,
-            temperature_c=50,
-            throttled_flags=0,
+            load_1m=50.0,
         )
         assessment = broker.assess_health(snapshot, self.args.health_thresholds)
         self.assertTrue(assessment.ok, assessment.reasons)

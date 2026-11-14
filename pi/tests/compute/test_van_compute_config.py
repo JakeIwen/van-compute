@@ -35,7 +35,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertTrue(runtime.once)
         self.assertFalse(runtime.self_test)
         self.assertEqual(
-            runtime.health_thresholds.minimum_available_bytes, 1536 * 1024 * 1024
+            runtime.health_thresholds.minimum_available_bytes, 1024 * 1024 * 1024
         )
         self.assertEqual(runtime.max_result_bytes, broker.DEFAULT_MAX_RESULT_BYTES)
 

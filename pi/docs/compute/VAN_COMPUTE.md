@@ -27,14 +27,64 @@ needed. The queue and broker are intentionally not a general remote shell.
 - While any non-local compute lease is fresh, queued work is left for remote
   workers. This naturally extends to additional compute nodes later.
 - If every remote lease is stale, the broker waits a short grace period and may
-  run one eligible task locally. Memory, disk free space, load, temperature,
-  throttling, runtime, file size, and cgroup limits guard that
-  fallback.
+  run one eligible task locally. CAN transmit activity, memory, swap paging,
+  CPU use, temperature, throttling, disk free space, runtime, file size, and
+  cgroup limits guard that fallback (see Pi fallback gate).
 - A remotely claimed job whose exact slot heartbeat has been stale for five
   minutes is conservatively returned to the queue. Attempt tokens reject late
   uploads from the superseded worker.
 - Jobs too risky for the Pi fallback, notably JADX decompilation and configured
   corpus searches, remain queued until a remote worker is available.
+
+### Pi fallback gate
+
+The broker starts a Pi-local job only when every check passes. Rates come from
+a sampler that keeps its previous reading: the delta since the last poll, or a
+fresh one-second window when there is no reading or it is over 30 s old. A
+counter that goes backwards, a missing field or an unreadable source defers the
+job (`health probe failed`); nothing is ever read as healthy by default.
+
+| Check | Default | Flag | Why |
+| --- | --- | --- | --- |
+| CAN transmit | no write lock on any `active-diagnostics-*.lock` now, and none for the last 60 s | `--can-lock-dir`, `--can-quiet-seconds` (0-3600) | The one hard rule: the Pi must not be loaded while it sends CAN frames. |
+| MemAvailable | at least 1024 MiB | `--min-available-memory-mb` (at least 256 and at least `--max-memory-bytes`) | The job's 768 MiB ceiling plus 256 MiB for other services. |
+| Swap paging | at most 1024 pages/s (`pswpin` + `pswpout`, 4 MiB/s) | `--max-swap-pages-per-second` | Current thrash, not cold pages parked in swap (the idle Pi keeps about 0.9 GiB there). |
+| CPU busy | at most 0.90 of CPU time, excluding idle and iowait | `--max-cpu-busy` | Backup I/O wait (load average 5-6 at idle) must not block work; real compute pressure does. |
+| Temperature | at most 75 C | `--max-temperature-c` | Unchanged. |
+| Throttling | no current bits 0-3 of `vcgencmd get_throttled` | none | Unchanged. |
+
+`HealthThresholds` in `van_compute/config.py` is the single definition of these
+defaults, and the service unit passes no gate flags. Load average and swap used
+are reported in the health snapshot but no longer gate. The removed flags
+`--max-swap-used`, `--max-swap-used-mb` and `--max-load-per-cpu` still parse
+only to exit with an error naming `--max-swap-pages-per-second` or
+`--max-cpu-busy`.
+
+The memory minimum is not guaranteed headroom for other services. The job's
+768 MiB limit is per-process address space (`RLIMIT_AS`), and the unit's 1 GiB
+`MemoryMax` covers the broker plus every descendant, so a job and the broker
+together may use more than the 256 MiB the minimum leaves free.
+
+CAN lock contract. Every Pi CAN transmitter in obd-things takes a nonblocking
+exclusive `flock` on `active-diagnostics-<name>.lock` in
+`/home/pi/dev/obd-things/tmp/locks` for as long as it may transmit; the kernel
+drops it when the holder exits, so it cannot go stale. The broker reads
+`/proc/locks` and matches each record's `major:minor:inode` (device in hex,
+inode in decimal) against a fresh `stat` of the lock files on every probe. Any
+WRITE lock, held or waited for (FLOCK, POSIX or OFDLCK), counts as active; READ
+locks (passive observers such as the telemetry broker) are ignored. The broker
+never opens, creates or locks those files, since a probing shared lock could
+make a sender's `LOCK_EX|LOCK_NB` fail. A missing lock directory, a listing or
+`stat` error, an unreadable `/proc/locks` or an unparseable record about a lock
+file counts as CAN active (fail closed). The obd-things lock files must never
+be replaced or removed while they have owners: a replacement is a different
+inode that the old holders do not lock.
+
+`--once` first watches CAN every 0.5 s for up to `--can-quiet-seconds` (stopping
+early, and deferring, if a lock appears). `--health` prints the current snapshot
+and assessment as JSON and exits 0 whether or not the gate passes; it takes no
+queue lock, so it works beside the service under its systemd sandbox. Its quiet
+time counts only from that process's start.
 
 ## Safety boundaries
 

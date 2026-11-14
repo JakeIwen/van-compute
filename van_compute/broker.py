@@ -38,8 +38,10 @@ from typing import Callable, Mapping, Sequence
 
 
 from van_compute import engine, limited_child, queue, task_cache
-from van_compute.config import BrokerConfig, HealthThresholds, MissedOffloadRecord
+from van_compute.config import BrokerConfig, MissedOffloadRecord
 from van_compute.job_requeue import requeue_running_job
+from van_compute.pi_gate_flags import add_gate_arguments, validated_thresholds
+from van_compute.pi_health_monitor import HealthMonitor
 from van_compute.pi_health import (
     HealthAssessment,
     HealthProbeError,
@@ -76,11 +78,6 @@ DEFAULT_CPU_SECONDS = 1200
 DEFAULT_MAX_MEMORY_BYTES = 768 * 1024 * 1024
 DEFAULT_MAX_RESULT_BYTES = protocol.MAX_RESULT_BYTES
 DEFAULT_MIN_WORK_FREE_BYTES = 1024 * 1024 * 1024
-DEFAULT_MIN_AVAILABLE_BYTES = 1536 * 1024 * 1024
-DEFAULT_MAX_SWAP_FRACTION = 0.20
-DEFAULT_MAX_SWAP_BYTES = 512 * 1024 * 1024
-DEFAULT_MAX_LOAD_PER_CPU = 1.25
-DEFAULT_MAX_TEMPERATURE_C = 75.0
 DEFAULT_NOFILE = 256
 DEFAULT_BWRAP = "/usr/bin/bwrap"
 DEFAULT_LOCAL_PYTHON = "/home/pi/van_compute/venv/bin/python3"
@@ -1330,9 +1327,19 @@ def run_once(
     args: BrokerConfig,
     *,
     now: dt.datetime | None = None,
-    health_reader: Callable[[], HealthSnapshot] = read_health_snapshot,
+    health_reader: Callable[[], HealthSnapshot] | None = None,
     should_stop: Callable[[], bool] = lambda: False,
+    monitor: HealthMonitor | None = None,
 ) -> dict[str, object]:
+    # Observe CAN before any early return so deferrals (maintenance, a fresh
+    # remote lease) keep the quiet chain unbroken.  The monitor is owned by
+    # serve() or main(); building one here would reset the chain every poll.
+    if monitor is not None:
+        monitor.observe_can()
+    if health_reader is None:
+        if monitor is None:
+            raise BrokerError("run_once needs a health monitor or a health reader")
+        health_reader = monitor.snapshot
     root = queue.safe_root(args.root)
     work_root = prepare_work_root(args.work_root)
     args.work_root = work_root
@@ -1423,6 +1430,12 @@ def run_self_test(args: BrokerConfig) -> dict[str, object]:
     }
 
 
+def health_report(config: BrokerConfig, monitor: HealthMonitor) -> dict[str, object]:
+    """The `--health` payload: what the gate sees now and what it decides."""
+    assessment = assess_health(monitor.snapshot(), config.health_thresholds)
+    return {**asdict(assessment), "thresholds": asdict(config.health_thresholds)}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1441,7 +1454,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
-        "--once", action="store_true", help="make one placement decision and exit"
+        "--once",
+        action="store_true",
+        help="make one placement decision and exit; first watches CAN for up to "
+        "--can-quiet-seconds (stopping early if a transmitter lock appears, which "
+        "defers the job)",
+    )
+    mode.add_argument(
+        "--health",
+        action="store_true",
+        help="print the current health snapshot and assessment as JSON and exit 0 "
+        "whether or not the gate passes (CAN quiet time counts from this process "
+        "start; takes no queue lock, so it works beside the running service)",
     )
     mode.add_argument(
         "--self-test",
@@ -1472,19 +1496,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sqlite3", default="/usr/bin/sqlite3")
     parser.add_argument("--bwrap", default=DEFAULT_BWRAP)
-    parser.add_argument(
-        "--min-available-memory-mb",
-        type=int,
-        default=DEFAULT_MIN_AVAILABLE_BYTES // (1024 * 1024),
-    )
-    parser.add_argument("--max-swap-used", type=float, default=DEFAULT_MAX_SWAP_FRACTION)
-    parser.add_argument(
-        "--max-swap-used-mb",
-        type=int,
-        default=DEFAULT_MAX_SWAP_BYTES // (1024 * 1024),
-    )
-    parser.add_argument("--max-load-per-cpu", type=float, default=DEFAULT_MAX_LOAD_PER_CPU)
-    parser.add_argument("--max-temperature-c", type=float, default=DEFAULT_MAX_TEMPERATURE_C)
+    add_gate_arguments(parser)
     return parser
 
 
@@ -1521,31 +1533,12 @@ def _validate_args(args: argparse.Namespace) -> BrokerConfig:
         raise BrokerError(
             "worker timing values must be finite and stale-running-age must be at least remote-max-age"
         )
-    if args.min_available_memory_mb < 256:
-        raise BrokerError("--min-available-memory-mb must be at least 256")
-    if not math.isfinite(args.max_swap_used) or not 0 <= args.max_swap_used <= 1:
-        raise BrokerError("--max-swap-used must be from 0 through 1")
-    if not 0 <= args.max_swap_used_mb <= 16 * 1024:
-        raise BrokerError("--max-swap-used-mb must be from 0 through 16384")
-    if not math.isfinite(args.max_load_per_cpu) or args.max_load_per_cpu <= 0:
-        raise BrokerError("--max-load-per-cpu must be positive")
-    if (
-        not math.isfinite(args.max_temperature_c)
-        or not 40 <= args.max_temperature_c <= 100
-    ):
-        raise BrokerError("--max-temperature-c must be from 40 through 100")
+    health_thresholds = validated_thresholds(args, BrokerError)
     if args.task_cache_max_bytes < 1:
         raise BrokerError("--task-cache-max-bytes must be positive")
     if args.task_cache_root is None:
         # Beside the queue the service may already write, wherever --root points.
         args.task_cache_root = args.root / "task-caches"
-    health_thresholds = HealthThresholds(
-        minimum_available_bytes=args.min_available_memory_mb * 1024 * 1024,
-        maximum_swap_used_fraction=args.max_swap_used,
-        maximum_swap_used_bytes=args.max_swap_used_mb * 1024 * 1024,
-        maximum_load_per_cpu=args.max_load_per_cpu,
-        maximum_temperature_c=args.max_temperature_c,
-    )
     return BrokerConfig.from_namespace(args, health_thresholds=health_thresholds)
 
 
@@ -1565,7 +1558,7 @@ def _start_task_cache(config: BrokerConfig) -> None:
         raise BrokerError(str(exc)) from None
 
 
-def serve(args: BrokerConfig) -> None:
+def serve(args: BrokerConfig, monitor: HealthMonitor) -> None:
     stopping = False
 
     def stop(_signum: int, _frame: object) -> None:
@@ -1576,7 +1569,7 @@ def serve(args: BrokerConfig) -> None:
     signal.signal(signal.SIGINT, stop)
     last_message = ""
     while not stopping:
-        result = run_once(args, should_stop=lambda: stopping)
+        result = run_once(args, should_stop=lambda: stopping, monitor=monitor)
         rendered = json.dumps(result, sort_keys=True)
         if (
             rendered != last_message
@@ -1612,17 +1605,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(raw)
     try:
         config = _validate_args(args)
+        monitor = HealthMonitor(config.can_lock_dir)
+        if config.health:
+            # Read-only, so no broker lock: it must work beside the service.
+            print(json.dumps(health_report(config, monitor), indent=2, sort_keys=True))
+            return 0
         with broker_lock(config.root):
             if not config.self_test:
                 _start_task_cache(config)
             if config.self_test:
                 print(json.dumps(run_self_test(config), indent=2, sort_keys=True))
             elif config.once:
-                print(json.dumps(run_once(config), indent=2, sort_keys=True))
+                monitor.wait_for_quiet(config.can_quiet_seconds)
+                result = run_once(config, monitor=monitor)
+                print(json.dumps(result, indent=2, sort_keys=True))
             else:
-                serve(config)
+                serve(config, monitor)
         return 0
-    except (BrokerError, queue.QueueError, protocol.ProtocolError, OSError) as exc:
+    except (
+        BrokerError,
+        HealthProbeError,
+        queue.QueueError,
+        protocol.ProtocolError,
+        OSError,
+    ) as exc:
         print(f"van-compute-broker: {exc}", file=sys.stderr)
         return 2
 
