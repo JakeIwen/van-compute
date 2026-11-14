@@ -225,8 +225,11 @@ def package_output_directories(
                 if host is Host.MAC
                 else os.fdopen(descriptor, "wb")
             ) as raw_archive:
+                # Pinned: Python 3.15 lowered tarfile's gzip default from 9,
+                # which changes archive bytes the protocol goldens pin.
                 with tarfile.open(
-                    fileobj=raw_archive, mode="w:gz", dereference=False
+                    fileobj=raw_archive, mode="w:gz", dereference=False,
+                    compresslevel=9,
                 ) as bundle:
                     if host is Host.MAC:
                         bundle.add(
