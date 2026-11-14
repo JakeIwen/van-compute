@@ -7,76 +7,104 @@ from unittest import mock
 from van_compute import worker
 
 
+class SlowPs:
+    """A `ps` that times out after consuming the real timeout on the fake clock."""
+
+
+SLOW_PS = SlowPs()
+
+
 class ResourceWatchdogPsTimeoutTests(unittest.TestCase):
-    def _sample_process_table(self, clock: list[float], outcomes: list[object]):
-        """Run one reader call at clock[0]; each outcome is stdout or an exception."""
-        def fake_run(*_args, **_kwargs):
+    def setUp(self):
+        self._clear_process_table()
+        self.addCleanup(self._clear_process_table)
+        self.clock = [1000.0]
+
+    def _clear_process_table(self):
+        worker._PROCESS_TABLE_GROUPS = {}
+        worker._PROCESS_TABLE_SAMPLED_AT = 0.0
+        worker._PROCESS_TABLE_TIMED_OUT_AT = None
+        worker._PROCESS_TABLE_TIMEOUT_ERROR = ""
+
+    def sample(self, outcomes: list[object], group_id: int = 101):
+        """Read one group at the fake clock; outcomes are stdout, SLOW_PS or exceptions."""
+        def fake_run(*_args, **kwargs):
             outcome = outcomes.pop(0)
+            if outcome is SLOW_PS:
+                self.clock[0] += kwargs["timeout"]
+                raise subprocess.TimeoutExpired(["/bin/ps"], kwargs["timeout"])
             if isinstance(outcome, BaseException):
                 raise outcome
             if isinstance(outcome, subprocess.CompletedProcess):
                 return outcome
             return subprocess.CompletedProcess([], 0, outcome, "")
 
-        with mock.patch.object(worker.time, "monotonic", side_effect=lambda: clock[0]), \
+        with mock.patch.object(worker.time, "monotonic", side_effect=lambda: self.clock[0]), \
                 mock.patch.object(worker.subprocess, "run", side_effect=fake_run) as run:
-            return worker.process_group_resources(101), run.call_count
+            return worker.process_group_resources(group_id), run.call_count
 
-    def _reset_process_table(self):
-        worker._PROCESS_TABLE_GROUPS = {}
-        worker._PROCESS_TABLE_SAMPLED_AT = 0.0
-        worker._PROCESS_TABLE_TIMED_OUT_AT = None
-        self.addCleanup(self._clear_process_table)
+    def at_age(self, seconds: float):
+        self.clock[0] = 1000.0 + seconds
 
-    def _clear_process_table(self):
-        worker._PROCESS_TABLE_GROUPS = {}
-        worker._PROCESS_TABLE_SAMPLED_AT = 0.0
-        worker._PROCESS_TABLE_TIMED_OUT_AT = None
+    def test_slow_ps_reuses_recent_table_then_recovers(self):
+        self.assertEqual(self.sample(["101 100\n"]), ((100 * 1024, 1), 1))
 
-    def test_resource_watchdog_tolerates_ps_timeout_with_recent_sample(self):
-        self._reset_process_table()
-        clock = [1000.0]
-        timeout = subprocess.TimeoutExpired(["/bin/ps"], worker.PROCESS_TABLE_TIMEOUT)
-        self.assertEqual(self._sample_process_table(clock, ["101 100\n"]), ((100 * 1024, 1), 1))
+        self.at_age(2)
+        self.assertEqual(self.sample([SLOW_PS]), ((100 * 1024, 1), 1))
 
-        clock[0] = 1002.0
-        self.assertEqual(self._sample_process_table(clock, [timeout]), ((100 * 1024, 1), 1))
+        # Callers just after a timeout share it instead of queueing another
+        # five-second ps on the shared lock.
+        self.assertEqual(self.sample([]), ((100 * 1024, 1), 0))
 
-        # Callers right after a timeout reuse the table instead of queueing
-        # another five-second ps on the shared lock.
-        clock[0] = 1002.5
-        self.assertEqual(self._sample_process_table(clock, []), ((100 * 1024, 1), 0))
-
-        clock[0] = 1004.0
-        self.assertEqual(self._sample_process_table(clock, ["101 400\n"]), ((400 * 1024, 1), 1))
+        self.at_age(9)
+        self.assertEqual(self.sample(["101 400\n"]), ((400 * 1024, 1), 1))
         self.assertIsNone(worker._PROCESS_TABLE_TIMED_OUT_AT)
 
-    def test_resource_watchdog_fails_closed_once_sample_is_too_old(self):
-        self._reset_process_table()
-        clock = [1000.0]
-        timeout = subprocess.TimeoutExpired(["/bin/ps"], worker.PROCESS_TABLE_TIMEOUT)
-        self._sample_process_table(clock, ["101 100\n"])
+    def test_unseen_group_reads_empty_while_table_is_reused(self):
+        self.sample(["101 100\n"])
+        self.at_age(2)
+        self.assertEqual(self.sample([SLOW_PS], group_id=202), ((0, 0), 1))
 
-        clock[0] = 1000.0 + worker.PROCESS_TABLE_STALE_LIMIT + 1
-        with self.assertRaisesRegex(worker.WorkerError, "resource watchdog could not run ps"):
-            self._sample_process_table(clock, [timeout])
+    def test_timeout_that_crosses_the_stale_limit_fails(self):
+        self.sample(["101 100\n"])
+        self.at_age(worker.PROCESS_TABLE_STALE_LIMIT - 3)
+        with self.assertRaisesRegex(worker.WorkerError, "could not run ps"):
+            self.sample([SLOW_PS])
 
-    def test_resource_watchdog_fails_closed_on_timeout_without_prior_sample(self):
-        self._reset_process_table()
-        timeout = subprocess.TimeoutExpired(["/bin/ps"], worker.PROCESS_TABLE_TIMEOUT)
-        with self.assertRaisesRegex(worker.WorkerError, "resource watchdog could not run ps"):
-            self._sample_process_table([1000.0], [timeout])
+    def test_repeated_timeouts_cannot_extend_tolerance(self):
+        self.sample(["101 100\n"])
+        self.at_age(1)
+        self.assertEqual(self.sample([SLOW_PS])[0], (100 * 1024, 1))  # age 6
+        self.at_age(7)
+        self.assertEqual(self.sample([SLOW_PS])[0], (100 * 1024, 1))  # age 12
+        self.at_age(12.5)
+        self.assertEqual(self.sample([]), ((100 * 1024, 1), 0))
+        self.at_age(13)
+        with self.assertRaisesRegex(worker.WorkerError, "could not run ps"):
+            self.sample([SLOW_PS])  # age 18
 
-    def test_resource_watchdog_fails_closed_on_ps_error_despite_recent_sample(self):
-        self._reset_process_table()
-        clock = [1000.0]
-        self._sample_process_table(clock, ["101 100\n"])
-        clock[0] = 1002.0
+    def test_waiting_callers_share_a_failed_probe(self):
+        self.sample(["101 100\n"])
+        self.at_age(13)
+        with self.assertRaisesRegex(worker.WorkerError, "could not run ps"):
+            self.sample([SLOW_PS])
+        # The next nine slots get the same failure without nine more probes.
+        for _ in range(9):
+            with self.assertRaisesRegex(worker.WorkerError, "timed out after 5"):
+                self.sample([])
+
+    def test_timeout_without_prior_sample_fails(self):
+        with self.assertRaisesRegex(worker.WorkerError, "could not run ps"):
+            self.sample([SLOW_PS])
+
+    def test_ps_errors_fail_despite_recent_table(self):
+        self.sample(["101 100\n"])
+        self.at_age(2)
         failed = subprocess.CompletedProcess([], 1, "", "ps: broken")
         with self.assertRaisesRegex(worker.WorkerError, "ps: broken"):
-            self._sample_process_table(clock, [failed])
+            self.sample([failed])
         with self.assertRaisesRegex(worker.WorkerError, "could not run ps"):
-            self._sample_process_table(clock, [OSError("no ps")])
+            self.sample([OSError("no ps")])
 
 
 if __name__ == "__main__":

@@ -770,11 +770,15 @@ fixtures must remain byte-identical.
 8. **Watchdogs:** Pi checks disk every 0.5 seconds at reserve+result_limit and
    samples again after a fast exit. Mac checks RSS, process count then disk
    every second at reserve only, without a final sample. A Mac `ps` timeout
-   reuses the last good process table while it is at most 15 seconds old, and
-   callers within one poll interval of that timeout skip retrying `ps`; an older
-   table, a first-sample timeout, a nonzero `ps` exit or an OSError still fail
-   the job with exit 125. A loaded Mac had killed healthy suites on one slow
-   sample. Thresholds, sampling
+   reuses the last good process table while it is at most 15 seconds old when
+   the timeout returns; because each probe can itself take the 5-second
+   timeout, a job may go up to about 20 seconds without a fresh RSS/process
+   reading before it is failed. Callers within one poll interval of a timeout
+   share its outcome (the reused table, or the same failure) rather than
+   queueing more `ps` probes on the shared lock. A table that is too old, a
+   first-sample timeout, a nonzero `ps` exit or an OSError still fail the job
+   with exit 125. A loaded Mac had killed healthy suites on one slow sample.
+   Thresholds, sampling
    order, error strings and exit codes remain host-specific, including Mac's
    legacy empty-watchdog-error graceful termination/143 behavior.
 9. **Cleanup:** Both terminate descendants before publication. Pi records a

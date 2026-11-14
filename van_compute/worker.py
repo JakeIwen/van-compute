@@ -74,6 +74,7 @@ PROCESS_TABLE_STALE_LIMIT = 15.0
 _PROCESS_TABLE_LOCK = threading.Lock()
 _PROCESS_TABLE_SAMPLED_AT = 0.0
 _PROCESS_TABLE_TIMED_OUT_AT: float | None = None
+_PROCESS_TABLE_TIMEOUT_ERROR = ""
 _PROCESS_TABLE_GROUPS: dict[int, tuple[int, int]] = {}
 COPY_CHUNK = 1024 * 1024
 DATASET_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -911,19 +912,21 @@ def process_group_resources(group_id: int) -> tuple[int, int]:
     """Return aggregate RSS/count from one shared process-table sample.
 
     A ps timeout falls back to the last good table while it is younger than
-    PROCESS_TABLE_STALE_LIMIT; after a timeout, callers within one poll interval
-    reuse that table instead of queueing serial five-second retries on the lock.
+    PROCESS_TABLE_STALE_LIMIT. Callers within one poll interval of a timeout
+    share its outcome (the reused table, or the same failure once the table is
+    too old) instead of queueing serial five-second retries on the lock.
     """
     global _PROCESS_TABLE_GROUPS, _PROCESS_TABLE_SAMPLED_AT
-    global _PROCESS_TABLE_TIMED_OUT_AT
+    global _PROCESS_TABLE_TIMED_OUT_AT, _PROCESS_TABLE_TIMEOUT_ERROR
     with _PROCESS_TABLE_LOCK:
         now = time.monotonic()
         if (
             _PROCESS_TABLE_TIMED_OUT_AT is not None
             and now - _PROCESS_TABLE_TIMED_OUT_AT < RESOURCE_POLL_INTERVAL
-            and _process_table_is_fresh_enough(now)
         ):
-            return _PROCESS_TABLE_GROUPS.get(group_id, (0, 0))
+            if _process_table_is_fresh_enough(now):
+                return _PROCESS_TABLE_GROUPS.get(group_id, (0, 0))
+            raise WorkerError(_PROCESS_TABLE_TIMEOUT_ERROR)
         if (
             group_id not in _PROCESS_TABLE_GROUPS
             or now - _PROCESS_TABLE_SAMPLED_AT >= RESOURCE_POLL_INTERVAL
@@ -940,12 +943,13 @@ def process_group_resources(group_id: int) -> tuple[int, int]:
                 )
             except subprocess.TimeoutExpired as exc:
                 failed_at = time.monotonic()
-                if _process_table_is_fresh_enough(failed_at):
-                    _PROCESS_TABLE_TIMED_OUT_AT = failed_at
-                    return _PROCESS_TABLE_GROUPS.get(group_id, (0, 0))
-                raise WorkerError(
+                _PROCESS_TABLE_TIMED_OUT_AT = failed_at
+                _PROCESS_TABLE_TIMEOUT_ERROR = (
                     f"resource watchdog could not run ps: {exc}"
-                ) from None
+                )
+                if _process_table_is_fresh_enough(failed_at):
+                    return _PROCESS_TABLE_GROUPS.get(group_id, (0, 0))
+                raise WorkerError(_PROCESS_TABLE_TIMEOUT_ERROR) from None
             except (OSError, subprocess.SubprocessError) as exc:
                 raise WorkerError(
                     f"resource watchdog could not run ps: {exc}"
