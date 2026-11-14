@@ -112,11 +112,14 @@ class WorkerProxyWiringTests(unittest.TestCase):
         self.assertEqual(captured["proxy_port"], 4321)
         self.assertEqual(captured["environment"]["HTTPS_PROXY"], "http://127.0.0.1:4321")
         self.assertEqual(captured["environment"]["https_proxy"], "http://127.0.0.1:4321")
+        self.assertEqual(captured["environment"]["PIP_USE_DEPRECATED"], "legacy-certs")
         for absent in ("HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"):
             self.assertNotIn(absent, captured["environment"])
         captured = self.run_job()
         self.assertIsNone(captured["proxy_port"])
-        self.assertFalse({"HTTPS_PROXY", "https_proxy"} & set(captured["environment"]))
+        self.assertFalse(
+            {"HTTPS_PROXY", "https_proxy", "PIP_USE_DEPRECATED"} & set(captured["environment"])
+        )
 
     def main_arguments(self, *extra):
         arguments = [

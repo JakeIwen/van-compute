@@ -109,11 +109,19 @@ def child_environment(port: int | None) -> dict[str, str]:
 
     Only HTTPS is proxied: plain HTTP would be refused anyway, and NO_PROXY is
     left unset so nothing bypasses the proxy toward a denied direct connection.
+
+    pip >= 24.2 verifies certificates through macOS trustd, a Mach service the
+    profile does not grant: trustd can fetch AIA/OCSP URLs named in a
+    certificate, outside the sandbox, so granting it would reopen egress.
+    ``legacy-certs`` makes pip use its bundled certifi CA file instead. It is
+    a compatibility default, not the boundary (the profile is): pip marks it
+    deprecated, and a pip that drops it rejects the value or ignores it and
+    falls back to the unreachable trustd, so pip fails without gaining network.
     """
     if port is None:
         return {}
     url = f"http://{PROXY_ADDRESS_V4}:{port}"
-    return {"HTTPS_PROXY": url, "https_proxy": url}
+    return {"HTTPS_PROXY": url, "https_proxy": url, "PIP_USE_DEPRECATED": "legacy-certs"}
 
 
 def parse_connect_head(head: bytes) -> str:

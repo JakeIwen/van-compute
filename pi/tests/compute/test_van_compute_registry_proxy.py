@@ -643,7 +643,11 @@ class RegistryProxyTests(unittest.TestCase):
         self.assertEqual(registry_proxy.child_environment(None), {})
         self.assertEqual(
             registry_proxy.child_environment(4321),
-            {"HTTPS_PROXY": "http://127.0.0.1:4321", "https_proxy": "http://127.0.0.1:4321"},
+            {
+                "HTTPS_PROXY": "http://127.0.0.1:4321",
+                "https_proxy": "http://127.0.0.1:4321",
+                "PIP_USE_DEPRECATED": "legacy-certs",
+            },
         )
 
     def test_sandbox_context_runs_a_proxy_only_when_enabled(self):

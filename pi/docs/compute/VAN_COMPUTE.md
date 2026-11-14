@@ -141,7 +141,8 @@ DNS, no UDP). Pi jobs still have no network, and an unsandboxed Mac worker
   port if ::1 has it taken, so no other service can sit on the granted port.
   A proxy that cannot bind fails worker startup. The port is threaded
   explicitly through `WorkerConfig.registry_proxy_port` to the job; jobs get
-  `HTTPS_PROXY`/`https_proxy` (no `HTTP_PROXY`, no `NO_PROXY`) only then, and
+  `HTTPS_PROXY`/`https_proxy` (no `HTTP_PROXY`, no `NO_PROXY`) and
+  `PIP_USE_DEPRECATED=legacy-certs` only then, and
   the profile is never applied without a live port (`PROXY_PORT=0` would make
   `sandbox-exec` fail). Children orphaned by a worker crash lose their network
   when the next start picks a new port.
@@ -149,6 +150,21 @@ DNS, no UDP). Pi jobs still have no network, and an unsandboxed Mac worker
   an allowed registry for any purpose, such as publishing with a token it
   holds, and HTTP domain fronting inside the encrypted channel is refused only
   by the CDNs' own SNI/Host matching.
+- **Certificate trust.** The profile grants no Mach services, so the macOS
+  trust daemon (trustd) is unreachable: granting it would let a job make
+  trustd fetch AIA/OCSP URLs named in a crafted certificate, outside the
+  sandbox. npm and curl ship or read their own CA bundles; pip >= 24.2 uses
+  trustd by default, hence `PIP_USE_DEPRECATED=legacy-certs` (pip's bundled
+  certifi). It is a compatibility default, not the boundary: a job may unset
+  it, and a pip that drops the option rejects it (exit 3, invalid choice) or
+  falls back to trustd and fails certificate checks (OSStatus -26276); either
+  way pip fails without gaining network. Verified 2026-11-14 that a job
+  granted `com.apple.trustd.agent` can make trustd fetch an AIA URL on a port
+  the job itself is denied. Verified live 2026-11-14 against real
+  pypi.org and registry.npmjs.org: obd-things' `pip install --only-binary=:all:`
+  and `npm ci` succeed sandboxed; example.com, a direct 1.1.1.1:443, an SNI
+  that differs from the CONNECT host, and loopback port 22 are all refused.
+  The offline installer probe cannot catch a trust-store failure.
 - **Installer probe.** Offline: the installer runs the staged release's proxy
   (staged venv Python, outside the sandbox) with every allowlisted name mapped
   to a local echo server, and keeps it up for every sandbox check. Inside the
@@ -876,8 +892,8 @@ fixtures must remain byte-identical.
 5. **Environment/cwd:** Pi keeps Linux PATH, C.UTF-8, outer workspace cwd,
    inner source cwd, placement variables and pytest cache suppression. Mac
    keeps Homebrew PATH, en_US.UTF-8, source cwd and delayed
-   VAN_COMPUTE_CHILD_PYTHONPATH, plus HTTPS_PROXY/https_proxy while the
-   registry proxy runs. The standalone limit helper remains
+   VAN_COMPUTE_CHILD_PYTHONPATH, plus HTTPS_PROXY/https_proxy and
+   PIP_USE_DEPRECATED=legacy-certs while the registry proxy runs. The standalone limit helper remains
    package-import-free; untrusted sitecustomize cannot run ahead of limits.
 6. **Limits:** Pi keeps 1800-second wall/1200-second CPU defaults, 768 MiB
    memory, hard-limit clamping and failure on limit refusal. Mac keeps
