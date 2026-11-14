@@ -177,8 +177,13 @@ class StoreTests(unittest.TestCase):
         self.processes.append(process)
         deadline = time.time() + 20
         while not ready.exists():
-            if time.time() > deadline or process.poll() is not None:
-                self.fail(f"holder did not start: {process.communicate()}")
+            if process.poll() is not None:
+                self.fail(f"holder exited before starting: {process.communicate()}")
+            if time.time() > deadline:
+                # A late holder would otherwise wait forever for its release
+                # file while communicate() waits for it.
+                process.kill()
+                self.fail(f"holder did not start in time: {process.communicate()}")
             time.sleep(0.02)
         return release
 
