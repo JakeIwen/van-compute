@@ -23,12 +23,11 @@ other service can hold the granted port in either family.
 
 from __future__ import annotations
 
-from concurrent.futures import Future, TimeoutError as FutureTimeout
+from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
 import ipaddress
-import queue
 import selectors
 import socket
 import sys
@@ -37,6 +36,7 @@ import time
 from typing import Callable, Iterator, Sequence
 
 from van_compute.registry_relay import relay
+from van_compute.registry_resolver_pool import Resolver, ResolverPool
 
 REGISTRY_HOSTS = frozenset(
     {"pypi.org", "files.pythonhosted.org", "registry.npmjs.org"}
@@ -74,7 +74,6 @@ STATUS_REASONS = {
     504: "Gateway Timeout",
 }
 
-Resolver = Callable[[str, int], Sequence[tuple[str, int]]]
 AddressLookup = Callable[..., Sequence[tuple]]
 
 
@@ -356,51 +355,6 @@ def bind_dual_stack() -> list[socket.socket]:
         errno.EADDRINUSE,
         "could not hold one registry proxy port on both 127.0.0.1 and ::1",
     )
-
-
-class ResolverPool:
-    """Run name lookups on a fixed set of daemon threads.
-
-    ``getaddrinfo`` cannot be interrupted, so callers wait on a Future with a
-    deadline and walk away; a late answer lands in an abandoned Future and is
-    discarded. Daemon threads keep a lookup that never returns from blocking
-    worker exit.
-    """
-
-    def __init__(self, resolver: Resolver, threads: int) -> None:
-        self._resolver = resolver
-        self._jobs: "queue.Queue[tuple[Future, str, int] | None]" = queue.Queue()
-        self._threads = [
-            threading.Thread(
-                target=self._work, name="van-compute-registry-resolver", daemon=True
-            )
-            for _ in range(threads)
-        ]
-        for thread in self._threads:
-            thread.start()
-
-    def submit(self, host: str, port: int) -> Future:
-        future: Future = Future()
-        self._jobs.put((future, host, port))
-        return future
-
-    def close(self) -> None:
-        for _thread in self._threads:
-            self._jobs.put(None)
-
-    def _work(self) -> None:
-        while True:
-            job = self._jobs.get()
-            if job is None:
-                return
-            future, host, port = job
-            # False once a caller gave up and cancelled it while queued.
-            if not future.set_running_or_notify_cancel():
-                continue
-            try:
-                future.set_result(self._resolver(host, port))
-            except BaseException as exc:  # handed to the waiting caller
-                future.set_exception(exc)
 
 
 class RegistryProxy:

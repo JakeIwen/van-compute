@@ -2,7 +2,7 @@
 
 ## Repository map
 
-- `van_compute/`: protocol, queue, broker, worker, metrics, typed runtime configuration, and shared child/result engine; `retention.py` owns completed-job inspection and guarded pruning, `retention_policy.py` selects age/budget candidates, and `retention_citations.py` owns Git working-tree citation discovery. `task_cache.py` owns the opt-in persistent per-task cache store (locking, eviction, `list`/`clear` CLI) shared by the broker and the Mac worker. `registry_proxy.py` owns the Mac worker's loopback CONNECT proxy and its package-registry allowlist (`REGISTRY_HOSTS`), the only network a sandboxed Mac job has. `registry_relay.py` owns its deadline-bounded, nonblocking tunnel relay.
+- `van_compute/`: protocol, queue, broker, worker, metrics, typed runtime configuration, and shared child/result engine; `retention.py` owns completed-job inspection and guarded pruning, `retention_policy.py` selects age/budget candidates, and `retention_citations.py` owns Git working-tree citation discovery. `task_cache.py` owns the opt-in persistent per-task cache store (locking, eviction, `list`/`clear` CLI) shared by the broker and the Mac worker. `registry_proxy.py` owns the Mac worker's loopback CONNECT proxy and its package-registry allowlist (`REGISTRY_HOSTS`), the only network a sandboxed Mac job has. `registry_relay.py` owns its deadline-bounded, nonblocking tunnel relay. `registry_resolver_pool.py` owns its fixed name-lookup thread pool.
 - `macbook/scripts/install_van_compute_worker.zsh` and `.py`: stable installer entry points.
 - `macbook/scripts/van_compute_installer/`: coupled Mac/Pi installer implementation;
   `models.py` owns deployment records and `runners.py` owns local SSH/SCP adapters
