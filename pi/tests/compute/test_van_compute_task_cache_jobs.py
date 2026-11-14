@@ -238,14 +238,7 @@ class MacSandboxProfileTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.base = Path(self.temporary.name).resolve()
         self.profile = self.base / "sandbox.sb"
-        # Newer macOS releases make dyld read the root directory itself, which
-        # the shipped profile does not grant (so it aborts every process on
-        # them); this shim is independent of the cache rules under test.
-        self.profile.write_text(
-            installer_constants.SANDBOX_PROFILE
-            + '(allow file-read-data (literal "/"))\n',
-            encoding="utf-8",
-        )
+        self.profile.write_text(installer_constants.SANDBOX_PROFILE, encoding="utf-8")
         self.job = self.base / "job"
         self.selected = self.base / "cache-selected"
         self.other = self.base / "cache-other"

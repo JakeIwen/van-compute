@@ -29,6 +29,9 @@ SANDBOX_PROFILE = r'''(version 1)
 ; Metadata is needed to traverse operator-configured dataset roots. Contents
 ; and directory reads remain constrained by file-read* below.
 (allow file-read-metadata)
+; dyld reads the root directory's own contents at launch on macOS 27; without
+; this every process aborts. A literal grants "/" only, not paths below it.
+(allow file-read-data (literal "/"))
 (allow file-read*
     (subpath "/System/Library")
     ; macOS 26 stores the dyld shared cache used by system executables here.
