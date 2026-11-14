@@ -11,8 +11,10 @@ command string.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 from typing import Mapping, Sequence
@@ -65,6 +67,7 @@ class RepoTaskDefinition:
     outputs: tuple[str, ...]
     datasets: tuple[str, ...]
     input_values: bool = False
+    cache: str | None = None
 
 
 TASKS = {
@@ -150,8 +153,9 @@ _TASK_KEYS = {
     "outputs",
     "datasets",
     "input_values",
+    "cache",
 }
-_REQUIRED_TASK_KEYS = _TASK_KEYS - {"description", "input_values", "datasets"}
+_REQUIRED_TASK_KEYS = _TASK_KEYS - {"description", "input_values", "datasets", "cache"}
 _EXECUTION_KEYS = {
     "profile",
     "family",
@@ -162,6 +166,8 @@ _EXECUTION_KEYS = {
     "maximum_inputs",
     "input_values",
 }
+# Optional: only cached jobs carry it, so uncached specs stay byte-identical.
+_OPTIONAL_EXECUTION_KEYS = {"cache"}
 _NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 _DATASET_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}")
 _MODULE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
@@ -559,6 +565,7 @@ def _parse_repo_task(payload: object, index: int) -> RepoTaskDefinition:
         outputs=outputs,
         datasets=datasets,
         input_values=input_values,
+        cache=_cache_name(payload["cache"], f"tasks[{index}].cache") if "cache" in payload else None,
     )
     _validate_argv(
         task.argv,
@@ -730,11 +737,27 @@ def validate_inputs(
     return task
 
 
+def _cache_name(value: object, label: str) -> str:
+    if not isinstance(value, str) or not _NAME_RE.fullmatch(value):
+        raise ProtocolError(f"{label} must use lowercase letters, digits, and hyphens")
+    return value
+
+
+def task_cache_namespace(source_root: object) -> str:
+    """Name the per-repo cache namespace from the job's absolute source root."""
+    if not isinstance(source_root, str) or not os.path.isabs(source_root):
+        raise ProtocolError("a cached job needs an absolute source_root")
+    base = re.sub(r"[^a-z0-9]+", "-", os.path.basename(source_root.rstrip("/")).lower())
+    base = base.strip("-")[:40] or "repo"
+    digest = hashlib.sha256(source_root.encode("utf-8")).hexdigest()[:16]
+    return f"{base}-{digest}"
+
+
 def task_execution(task: TaskDefinition | RepoTaskDefinition) -> dict[str, object] | None:
     """Return the portable execution specification embedded in a queued job."""
     if not isinstance(task, RepoTaskDefinition):
         return None
-    return {
+    execution: dict[str, object] = {
         "profile": task.profile,
         "family": task.family,
         "argv": list(task.argv),
@@ -744,13 +767,16 @@ def task_execution(task: TaskDefinition | RepoTaskDefinition) -> dict[str, objec
         "maximum_inputs": task.maximum_inputs,
         "input_values": task.input_values,
     }
+    if task.cache is not None:
+        execution["cache"] = task.cache
+    return execution
 
 
 def validate_execution(payload: object) -> dict[str, object]:
     """Validate an embedded repo-task execution spec on either host."""
     if not isinstance(payload, dict):
         raise ProtocolError("execution must be an object")
-    _unexpected_keys(payload, _EXECUTION_KEYS, "execution")
+    _unexpected_keys(payload, _EXECUTION_KEYS | _OPTIONAL_EXECUTION_KEYS, "execution")
     missing = sorted(_EXECUTION_KEYS - set(payload))
     if missing:
         raise ProtocolError(f"execution is missing field(s): {', '.join(missing)}")
@@ -803,7 +829,7 @@ def validate_execution(payload: object) -> dict[str, object]:
         outputs=outputs,
         datasets=datasets,
     )
-    return {
+    validated: dict[str, object] = {
         "profile": profile,
         "family": family,
         "argv": argv,
@@ -813,6 +839,9 @@ def validate_execution(payload: object) -> dict[str, object]:
         "maximum_inputs": maximum,
         "input_values": input_values,
     }
+    if "cache" in payload:
+        validated["cache"] = _cache_name(payload["cache"], "execution.cache")
+    return validated
 
 
 def _render_input(path: Path, value: object | None) -> str:

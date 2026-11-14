@@ -1243,6 +1243,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                     "outputs": list(task.outputs),
                                     "datasets": list(task.datasets),
                                     "accepts_arguments": "{arguments}" in task.argv,
+                                    **({"cache": task.cache} if task.cache else {}),
                                 }
                                 if isinstance(task, protocol.RepoTaskDefinition)
                                 else {
