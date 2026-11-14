@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import secrets
 import subprocess
+import threading
 import time
 import unittest
 from unittest import mock
@@ -109,6 +110,7 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
         self.token = f"--hang={secrets.token_hex(8)}"
         self.calls = 0
         self.seen_active_at = None
+        self.dead_at = None
         self.seen_pids = []
 
     def active_after_launch(self, _directory=None):
@@ -119,6 +121,8 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
                 self.seen_active_at = time.monotonic()
                 self.seen_pids = self.hang_pids()
                 self.assertEqual(len(self.seen_pids), 2)
+                self.watcher = threading.Thread(target=self.watch_until_dead)
+                self.watcher.start()
             return HELD
         return QUIET
 
@@ -153,6 +157,27 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
             if self.token in line and "ps -axo" not in line
         ]
 
+    def watch_until_dead(self):
+        """Record when every seen process has exited (a zombie counts).
+
+        The stop bound is about the processes, not run_once: requeue I/O and
+        this test's own `ps` scans add time on a slow Pi that a transmitter
+        never competes with.
+        """
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            states = [
+                subprocess.run(
+                    ["ps", "-o", "stat=", "-p", str(pid)],
+                    capture_output=True, text=True,
+                ).stdout.strip()
+                for pid in self.seen_pids
+            ]
+            if all(not state or state.startswith("Z") for state in states):
+                self.dead_at = time.monotonic()
+                return
+            time.sleep(0.02)
+
     def assert_gone(self, pids):
         deadline = time.monotonic() + 3
         for pid in pids:
@@ -179,7 +204,9 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
             broker, "_record_local_execution_once"
         ) as telemetry:
             result = self.run_with(self.active_after_launch)
-        stopped_after = time.monotonic() - self.seen_active_at
+        self.watcher.join()
+        self.assertIsNotNone(self.dead_at, "job processes outlived the watch")
+        stopped_after = self.dead_at - self.seen_active_at
 
         self.assertEqual(
             result,
@@ -187,7 +214,7 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
         )
         # 0.5 s watch + 1 s SIGTERM grace (the job and a descendant ignore
         # SIGTERM); the usual grace would be 10 s.
-        self.assertLess(stopped_after, 4.0)
+        self.assertLess(stopped_after, 2.5)
         self.assert_gone(self.seen_pids)
         finish.assert_not_called()
         upload.assert_not_called()
