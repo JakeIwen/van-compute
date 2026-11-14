@@ -125,8 +125,9 @@ downloads on every run; venvs and results stay per job.
 - **Network.** Pi jobs run with no network, so a Pi cache fills only from what
   the job brings in. Mac jobs reach the network only where the worker runs
   unsandboxed (`--allow-unsandboxed-dynamic`, the current install).
-- **Locations.** Pi: `<queue root>/task-caches` (`--task-cache-root`, inside
-  the broker unit's `ReadWritePaths`). Mac:
+- **Locations.** Pi: `<queue root>/task-caches` for whichever `--root` the broker
+  runs with (override with `--task-cache-root`; it must be writable by the
+  unit, and the default sits inside its `ReadWritePaths`). Mac:
   `~/Library/Caches/van-compute/task-caches`. Each must be on the same
   filesystem as the host's work root; startup fails otherwise so the
   free-space watchdog and admission cover it.

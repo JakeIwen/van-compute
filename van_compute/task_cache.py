@@ -31,6 +31,7 @@ from typing import ContextManager, Iterator, Mapping
 
 from van_compute import protocol
 
+# Matches the broker default, <queue root>/task-caches, for the default queue root.
 PI_DEFAULT_ROOT = Path("/home/pi/dev/obd-things/tmp/compute/task-caches")
 MAC_DEFAULT_ROOT = Path.home() / "Library" / "Caches" / "van-compute" / "task-caches"
 PI_DEFAULT_MAX_BYTES = 2 * 1024**3
@@ -231,10 +232,10 @@ class TaskCacheStore:
                 PRUNE_LOCK_NAME, _LOCK_FLAGS | os.O_CREAT, 0o600, dir_fd=root_fd
             )
             try:
-                fcntl.flock(prune_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return PruneReport(skipped=True)
-            try:
+                try:
+                    fcntl.flock(prune_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return PruneReport(skipped=True)
                 return self._prune_locked(root_fd, free_target_bytes)
             finally:
                 os.close(prune_fd)
@@ -245,27 +246,37 @@ class TaskCacheStore:
         device = os.fstat(root_fd).st_dev
         entries = []
         for namespace, name in _enumerate(root_fd):
-            namespace_fd = _open_child_directory(root_fd, namespace, create=False)
             try:
-                size = _measure(namespace_fd, name, device)
-                last_used = _lock_mtime(namespace_fd, name)
-            finally:
-                os.close(namespace_fd)
-            entries.append([namespace, name, size, last_used])
+                namespace_fd = _open_child_directory(root_fd, namespace, create=False)
+                try:
+                    size = _measure(namespace_fd, name, device)
+                    last_used = _lock_mtime(namespace_fd, name)
+                finally:
+                    os.close(namespace_fd)
+            except (OSError, TaskCacheError):
+                continue
+            entries.append((namespace, name, size, last_used))
         total = sum(size or 0 for _, _, size, _ in entries)
-        # Unmeasurable caches count as over the cap: evicted first when idle.
+        # Unmeasurable caches count as over the cap for as long as one exists
+        # (even a busy one we cannot touch), so idle caches keep being evicted.
+        unmeasurable = sum(1 for _, _, size, _ in entries if size is None)
         entries.sort(key=lambda item: (item[2] is not None, item[3]))
         evicted: list[str] = []
         failed: list[str] = []
         for namespace, name, size, _ in entries:
-            if size is not None and total <= self.max_bytes and (
+            if not unmeasurable and total <= self.max_bytes and (
                 shutil.disk_usage(self.root).free >= free_target_bytes
             ):
                 break
-            outcome = self._evict(root_fd, namespace, name, device)
-            if outcome == "evicted":
-                evicted.append(f"{namespace}/{name}")
+            try:
+                outcome = self._evict(root_fd, namespace, name, device)
+            except Exception:  # noqa: BLE001 - one poisoned cache must not stop the rest
+                outcome = "failed"
+            if outcome in ("evicted", "absent"):
                 total -= size or 0
+                unmeasurable -= size is None
+                if outcome == "evicted":
+                    evicted.append(f"{namespace}/{name}")
             elif outcome == "failed":
                 failed.append(f"{namespace}/{name}")
         return PruneReport(evicted=tuple(evicted), failed=tuple(failed))
@@ -287,7 +298,7 @@ class TaskCacheStore:
                     return "busy"
                 try:
                     removed = _remove_entry(namespace_fd, name, device)
-                except OSError:
+                except Exception:  # noqa: BLE001 - reported as failed by the caller
                     return "failed"
                 return "evicted" if removed else "absent"
             finally:
@@ -308,7 +319,10 @@ class TaskCacheStore:
             for found_namespace, found_name in _enumerate(root_fd):
                 if namespace not in (None, found_namespace) or name not in (None, found_name):
                     continue
-                outcome = self._evict(root_fd, found_namespace, found_name, device)
+                try:
+                    outcome = self._evict(root_fd, found_namespace, found_name, device)
+                except Exception:  # noqa: BLE001 - report it, keep clearing the rest
+                    outcome = "failed"
                 if outcome != "absent":
                     key = "cleared" if outcome == "evicted" else outcome
                     report[key].append(f"{found_namespace}/{found_name}")
@@ -324,7 +338,10 @@ class TaskCacheStore:
             device = os.fstat(root_fd).st_dev
             infos = []
             for namespace, name in _enumerate(root_fd):
-                namespace_fd = _open_child_directory(root_fd, namespace, create=False)
+                try:
+                    namespace_fd = _open_child_directory(root_fd, namespace, create=False)
+                except TaskCacheError:
+                    continue
                 try:
                     infos.append(CacheInfo(
                         namespace, name,
@@ -430,29 +447,13 @@ def _measure(namespace_fd: int, name: str, device: int) -> int | None:
             return details.st_blocks * 512
         descriptor = os.open(name, _DIR_FLAGS, dir_fd=namespace_fd)
         try:
-            return details.st_blocks * 512 + _measure_open(descriptor, device)
+            return details.st_blocks * 512 + _traverse(descriptor, device, remove=False)
         finally:
             os.close(descriptor)
     except FileNotFoundError:
         return 0
-    except OSError:
+    except (OSError, TaskCacheError):
         return None
-
-
-def _measure_open(descriptor: int, device: int) -> int:
-    total = 0
-    with os.scandir(descriptor) as entries:
-        children = list(entries)
-    for entry in children:
-        details = entry.stat(follow_symlinks=False)
-        total += details.st_blocks * 512
-        if stat.S_ISDIR(details.st_mode) and details.st_dev == device:
-            child = os.open(entry.name, _DIR_FLAGS, dir_fd=descriptor)
-            try:
-                total += _measure_open(child, device)
-            finally:
-                os.close(child)
-    return total
 
 
 def _remove_entry(namespace_fd: int, name: str, device: int) -> bool:
@@ -463,36 +464,95 @@ def _remove_entry(namespace_fd: int, name: str, device: int) -> bool:
         return False
     if not stat.S_ISDIR(details.st_mode):
         os.unlink(name, dir_fd=namespace_fd)
-    else:
-        _remove_directory(namespace_fd, name, details, device)
+        return True
+    descriptor = _open_directory_for_walk(namespace_fd, name, details, device, remove=True)
+    try:
+        _traverse(descriptor, device, remove=True)
+    finally:
+        os.close(descriptor)
+    os.rmdir(name, dir_fd=namespace_fd)
     return True
 
 
-def _remove_directory(parent_fd: int, name: str, details: os.stat_result, device: int) -> None:
+def _open_directory_for_walk(
+    parent_fd: int, name: str, details: os.stat_result, device: int, *, remove: bool
+) -> int:
     if details.st_dev != device:
         raise TaskCacheError(f"cache entry crosses a filesystem boundary: {name}")
     try:
         descriptor = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
     except PermissionError:
+        if not remove:
+            raise
         # A job may have dropped its own rwx; repair that one directory. The
-        # exclusive cache lock (or lstat of a real directory) keeps this safe.
+        # exclusive cache lock keeps nothing else running in the tree.
         os.chmod(name, stat.S_IMODE(details.st_mode) | 0o700, dir_fd=parent_fd)
         descriptor = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
     try:
         opened = os.fstat(descriptor)
         if (opened.st_dev, opened.st_ino) != (details.st_dev, details.st_ino):
             raise TaskCacheError(f"directory changed while opening: {name}")
-        if stat.S_IMODE(opened.st_mode) & 0o700 != 0o700:
+        if remove and stat.S_IMODE(opened.st_mode) & 0o700 != 0o700:
             os.fchmod(descriptor, stat.S_IMODE(opened.st_mode) | 0o700)
-        for child in os.listdir(descriptor):
-            child_details = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
-            if stat.S_ISDIR(child_details.st_mode):
-                _remove_directory(descriptor, child, child_details, device)
-            else:
-                os.unlink(child, dir_fd=descriptor)
-    finally:
+    except BaseException:
         os.close(descriptor)
-    os.rmdir(name, dir_fd=parent_fd)
+        raise
+    return descriptor
+
+
+def _traverse(top_fd: int, device: int, *, remove: bool) -> int:
+    """Walk (and with ``remove`` empty) the tree under ``top_fd``; return its
+    allocated bytes below it.
+
+    Iterative with exactly one descriptor open at a time: a job controls the
+    tree's depth, so recursion or an fd per level would let it break pruning.
+    The way back up reopens ``..`` and checks it is the directory we left.
+    """
+    total = 0
+    current = top_fd
+    pending = os.listdir(current)
+    inode = os.fstat(current).st_ino
+    stack: list[tuple[list[str], int, str]] = []
+    try:
+        while True:
+            if pending:
+                child = pending.pop()
+                details = os.stat(child, dir_fd=current, follow_symlinks=False)
+                total += details.st_blocks * 512
+                if not stat.S_ISDIR(details.st_mode):
+                    if remove:
+                        os.unlink(child, dir_fd=current)
+                    continue
+                if details.st_dev != device and not remove:
+                    continue  # never measure across a mount
+                descriptor = _open_directory_for_walk(
+                    current, child, details, device, remove=remove
+                )
+                stack.append((pending, inode, child))
+                if current != top_fd:
+                    os.close(current)
+                current, inode = descriptor, details.st_ino
+                pending = os.listdir(current)
+                continue
+            if not stack:
+                return total
+            pending, parent_inode, child_name = stack.pop()
+            parent = os.open("..", _DIR_FLAGS, dir_fd=current)
+            os.close(current)
+            current = parent
+            if os.fstat(current).st_ino != parent_inode:
+                raise TaskCacheError(f"tree changed while walking: {child_name}")
+            if remove:
+                os.rmdir(child_name, dir_fd=current)
+            inode = parent_inode
+            if not stack:
+                # Back at the top: keep the caller's descriptor as the only one.
+                if current != top_fd:
+                    os.close(current)
+                    current = top_fd
+    finally:
+        if current != top_fd:
+            os.close(current)
 
 
 # -- command line ---------------------------------------------------------------

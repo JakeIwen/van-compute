@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ import time
 import unittest
 from unittest import mock
 
-from van_compute import protocol, queue, task_cache
+from van_compute import broker, protocol, queue, task_cache
 
 REPO = Path(__file__).resolve().parents[3]
 FakeUsage = collections.namedtuple("FakeUsage", "total used free")
@@ -291,6 +292,86 @@ class StoreTests(unittest.TestCase):
         )
         self.assertEqual(json.loads(cleared.stdout)["cleared"], ["ns/one"])
         self.assertFalse((self.root / "ns" / "one").exists())
+
+    def test_contended_prune_does_not_leak_descriptors(self):
+        self.fill("ns", "one", 1024, age=10)
+        lock = os.open(self.root / task_cache.PRUNE_LOCK_NAME, os.O_RDWR | os.O_CREAT)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            before = len(os.listdir("/dev/fd"))
+            for _ in range(30):
+                self.assertTrue(self.store.prune(0).skipped)
+            self.assertEqual(len(os.listdir("/dev/fd")), before)
+        finally:
+            os.close(lock)
+
+    def make_deep_tree(self, namespace, name, depth=1500):
+        with self.store.use(self.request(namespace, name)) as path:
+            descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        for _ in range(depth):
+            os.mkdir("d", 0o700, dir_fd=descriptor)
+            child = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        os.close(descriptor)
+
+    def test_a_very_deep_tree_is_listed_pruned_and_cleared(self):
+        self.make_deep_tree("ns", "pruned")
+        self.make_deep_tree("ns", "cleared")
+        self.assertTrue(all(i.size_bytes is not None for i in self.store.caches()))
+        self.assertEqual(self.store.clear("ns", "cleared")["cleared"], ["ns/cleared"])
+        self.assertFalse((self.root / "ns" / "cleared").exists())
+        # Directories can report zero blocks (APFS), so force eviction by free space.
+        with mock.patch.object(
+            task_cache.shutil, "disk_usage", return_value=FakeUsage(1, 1, 0)
+        ):
+            self.assertEqual(self.store.prune(1).evicted, ("ns/pruned",))
+        self.assertFalse((self.root / "ns" / "pruned").exists())
+
+    def test_one_failing_cache_does_not_stop_eviction_of_others(self):
+        self.fill("ns", "bad", 1024, age=300)
+        self.fill("ns", "good", 1024, age=200)
+        real = task_cache._remove_entry
+
+        def flaky(namespace_fd, name, device):
+            if name == "bad":
+                raise RecursionError("poisoned")
+            return real(namespace_fd, name, device)
+
+        self.store.max_bytes = 0
+        with mock.patch.object(task_cache, "_remove_entry", side_effect=flaky):
+            report = self.store.prune(0)
+            cleared = self.store.clear()
+        self.assertEqual(report.failed, ("ns/bad",))
+        self.assertEqual(report.evicted, ("ns/good",))
+        self.assertEqual(cleared["failed"], ["ns/bad"])
+
+    def test_busy_unmeasurable_cache_keeps_idle_caches_evictable(self):
+        self.fill("ns", "idle", 4096, age=100)
+        self.fill("ns", "busy", 1024, age=500)
+        release = self.hold("ns", "busy")
+        hidden = self.root / "ns" / "busy" / "private"
+        hidden.mkdir()
+        hidden.chmod(0)
+        self.assertIsNone(
+            next(i for i in self.store.caches() if i.name == "busy").size_bytes
+        )
+        report = self.store.prune(0)  # cap is huge: only the unmeasurable one is over
+        self.assertEqual(report.evicted, ("ns/idle",))
+        self.assertTrue(hidden.exists())
+        release.write_text("go")
+
+    def test_pi_default_cache_root_follows_the_selected_queue_root(self):
+        parsed = broker.build_parser().parse_args(["--root", "/srv/queue"])
+        self.assertEqual(
+            broker._validate_args(parsed).task_cache_root, Path("/srv/queue/task-caches")
+        )
+        parsed = broker.build_parser().parse_args(
+            ["--root", "/srv/queue", "--task-cache-root", "/srv/elsewhere"]
+        )
+        self.assertEqual(
+            broker._validate_args(parsed).task_cache_root, Path("/srv/elsewhere")
+        )
 
 
 def stat_mode(path):

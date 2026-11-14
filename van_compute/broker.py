@@ -1592,7 +1592,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path(os.environ.get("VAN_COMPUTE_ROOT", queue.DEFAULT_QUEUE_ROOT)),
     )
     parser.add_argument("--work-root", type=Path, default=DEFAULT_WORK_ROOT)
-    parser.add_argument("--task-cache-root", type=Path, default=task_cache.PI_DEFAULT_ROOT)
+    parser.add_argument(
+        "--task-cache-root",
+        type=Path,
+        help="persistent task caches (default: <queue root>/task-caches)",
+    )
     parser.add_argument(
         "--task-cache-max-bytes", type=int, default=task_cache.PI_DEFAULT_MAX_BYTES
     )
@@ -1693,6 +1697,9 @@ def _validate_args(args: argparse.Namespace) -> BrokerConfig:
         raise BrokerError("--max-temperature-c must be from 40 through 100")
     if args.task_cache_max_bytes < 1:
         raise BrokerError("--task-cache-max-bytes must be positive")
+    if args.task_cache_root is None:
+        # Beside the queue the service may already write, wherever --root points.
+        args.task_cache_root = args.root / "task-caches"
     health_thresholds = HealthThresholds(
         minimum_available_bytes=args.min_available_memory_mb * 1024 * 1024,
         maximum_swap_used_fraction=args.max_swap_used,
