@@ -37,7 +37,7 @@ import time
 from typing import Callable, Mapping, Sequence
 
 
-from van_compute import engine, limited_child, queue
+from van_compute import engine, limited_child, queue, task_cache
 from van_compute.config import BrokerConfig, HealthThresholds, MissedOffloadRecord
 
 protocol = queue.protocol
@@ -1237,6 +1237,10 @@ def execute_claimed_job(
         raise BrokerError(capacity_reason)
     broker_active_started = time.monotonic()
     work_root = prepare_work_root(args.work_root)
+    cache_store = (
+        None if args.task_cache_root is None
+        else task_cache.TaskCacheStore(args.task_cache_root, args.task_cache_max_bytes)
+    )
     with tempfile.TemporaryDirectory(prefix=f"{job_id}-", dir=work_root) as temporary:
         work = Path(temporary)
         source_root = work / "source"
@@ -1253,9 +1257,11 @@ def execute_claimed_job(
             result_root.mkdir(mode=0o700)
             home_root = work / "home"
             temporary_root = work / "tmp"
-            cache_root = work / "cache"
-            for path in (home_root, temporary_root, cache_root):
+            for path in (home_root, temporary_root):
                 path.mkdir(mode=0o700)
+            cache_root, cache_scope = task_cache.job_cache(
+                cache_store, task_cache.request_for_manifest(manifest), work / "cache"
+            )
             sandbox: engine.Sandbox = engine.BubblewrapSandbox(
                 args.bwrap,
                 source_root,
@@ -1316,13 +1322,15 @@ def execute_claimed_job(
                 cleaned = terminate_remaining_process_group(process.pid)
                 return outcome, cleaned
 
-            outcome, background_descendants_terminated = engine.run_child(
-                child_command,
-                cwd=work,
-                environment=environment,
-                result_root=result_root,
-                supervise=supervise,
-            )
+            # The cache stays locked until the child and its process group are reaped.
+            with cache_scope:
+                outcome, background_descendants_terminated = engine.run_child(
+                    child_command,
+                    cwd=work,
+                    environment=environment,
+                    result_root=result_root,
+                    supervise=supervise,
+                )
             duration = time.monotonic() - started_monotonic
             resource_usage = _resource_usage(outcome.usage, duration)
             resource_usage.update(
@@ -1464,7 +1472,7 @@ def execute_claimed_job(
             # A Pi-local lease must not make the dashboard or broker believe a
             # remote worker is available.
             (root / "workers" / f"{LOCAL_WORKER}.json").unlink(missing_ok=True)
-        return {
+        result = {
             "ok": exit_code == 0,
             "state": completed.get("state"),
             "job": job_id,
@@ -1472,6 +1480,11 @@ def execute_claimed_job(
             "execution": execution,
             "results": uploaded,
         }
+    # After results are published: eviction never delays a job's outcome.
+    task_cache.prune_quietly(
+        cache_store, 2 * args.min_work_free_bytes, label="van-compute-broker"
+    )
+    return result
 
 
 def run_once(
@@ -1579,6 +1592,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path(os.environ.get("VAN_COMPUTE_ROOT", queue.DEFAULT_QUEUE_ROOT)),
     )
     parser.add_argument("--work-root", type=Path, default=DEFAULT_WORK_ROOT)
+    parser.add_argument("--task-cache-root", type=Path, default=task_cache.PI_DEFAULT_ROOT)
+    parser.add_argument(
+        "--task-cache-max-bytes", type=int, default=task_cache.PI_DEFAULT_MAX_BYTES
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--once", action="store_true", help="make one placement decision and exit"
@@ -1674,6 +1691,8 @@ def _validate_args(args: argparse.Namespace) -> BrokerConfig:
         or not 40 <= args.max_temperature_c <= 100
     ):
         raise BrokerError("--max-temperature-c must be from 40 through 100")
+    if args.task_cache_max_bytes < 1:
+        raise BrokerError("--task-cache-max-bytes must be positive")
     health_thresholds = HealthThresholds(
         minimum_available_bytes=args.min_available_memory_mb * 1024 * 1024,
         maximum_swap_used_fraction=args.max_swap_used,
@@ -1682,6 +1701,22 @@ def _validate_args(args: argparse.Namespace) -> BrokerConfig:
         maximum_temperature_c=args.max_temperature_c,
     )
     return BrokerConfig.from_namespace(args, health_thresholds=health_thresholds)
+
+
+def _start_task_cache(config: BrokerConfig) -> None:
+    """Prepare the cache root beside the work root and prune before any job runs."""
+    if config.task_cache_root is None:
+        return
+    try:
+        config.task_cache_root = task_cache.start_store(
+            config.task_cache_root,
+            config.task_cache_max_bytes,
+            prepare_work_root(config.work_root),
+            2 * config.min_work_free_bytes,
+            label="van-compute-broker",
+        )
+    except task_cache.TaskCacheError as exc:
+        raise BrokerError(str(exc)) from None
 
 
 def serve(args: BrokerConfig) -> None:
@@ -1732,6 +1767,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = _validate_args(args)
         with broker_lock(config.root):
+            if not config.self_test:
+                _start_task_cache(config)
             if config.self_test:
                 print(json.dumps(run_self_test(config), indent=2, sort_keys=True))
             elif config.once:

@@ -44,6 +44,9 @@ class BrokerConfig:
     max_load_per_cpu: float
     max_temperature_c: float
     health_thresholds: HealthThresholds = field(default_factory=HealthThresholds)
+    # None: this host has no cache root, so a job that asks for one fails.
+    task_cache_root: Path | None = None
+    task_cache_max_bytes: int = 0
 
     @classmethod
     def from_namespace(
@@ -76,6 +79,8 @@ class BrokerConfig:
             max_swap_used_mb=args.max_swap_used_mb,
             max_load_per_cpu=args.max_load_per_cpu,
             max_temperature_c=args.max_temperature_c,
+            task_cache_root=getattr(args, "task_cache_root", None),
+            task_cache_max_bytes=getattr(args, "task_cache_max_bytes", 0),
             health_thresholds=(
                 HealthThresholds() if health_thresholds is None else health_thresholds
             ),
@@ -128,6 +133,9 @@ class WorkerConfig:
     datasets: Mapping[str, Path] = field(default_factory=dict)
     resource_manager: ResourceManager | None = None
     resource_admission_stop_event: threading.Event | None = None
+    # None: this host has no cache root, so a job that asks for one fails.
+    task_cache_root: Path | None = None
+    task_cache_max_bytes: int = 0
 
     @classmethod
     def from_namespace(
@@ -168,6 +176,8 @@ class WorkerConfig:
             executables={} if executables is None else executables,
             datasets={} if datasets is None else datasets,
             resource_manager=resource_manager,
+            task_cache_root=getattr(args, "task_cache_root", None),
+            task_cache_max_bytes=getattr(args, "task_cache_max_bytes", 0),
         )
 
 

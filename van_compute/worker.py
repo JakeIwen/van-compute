@@ -37,7 +37,7 @@ import time
 from typing import BinaryIO, Callable, Mapping, Sequence
 
 
-from van_compute import config, engine, limited_child, protocol
+from van_compute import config, engine, limited_child, protocol, task_cache
 from van_compute.backoff import HostRetryGate, RetryCancelled
 from van_compute.config import WorkerConfig
 
@@ -1203,6 +1203,7 @@ def sandbox_command(
     result_root: Path,
     environment: Mapping[str, str],
     datasets: Mapping[str, Path],
+    cache_root: Path | None = None,
 ) -> list[str]:
     sandbox: engine.Sandbox = engine.MacSandbox(
         profile,
@@ -1213,6 +1214,7 @@ def sandbox_command(
         datasets,
         WORKER_ROOT,
         WorkerError,
+        cache_root,
     )
     return sandbox.wrap(command)
 
@@ -1245,9 +1247,12 @@ def scrub_private_paths(
     *,
     datasets: Mapping[str, Path],
     job_root: Path,
+    task_cache_root: Path | None = None,
 ) -> None:
     """Keep private Mac roots out of uploaded text results and diagnostics."""
     replacements: list[tuple[bytes, bytes]] = []
+    if task_cache_root is not None:
+        replacements.append((str(task_cache_root).encode(), b"{task-cache}"))
     for name, path in datasets.items():
         replacements.append(
             (str(path).encode(), f"{{dataset:{name}}}".encode())
@@ -1308,6 +1313,7 @@ def execute_job(
     stop_event: threading.Event | None = None,
     worker_id: str | None = None,
     allow_unsandboxed_dynamic: bool = False,
+    task_cache_store: task_cache.TaskCacheStore | None = None,
 ) -> tuple[int, dict[str, object]]:
     task_name = str(manifest.get("task", ""))
     arguments = manifest.get("arguments", [])
@@ -1355,10 +1361,16 @@ def execute_job(
     job_root = source_root.parent.resolve()
     home_root = job_root / "home"
     temporary_root = job_root / "tmp"
-    cache_root = job_root / "cache"
-    for path in (result_root, home_root, temporary_root, cache_root):
+    for path in (result_root, home_root, temporary_root):
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(path, 0o700)
+    cache_request = (
+        None if specification is None
+        else task_cache.cache_request(manifest, specification)
+    )
+    cache_root, cache_scope = task_cache.job_cache(
+        task_cache_store, cache_request, job_root / "cache"
+    )
     environment = {
         "HOME": str(home_root),
         "TMPDIR": str(temporary_root) + "/",
@@ -1380,6 +1392,7 @@ def execute_job(
         result_root=result_root,
         environment=environment,
         datasets=datasets,
+        cache_root=cache_root,
     )
     child_command = [
         sys.executable,
@@ -1394,21 +1407,23 @@ def execute_job(
     ]
     started = utc_now()
     started_monotonic = time.monotonic()
-    outcome = engine.run_child(
-        child_command,
-        cwd=source_root,
-        environment=environment,
-        result_root=result_root,
-        supervise=lambda process: wait_for_analysis_process(
-            process,
-            timeout=timeout,
-            stop_event=stop_event,
-            maximum_memory=maximum_memory,
-            maximum_processes=maximum_processes,
-            work_path=job_root,
-            minimum_free_bytes=minimum_free_bytes,
-        ),
-    )
+    # The cache stays locked until the child and its process group are reaped.
+    with cache_scope:
+        outcome = engine.run_child(
+            child_command,
+            cwd=source_root,
+            environment=environment,
+            result_root=result_root,
+            supervise=lambda process: wait_for_analysis_process(
+                process,
+                timeout=timeout,
+                stop_event=stop_event,
+                maximum_memory=maximum_memory,
+                maximum_processes=maximum_processes,
+                work_path=job_root,
+                minimum_free_bytes=minimum_free_bytes,
+            ),
+        )
     duration_seconds = time.monotonic() - started_monotonic
     resource_usage = child_resource_usage(outcome.usage, duration_seconds)
     resource_usage.update(
@@ -1445,11 +1460,18 @@ def execute_job(
             if isinstance(item, dict)
         ),
     }
+    if cache_request is not None:
+        execution["task_cache"] = cache_request.name
     (result_root / "execution.json").write_text(
         json.dumps(execution, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     validate_raw_result_bytes(result_root, maximum_file_size)
-    scrub_private_paths(result_root, datasets=datasets, job_root=job_root)
+    scrub_private_paths(
+        result_root,
+        datasets=datasets,
+        job_root=job_root,
+        task_cache_root=None if task_cache_store is None else task_cache_store.root,
+    )
     return outcome.exit_code, execution
 
 
@@ -1582,6 +1604,12 @@ def resource_manager_for_args(
     )
 
 
+def task_cache_store_for(args: WorkerConfig) -> task_cache.TaskCacheStore | None:
+    if args.task_cache_root is None:
+        return None
+    return task_cache.TaskCacheStore(args.task_cache_root, args.task_cache_max_bytes)
+
+
 def run_claimed_job(
     args: WorkerConfig,
     remote: RemoteQueue,
@@ -1596,6 +1624,7 @@ def run_claimed_job(
         raise WorkerError("job manifest has an invalid id")
     lease_token = manifest_lease_token(manifest)
     resources = resource_manager_for_args(args, work_root)
+    cache_store = task_cache_store_for(args)
     attempt_started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix=f"{job_id}-", dir=work_root) as temporary:
         job_root = Path(temporary)
@@ -1647,6 +1676,7 @@ def run_claimed_job(
                 stop_event=stop_event,
                 worker_id=remote.worker,
                 allow_unsandboxed_dynamic=args.allow_unsandboxed_dynamic,
+                task_cache_store=cache_store,
             )
             if execution.get("interrupted"):
                 raise WorkerShutdown(
@@ -1669,7 +1699,12 @@ def run_claimed_job(
                     json.dumps(execution, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8",
                 )
-            scrub_private_paths(result_root, datasets=args.datasets, job_root=job_root)
+            scrub_private_paths(
+                result_root,
+                datasets=args.datasets,
+                job_root=job_root,
+                task_cache_root=args.task_cache_root,
+            )
             files = result_files(
                 result_root,
                 args.max_result_bytes,
@@ -1697,7 +1732,12 @@ def run_claimed_job(
             )
             artifacts = {}
             failure_packaging_started = time.monotonic()
-            scrub_private_paths(result_root, datasets=args.datasets, job_root=job_root)
+            scrub_private_paths(
+                result_root,
+                datasets=args.datasets,
+                job_root=job_root,
+                task_cache_root=args.task_cache_root,
+            )
             files = result_files(
                 result_root,
                 args.max_result_bytes,
@@ -1731,7 +1771,12 @@ def run_claimed_job(
         execution_path.write_text(
             json.dumps(execution, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-        scrub_private_paths(result_root, datasets=args.datasets, job_root=job_root)
+        scrub_private_paths(
+            result_root,
+            datasets=args.datasets,
+            job_root=job_root,
+            task_cache_root=args.task_cache_root,
+        )
         files = result_files(
             result_root,
             args.max_result_bytes,
@@ -1754,7 +1799,12 @@ def run_claimed_job(
         execution_path.write_text(
             json.dumps(execution, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-        scrub_private_paths(result_root, datasets=args.datasets, job_root=job_root)
+        scrub_private_paths(
+            result_root,
+            datasets=args.datasets,
+            job_root=job_root,
+            task_cache_root=args.task_cache_root,
+        )
         files = result_files(
             result_root,
             args.max_result_bytes,
@@ -1765,7 +1815,7 @@ def run_claimed_job(
         )
         uploaded.append("execution.json")
         completed = remote.finish(job_id, exit_code, uploaded, lease_token=lease_token)
-        return {
+        outcome = {
             "ok": exit_code == 0,
             "worker": remote.worker,
             "job": job_id,
@@ -1773,6 +1823,11 @@ def run_claimed_job(
             "state": completed.get("state"),
             "results": uploaded,
         }
+    # After every phase timing and upload: eviction never slows a job's result.
+    task_cache.prune_quietly(
+        cache_store, 2 * args.min_free_bytes, label=f"van-compute-worker[{remote.worker}]"
+    )
+    return outcome
 
 
 def run_once(args: WorkerConfig) -> dict[str, object]:
@@ -2145,6 +2200,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--remote-root", default=os.environ.get("VAN_COMPUTE_ROOT"))
     parser.add_argument("--worker", default=os.environ.get("VAN_COMPUTE_WORKER", socket.gethostname().split(".")[0]))
     parser.add_argument("--work-root", type=Path, default=DEFAULT_WORK_ROOT)
+    parser.add_argument("--task-cache-root", type=Path, default=task_cache.MAC_DEFAULT_ROOT)
+    parser.add_argument(
+        "--task-cache-max-bytes", type=int, default=task_cache.MAC_DEFAULT_MAX_BYTES
+    )
     parser.add_argument("--control-path", type=Path, default=DEFAULT_CONTROL_PATH)
     parser.add_argument("--python", default=os.environ.get("VAN_COMPUTE_PYTHON", "/opt/homebrew/bin/python3"))
     parser.add_argument("--sqlite3", default="/usr/bin/sqlite3")
@@ -2219,6 +2278,18 @@ def _validated_runtime_config(args) -> WorkerConfig:
         minimum_free_bytes=args.min_free_bytes,
         maximum_result_bytes=args.max_result_bytes,
     )
+    if args.task_cache_max_bytes < 1:
+        raise WorkerError("--task-cache-max-bytes must be positive")
+    try:
+        args.task_cache_root = task_cache.start_store(
+            args.task_cache_root,
+            args.task_cache_max_bytes,
+            work_root,
+            2 * args.min_free_bytes,
+            label="van-compute-worker",
+        )
+    except task_cache.TaskCacheError as exc:
+        raise WorkerError(str(exc)) from None
     return WorkerConfig.from_namespace(
         args,
         work_root=work_root,

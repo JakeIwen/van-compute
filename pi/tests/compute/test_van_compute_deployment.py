@@ -150,7 +150,7 @@ class VanComputeDeploymentTests(DeploymentFixtureMixin, unittest.TestCase):
         sandbox_calls = [
             call for call in local.calls if "/usr/bin/sandbox-exec" in call[0]
         ]
-        self.assertEqual(len(sandbox_calls), 6)
+        self.assertEqual(len(sandbox_calls), 7)
         sandbox_cwds = {call[5] for call in sandbox_calls}
         self.assertEqual(len(sandbox_cwds), 1)
         sandbox_cwd = next(iter(sandbox_cwds))

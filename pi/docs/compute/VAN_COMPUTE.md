@@ -46,9 +46,11 @@ SocketCAN, ADB, SSH, service managers, and network tools are not executable
 families.
 
 The Mac installer fails closed unless it can validate the effective
-`sandbox-exec` profile. Each job gets a clean environment and private
-HOME/TMP/cache, no credentials passed through its environment, no network, declared read-only
-datasets only, monitored resource ceilings, and a writable job directory only.
+`sandbox-exec` profile. Each job gets a clean environment and a private
+HOME and TMP, and a private cache unless its task opts into a persistent one
+(see Persistent task caches); no credentials passed through its environment, no
+network, declared read-only datasets only, monitored resource ceilings, and a
+writable job directory (plus its one declared cache) only.
 Private Mac dataset paths stay out of manifests and logical command telemetry;
 recognized text results are scrubbed before upload. Tasks that use a private
 dataset must not copy its physical path into binary output or files embedded in
@@ -90,6 +92,57 @@ used only after explicit review, never as the normal configuration.
 Live CAN/SocketCAN access, interface configuration, bus wake or UDS traffic,
 ADB/device access, routing, storage, and service control never go through this
 system.
+
+## Persistent task caches
+
+A repo task may declare `"cache": "<name>"` in `.van-compute.json` (lowercase
+letters, digits and hyphens, at most 64 characters). That job's
+`XDG_CACHE_HOME` is then a directory that outlives the job, instead of a
+private per-job one. It exists to avoid re-downloading package-manager
+downloads on every run; venvs and results stay per job.
+
+- **Scope.** One cache per worker (Pi broker and Mac worker each keep their
+  own), keyed by the job's `source_root` path and the declared name, so the
+  same name in two repos is two caches. Isolation holds between jobs admitted
+  through normal submission, which fixes `source_root`; a same-account
+  submitter who forges `source_root` can reach another repo's cache.
+- **Not trusted, not durable.** A cache is never results and never a trusted
+  input: any job of that repo and name can leave anything in it, and it may
+  vanish at any time (eviction, `clear`). Tasks must tolerate an empty cache
+  and treat its contents as untrusted.
+- **Sharing.** Concurrent jobs of one cache share the directory and must lock
+  what they need themselves (obd-things `flock`s its own lock file inside the
+  cache). The store holds a shared `flock` for each job's whole run, until the
+  child and its process group are gone, and takes an exclusive one only to
+  initialize, evict or clear, so a cache in use is never touched.
+- **Eviction.** Between jobs (at startup and after each job) whole idle caches
+  are evicted least-recently-used first until the total is under
+  `--task-cache-max-bytes` (Pi 2 GiB, Mac 4 GiB) and the filesystem has twice
+  the host's free-space reserve free. That is a target, not a quota:
+  concurrent active caches can exceed it. A cache that cannot be measured
+  (for example a mode-000 directory) counts as over the cap and is evicted
+  when idle.
+- **Network.** Pi jobs run with no network, so a Pi cache fills only from what
+  the job brings in. Mac jobs reach the network only where the worker runs
+  unsandboxed (`--allow-unsandboxed-dynamic`, the current install).
+- **Locations.** Pi: `<queue root>/task-caches` (`--task-cache-root`, inside
+  the broker unit's `ReadWritePaths`). Mac:
+  `~/Library/Caches/van-compute/task-caches`. Each must be on the same
+  filesystem as the host's work root; startup fails otherwise so the
+  free-space watchdog and admission cover it.
+- **Mac sandbox.** The profile grants read/write on the `CACHE_ROOT`
+  parameter, which is the selected cache directory for a cached job and the
+  job's own `cache` directory otherwise. The installer probe checks the
+  selected cache is usable and that a sibling cache, a private sentinel and a
+  symlink inside the cache pointing at the sentinel are not writable.
+- **Operate.** `python3 -m van_compute.task_cache [--root R] list` shows
+  namespace, name, bytes (or unmeasurable), last use and whether in use;
+  `clear --all` or `clear <namespace>/<name>` removes idle caches and reports
+  busy ones. `execution.json` records `task_cache` for cached Mac jobs.
+- **Deploy order.** A pre-cache worker rejects a job whose execution carries
+  `cache` and fails it (it never runs silently uncached). Deploy both hosts
+  before a repo declares a cache, and drop the declarations before rolling
+  back to a pre-cache release while cached jobs may be queued.
 
 ## Completed-history retention
 

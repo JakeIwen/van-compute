@@ -43,6 +43,7 @@ SANDBOX_PROFILE = r'''(version 1)
     (subpath "/Library/Java")
     (subpath (param "WORKER_ROOT"))
     (subpath (param "JOB_ROOT"))
+    (subpath (param "CACHE_ROOT"))
     (subpath (param "DATASET_0"))
     (subpath (param "DATASET_1"))
     (subpath (param "DATASET_2"))
@@ -64,6 +65,7 @@ SANDBOX_PROFILE = r'''(version 1)
     (literal "/dev/urandom"))
 (allow file-write*
     (subpath (param "JOB_ROOT"))
+    (subpath (param "CACHE_ROOT"))
     (literal "/dev/null"))
 '''
 
@@ -96,6 +98,36 @@ else:
 finally:
     if probe_socket is not None:
         probe_socket.close()
+'''
+
+# Runs inside the sandbox with CACHE_ROOT bound to its first argument: the
+# selected cache must be usable while sibling caches, a private sentinel and a
+# symlink planted in the cache that points at the sentinel stay unwritable.
+SANDBOX_CACHE_PROBE = r'''
+import errno
+from pathlib import Path
+import sys
+
+selected, other, sentinel, link = (Path(item) for item in sys.argv[1:5])
+(selected / "probe.txt").write_text("ok", encoding="utf-8")
+if (selected / "probe.txt").read_text(encoding="utf-8") != "ok":
+    raise SystemExit("sandbox could not read back its selected cache")
+
+
+def require_denied(label, action):
+    try:
+        action()
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.EPERM}:
+            return
+        raise
+    raise SystemExit(f"sandbox allowed {label}")
+
+
+require_denied("a read of another cache", lambda: (other / "probe.txt").read_text())
+require_denied("a write to another cache", lambda: (other / "probe.txt").write_text("x"))
+require_denied("a write to a private sentinel", lambda: sentinel.write_text("x"))
+require_denied("a write through a cache symlink", lambda: link.write_text("x"))
 '''
 
 

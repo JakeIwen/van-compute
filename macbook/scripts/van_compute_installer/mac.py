@@ -15,7 +15,7 @@ import uuid
 
 from .constants import (
     DEPLOYMENT_HASH_FILE, LABEL, MANIFEST_FILE, OWNER_RE, PROVENANCE_FILE,
-    SANDBOX_DENIAL_PROBE, SANDBOX_PROFILE, SOURCE_HASH_FILE,
+    SANDBOX_CACHE_PROBE, SANDBOX_DENIAL_PROBE, SANDBOX_PROFILE, SOURCE_HASH_FILE,
 )
 from .models import DeploymentError, OwnedBuild, SourceRelease
 
@@ -185,7 +185,9 @@ class MacProvisionMixin:
                 "the macOS /usr/bin/sqlite3 executable is unavailable"
             )
 
-    def _sandbox_arguments(self, staging: Path, sandbox_test: Path) -> list[str]:
+    def _sandbox_arguments(
+        self, staging: Path, sandbox_test: Path, cache_selected: Path
+    ) -> list[str]:
         arguments = [
             "/usr/bin/sandbox-exec",
             "-f",
@@ -194,6 +196,8 @@ class MacProvisionMixin:
             f"WORKER_ROOT={staging}",
             "-D",
             f"JOB_ROOT={sandbox_test}",
+            "-D",
+            f"CACHE_ROOT={cache_selected}",
         ]
         for index in range(16):
             arguments.extend(("-D", f"DATASET_{index}=/dev/null"))
@@ -285,6 +289,41 @@ class MacProvisionMixin:
             cwd=sandbox_test,
         )
 
+    def _run_cache_probe(
+        self,
+        staging: Path,
+        sandbox_test: Path,
+        sentinel: Path,
+        prefix: list[str],
+        cache_selected: Path,
+        cache_other: Path,
+    ) -> None:
+        link = cache_selected / "sentinel-link"
+        link.symlink_to(sentinel)
+        # Pre-existing, so the probe sees a permission denial rather than the
+        # ENOENT that the profile's global metadata read grant would give.
+        other_file = cache_other / "probe.txt"
+        other_file.write_text("other", encoding="utf-8")
+        before = sentinel.read_bytes()
+        self.local.run(
+            prefix
+            + [
+                str(staging / "venv/bin/python"),
+                "-c",
+                SANDBOX_CACHE_PROBE,
+                str(cache_selected),
+                str(cache_other),
+                str(sentinel),
+                str(link),
+            ],
+            cwd=sandbox_test,
+        )
+        if (
+            sentinel.read_bytes() != before
+            or other_file.read_text(encoding="utf-8") != "other"
+        ):
+            raise DeploymentError("sandbox wrote outside its selected cache")
+
     def _validate_sandbox_release(self, staging: Path) -> None:
         self.say(
             "Validating macOS job isolation before changing the running worker..."
@@ -295,19 +334,34 @@ class MacProvisionMixin:
             tempfile.mkdtemp(prefix=".sandbox-test.", dir=self.paths.cache_root)
         )
         os.chmod(sandbox_test, 0o700)
+        # Sibling directories, never nested, so the probe proves the profile
+        # grants only the selected cache and not its neighbours.
+        cache_selected = Path(
+            tempfile.mkdtemp(prefix=".sandbox-cache-selected.", dir=self.paths.cache_root)
+        )
+        cache_other = Path(
+            tempfile.mkdtemp(prefix=".sandbox-cache-other.", dir=self.paths.cache_root)
+        )
         sentinel = self.paths.cache_root / f".sandbox-sentinel.{self.install_id}"
         sentinel.write_text("must-not-be-readable\n", encoding="utf-8")
         os.chmod(sentinel, 0o600)
         environment = self._sandbox_environment(sandbox_test)
-        prefix = self._sandbox_arguments(staging, sandbox_test) + environment
+        prefix = (
+            self._sandbox_arguments(staging, sandbox_test, cache_selected)
+            + environment
+        )
         checks = self._sandbox_checks(staging, sandbox_test)
         try:
             self._run_sandbox_checks(
                 staging, sandbox_test, sentinel, prefix, checks
             )
+            self._run_cache_probe(
+                staging, sandbox_test, sentinel, prefix, cache_selected, cache_other
+            )
         finally:
             sentinel.unlink(missing_ok=True)
-            shutil.rmtree(sandbox_test, ignore_errors=True)
+            for directory in (sandbox_test, cache_selected, cache_other):
+                shutil.rmtree(directory, ignore_errors=True)
 
     def _validate_process_watchdog(self, staging: Path) -> None:
         self.say("Checking Mac process-group resource watchdog...")

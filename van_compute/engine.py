@@ -479,6 +479,7 @@ def _mac_sandbox_command(
     datasets: Mapping[str, Path],
     worker_root: Path,
     error_type: type[RuntimeError],
+    cache_root: Path | None = None,
 ) -> list[str]:
     if profile is None:
         return list(command)
@@ -494,6 +495,9 @@ def _mac_sandbox_command(
         "SOURCE_ROOT": source_root,
         "INPUT_ROOT": job_root / "inputs",
         "RESULT_ROOT": result_root,
+        # Always passed so the installed profile's CACHE_ROOT slot is bound;
+        # an uncached job's cache is already inside JOB_ROOT.
+        "CACHE_ROOT": job_root / "cache" if cache_root is None else cache_root,
         "HOME": environment["HOME"],
         "TMPDIR": environment["TMPDIR"],
     }
@@ -564,6 +568,7 @@ class MacSandbox:
     datasets: Mapping[str, Path]
     worker_root: Path
     error_type: type[RuntimeError]
+    cache_root: Path | None = None
 
     def command_path(self, path: Path, area: str) -> Path:
         return path
@@ -584,4 +589,5 @@ class MacSandbox:
             datasets=self.datasets,
             worker_root=self.worker_root,
             error_type=self.error_type,
+            cache_root=self.cache_root,
         )
