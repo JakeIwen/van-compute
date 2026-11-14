@@ -121,6 +121,18 @@ if '--background' in sys.argv:
     print(f'background={child.pid}', flush=True)
 if '--fail' in sys.argv:
     raise SystemExit(7)
+hang = [a for a in sys.argv if a.startswith('--hang=')]
+if hang:
+    # Ignore SIGTERM here and in a descendant, then run until something kills
+    # the process group.  The token in both command lines lets a test find them.
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    subprocess.Popen([
+        sys.executable, '-c',
+        'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+        'time.sleep(60)  # ' + hang[0],
+    ])
+    time.sleep(60)
 """
 
 

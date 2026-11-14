@@ -39,7 +39,9 @@ from typing import Callable, Mapping, Sequence
 
 from van_compute import engine, limited_child, queue, task_cache
 from van_compute.config import BrokerConfig, MissedOffloadRecord
+from van_compute.can_activity import CanObserver
 from van_compute.job_requeue import requeue_running_job
+from van_compute.pi_can_stop import CanStopped, StopLatch, requeue_after_can_stop
 from van_compute.pi_gate_flags import add_gate_arguments, validated_thresholds
 from van_compute.pi_health_monitor import HealthMonitor
 from van_compute.pi_health import (
@@ -695,6 +697,7 @@ def _wait_for_process(
     free_space_reader: Callable[[Path], int] = lambda path: max(
         0, shutil.disk_usage(path).free
     ),
+    terminate_grace: float | Callable[[], float] = engine.DEFAULT_TERMINATE_GRACE,
 ) -> LocalProcessOutcome:
     outcome = engine.wait_for_process(
         process,
@@ -707,6 +710,7 @@ def _wait_for_process(
         free_space_reader=free_space_reader,
         poll=_wait4_nohang,
         clock=time,
+        terminate_grace=terminate_grace,
     )
     return LocalProcessOutcome(
         outcome.exit_code,
@@ -1048,12 +1052,46 @@ def _local_analysis_command(
     return command, runtime_bindings
 
 
+def _supervise_child(process, args: BrokerConfig, work: Path, stop: StopLatch):
+    try:
+        outcome = _wait_for_process(
+            process,
+            timeout=args.timeout,
+            should_stop=stop.should_stop,
+            work_path=work,
+            minimum_free_bytes=args.min_work_free_bytes + args.max_result_bytes,
+            terminate_grace=stop.terminate_grace,
+        )
+        cleaned = terminate_remaining_process_group(
+            process.pid, terminate_grace=stop.group_grace()
+        )
+        return outcome, cleaned
+    except BaseException:
+        # Whatever went wrong, the child and its group must be gone before the
+        # cache scope around the launch is released.
+        engine.kill_and_reap_group(process)
+        raise
+
+
+def _requeue_for_can(root, job_id, lease_token, stop, work):
+    return requeue_after_can_stop(
+        root,
+        job_id,
+        lease_token,
+        worker=LOCAL_WORKER,
+        cause=str(stop.cause),
+        work=work,
+        error_type=BrokerError,
+    )
+
+
 def execute_claimed_job(
     args: BrokerConfig,
     root: Path,
     manifest: dict[str, object],
     *,
     should_stop: Callable[[], bool] = lambda: False,
+    observe_can: CanObserver | None = None,
 ) -> dict[str, object]:
     job_id = queue.validate_job_id(str(manifest.get("id", "")))
     lease_token = str(manifest.get("lease_token", ""))
@@ -1071,6 +1109,9 @@ def execute_claimed_job(
     capacity_ok, capacity_reason = work_capacity_eligibility(manifest, args)
     if not capacity_ok:
         raise BrokerError(capacity_reason)
+    stop = StopLatch(should_stop, observe_can)
+    if not stop.clear_to_launch():
+        return _requeue_for_can(root, job_id, lease_token, stop, None)
     broker_active_started = time.monotonic()
     work_root = prepare_work_root(args.work_root)
     cache_store = (
@@ -1147,26 +1188,17 @@ def execute_claimed_job(
             started = utc_now()
             started_monotonic = time.monotonic()
 
-            def supervise(process):
-                outcome = _wait_for_process(
-                    process,
-                    timeout=args.timeout,
-                    should_stop=should_stop,
-                    work_path=work,
-                    minimum_free_bytes=args.min_work_free_bytes + args.max_result_bytes,
-                )
-                cleaned = terminate_remaining_process_group(process.pid)
-                return outcome, cleaned
-
             # The cache stays locked until the child and its process group are reaped.
             with cache_scope:
-                outcome, background_descendants_terminated = engine.run_child(
-                    child_command,
-                    cwd=work,
-                    environment=environment,
-                    result_root=result_root,
-                    supervise=supervise,
-                )
+                if stop.clear_to_launch():
+                    outcome, background_descendants_terminated = engine.run_child(
+                        child_command,
+                        cwd=work,
+                        environment=environment,
+                        result_root=result_root,
+                        supervise=lambda p: _supervise_child(p, args, work, stop),
+                    )
+            stop.raise_if_can_stopped()
             duration = time.monotonic() - started_monotonic
             resource_usage = _resource_usage(outcome.usage, duration)
             resource_usage.update(
@@ -1257,6 +1289,8 @@ def execute_claimed_job(
             files = _result_files(
                 manifest, result_root, args.max_result_bytes, artifacts
             )
+        except CanStopped:
+            pass
         except Exception as exc:
             exit_code, execution = _failure_results(result_root, manifest, exc)
             artifacts = {}
@@ -1266,6 +1300,9 @@ def execute_claimed_job(
 
         else:
             exit_code = outcome.exit_code
+
+        if stop.can_cause:
+            return _requeue_for_can(root, job_id, lease_token, stop, work)
 
         uploaded: list[str] = []
         upload_started = time.monotonic()
@@ -1323,6 +1360,19 @@ def execute_claimed_job(
     return result
 
 
+def _observe_and_pick_reader(monitor, health_reader):
+    """Observe CAN before any early return so deferrals (maintenance, a fresh
+    remote lease) keep the quiet chain unbroken.  The monitor is owned by
+    serve() or main(); building one per call would reset the chain every poll."""
+    if monitor is not None:
+        monitor.observe_can()
+    if health_reader is not None:
+        return health_reader
+    if monitor is None:
+        raise BrokerError("run_once needs a health monitor or a health reader")
+    return monitor.snapshot
+
+
 def run_once(
     args: BrokerConfig,
     *,
@@ -1331,15 +1381,7 @@ def run_once(
     should_stop: Callable[[], bool] = lambda: False,
     monitor: HealthMonitor | None = None,
 ) -> dict[str, object]:
-    # Observe CAN before any early return so deferrals (maintenance, a fresh
-    # remote lease) keep the quiet chain unbroken.  The monitor is owned by
-    # serve() or main(); building one here would reset the chain every poll.
-    if monitor is not None:
-        monitor.observe_can()
-    if health_reader is None:
-        if monitor is None:
-            raise BrokerError("run_once needs a health monitor or a health reader")
-        health_reader = monitor.snapshot
+    health_reader = _observe_and_pick_reader(monitor, health_reader)
     root = queue.safe_root(args.root)
     work_root = prepare_work_root(args.work_root)
     args.work_root = work_root
@@ -1399,7 +1441,10 @@ def run_once(
         root,
         manifest,
         should_stop=should_stop,
+        observe_can=None if monitor is None else monitor.observe_can,
     )
+    if "action" in result:  # stopped for CAN and requeued, or left untouched
+        return result
     return {"action": "executed", **result}
 
 

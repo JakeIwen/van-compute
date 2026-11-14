@@ -99,7 +99,13 @@ def wait4_nohang(process: subprocess.Popen):
     return process.returncode, usage
 
 
-def _finish_wait(process, monitor, timed_out, interrupted, poll, clock):
+DEFAULT_TERMINATE_GRACE = 10.0
+
+
+def _finish_wait(
+    process, monitor, timed_out, interrupted, poll, clock,
+    terminate_grace=DEFAULT_TERMINATE_GRACE,
+):
     limited = (
         (monitor.resource_limit is not None or monitor.resource_monitor_error is not None)
         if monitor.host is Host.PI
@@ -122,7 +128,8 @@ def _finish_wait(process, monitor, timed_out, interrupted, poll, clock):
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
-    terminate_deadline = clock.monotonic() + 10
+    grace = terminate_grace() if callable(terminate_grace) else terminate_grace
+    terminate_deadline = clock.monotonic() + grace
     while clock.monotonic() < terminate_deadline:
         completed = poll(process)
         if completed is not None:
@@ -157,8 +164,13 @@ def wait_for_process(
     resource_reader: Callable[[int], tuple[int, int]] | None = None,
     poll: Callable = wait4_nohang,
     clock=time,
+    terminate_grace: float | Callable[[], float] = DEFAULT_TERMINATE_GRACE,
 ) -> ProcessOutcome:
-    """Shared wait/reap/escalation; Pi final disk sample and Mac RSS stay distinct."""
+    """Shared wait/reap/escalation; Pi final disk sample and Mac RSS stay distinct.
+
+    `terminate_grace` is the SIGTERM-to-SIGKILL delay; a callable is evaluated
+    when the stop happens, so a stop cause latched during the wait can shorten it.
+    """
     deadline = clock.monotonic() + timeout
     next_resource_poll = 0.0
     timed_out = interrupted = False
@@ -192,7 +204,22 @@ def wait_for_process(
                 break
             next_resource_poll = now + (0.5 if host is Host.PI else 1.0)
         clock.sleep(0.1)
-    return _finish_wait(process, monitor, timed_out, interrupted, poll, clock)
+    return _finish_wait(
+        process, monitor, timed_out, interrupted, poll, clock, terminate_grace
+    )
+
+
+def kill_and_reap_group(process: subprocess.Popen) -> None:
+    """SIGKILL the child's whole process group and reap the child itself."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        _pid, status, _usage = os.wait4(process.pid, 0)
+    except ChildProcessError:
+        return  # already reaped by the wait loop
+    process.returncode = os.waitstatus_to_exitcode(status)
 
 
 def process_group_exists(

@@ -104,6 +104,58 @@ class SharedEngineTests(unittest.TestCase):
                     [mock.call(77, signal.SIGTERM), mock.call(77, signal.SIGKILL)],
                 )
 
+    def test_terminate_grace_sets_the_sigterm_to_sigkill_delay(self):
+        for grace, expected in ((None, 10.0), (1.0, 1.0), (lambda: 3.0, 3.0)):
+            with self.subTest(grace=grace):
+                clock = Clock()
+                killed = []
+
+                def kill(_pid, sent, clock=clock, killed=killed):
+                    killed.append((sent, clock.now))
+
+                extra = {} if grace is None else {"terminate_grace": grace}
+                with mock.patch.object(engine.os, "killpg", kill), mock.patch.object(
+                    engine.os, "wait4", return_value=(77, 0, "usage")
+                ):
+                    self.wait(
+                        engine.Host.PI, poll=lambda _p: None, should_stop=lambda: True,
+                        clock=clock, **extra,
+                    )
+                (term, started), (sigkill, escalated) = killed
+                self.assertEqual((term, sigkill), (signal.SIGTERM, signal.SIGKILL))
+                self.assertAlmostEqual(escalated - started, expected, delta=0.11)
+
+    def test_callable_terminate_grace_is_read_when_the_stop_happens(self):
+        reads = []
+        stops = iter([False, False, True])
+
+        def grace():
+            reads.append(1)
+            return 1.0
+
+        with mock.patch.object(engine.os, "killpg"), mock.patch.object(
+            engine.os, "wait4", return_value=(77, 0, "usage")
+        ):
+            self.wait(
+                engine.Host.PI, poll=lambda _p: None,
+                should_stop=lambda: next(stops), terminate_grace=grace,
+            )
+        self.assertEqual(reads, [1])
+
+    def test_kill_and_reap_group_kills_the_group_and_reaps_the_child(self):
+        process = SimpleNamespace(pid=77, returncode=None)
+        with mock.patch.object(engine.os, "killpg") as kill, mock.patch.object(
+            engine.os, "wait4", return_value=(77, 9, "usage")
+        ) as reap:
+            engine.kill_and_reap_group(process)
+        kill.assert_called_once_with(77, signal.SIGKILL)
+        reap.assert_called_once_with(77, 0)
+        self.assertEqual(process.returncode, -9)
+        with mock.patch.object(
+            engine.os, "killpg", side_effect=ProcessLookupError
+        ), mock.patch.object(engine.os, "wait4", side_effect=ChildProcessError):
+            engine.kill_and_reap_group(process)  # already gone: no error
+
     def test_host_specific_process_group_permission_policy(self):
         with mock.patch.object(
             engine.os, "killpg", side_effect=PermissionError("denied")

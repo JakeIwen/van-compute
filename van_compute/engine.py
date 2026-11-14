@@ -19,8 +19,8 @@ from typing import Callable, Mapping, Protocol, Sequence, TypeVar
 
 from van_compute import protocol
 from van_compute.engine_process import (
-    Host, ProcessOutcome, process_group_exists, terminate_group,
-    wait4_nohang, wait_for_process,
+    DEFAULT_TERMINATE_GRACE, Host, ProcessOutcome, kill_and_reap_group,
+    process_group_exists, terminate_group, wait4_nohang, wait_for_process,
 )
 
 

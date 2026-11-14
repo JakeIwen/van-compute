@@ -80,6 +80,41 @@ file counts as CAN active (fail closed). The obd-things lock files must never
 be replaced or removed while they have owners: a replacement is a different
 inode that the old holders do not lock.
 
+Running jobs are stopped, not just kept from starting. While a Pi-local child
+runs, the broker checks CAN at most every 0.5 s (the same probe, fed to the same
+quiet chain). The first stop cause latched wins:
+
+- A CAN write lock (`pi-can-transmit`) or a probe failure (`can-probe-failed`,
+  fail closed) sends SIGTERM to the job's process group, then SIGKILL after 1 s
+  instead of the usual 10 s, and kills any descendant left behind at once. The
+  broker discards the job's temporary outputs and local work, then, under one
+  queue lock, re-reads the manifest and checks that the worker is the local
+  one and the lease token is this attempt's. If so it appends an
+  `attempt_history` entry (reason `pi-can-transmit` or `can-probe-failed`),
+  strips the ownership fields, resets the result directory and moves the job to
+  `queued/` before publishing the manifest (the order the stale-remote-lease
+  recovery uses, so a crash cannot strand it). It logs
+  `{"action": "requeued", "reason": ..., "job_id": ...}` and publishes no
+  results, validation, packaging or completion telemetry and never calls
+  `worker_finish`. A later claim gets a fresh lease token, and uploads under
+  the old token are rejected. If ownership was lost, or the queue is under
+  maintenance, the job is left exactly as it is.
+- A service stop keeps today's behavior: the job fails with an interrupted
+  result.
+- CAN is also checked before staging and again, with the task cache held,
+  immediately before the child launches; a lock there requeues with no child
+  started.
+- Any exception while waiting on a child kills and reaps its process group
+  before the cache is released.
+
+The guarantee is bounded. No Pi-local job starts while a CAN transmitter lock is
+held or until CAN has been quiet for `--can-quiet-seconds`; a running job's
+process group is gone about 1.5 s after a lock appears (0.5 s watch, SIGTERM,
+SIGKILL after 1 s). A burst shorter than the watch interval can pass unseen,
+and strict zero overlap would need a handshake with the senders. Once the child
+has exited on its own, its results publish without another CAN check: that is a
+bounded local copy at the unit's `IOWeight=10`.
+
 `--once` first watches CAN every 0.5 s for up to `--can-quiet-seconds` (stopping
 early, and deferring, if a lock appears). `--health` prints the current snapshot
 and assessment as JSON and exits 0 whether or not the gate passes; it takes no

@@ -1,0 +1,341 @@
+import os
+from pathlib import Path
+import secrets
+import subprocess
+import time
+import unittest
+from unittest import mock
+
+from van_compute import broker, pi_can_stop, queue
+from van_compute.can_activity import CanProbe
+from van_compute.pi_can_stop import (
+    CAN_PROBE_FAILED, CAN_TRANSMIT, SERVICE_STOP, StopLatch,
+)
+from van_compute.pi_health_monitor import HealthMonitor
+
+from pi.tests.compute.test_van_compute_pi_health import FixedRates
+from pi.tests.compute.van_compute_test_fixtures import BrokerHarness, GOOD_HEALTH
+
+QUIET = CanProbe(False, (), None)
+HELD = CanProbe(True, ("active-diagnostics-can0.lock",), None)
+
+
+class LatchClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class StopLatchTests(unittest.TestCase):
+    def latch(self, service=lambda: False, observe=lambda: QUIET):
+        clock = LatchClock()
+        return StopLatch(service, observe, clock=clock), clock
+
+    def test_can_is_checked_at_most_every_half_second(self):
+        calls = []
+        latch, clock = self.latch(observe=lambda: calls.append(1) or QUIET)
+        for _ in range(10):  # the wait loop calls every 0.1 s
+            self.assertFalse(latch.should_stop())
+            clock.now += 0.1
+        self.assertEqual(len(calls), 2)
+
+    def test_first_cause_wins_service_then_can(self):
+        stop = {"on": False}
+        probe = {"value": QUIET}
+        latch, clock = self.latch(lambda: stop["on"], lambda: probe["value"])
+        self.assertFalse(latch.should_stop())
+        stop["on"] = True
+        clock.now += 0.1
+        self.assertTrue(latch.should_stop())
+        probe["value"] = HELD
+        clock.now += 1.0
+        self.assertTrue(latch.should_stop())
+        self.assertEqual(latch.cause, SERVICE_STOP)
+        self.assertFalse(latch.can_cause)
+        self.assertEqual(latch.terminate_grace(), 10.0)
+        self.assertEqual(latch.group_grace(), 2.0)
+
+    def test_first_cause_wins_can_then_service(self):
+        stop = {"on": False}
+        probe = {"value": QUIET}
+        latch, clock = self.latch(lambda: stop["on"], lambda: probe["value"])
+        probe["value"] = HELD
+        self.assertTrue(latch.should_stop())
+        stop["on"] = True
+        clock.now += 1.0
+        self.assertTrue(latch.should_stop())
+        self.assertEqual(latch.cause, CAN_TRANSMIT)
+        self.assertEqual(latch.detail, "active-diagnostics-can0.lock")
+        self.assertEqual(latch.terminate_grace(), 1.0)
+        self.assertEqual(latch.group_grace(), 0.0)
+
+    def test_a_simultaneous_can_and_service_stop_takes_the_faster_kill(self):
+        latch, _clock = self.latch(lambda: True, lambda: HELD)
+        self.assertTrue(latch.should_stop())
+        self.assertEqual(latch.cause, CAN_TRANSMIT)
+
+    def test_probe_exception_latches_probe_failed_and_never_escapes(self):
+        def boom():
+            raise OSError("proc gone")
+
+        latch, _clock = self.latch(observe=boom)
+        self.assertTrue(latch.should_stop())
+        self.assertEqual(latch.cause, CAN_PROBE_FAILED)
+        self.assertTrue(latch.can_cause)
+        self.assertIn("proc gone", latch.detail)
+
+    def test_probe_error_result_latches_probe_failed(self):
+        latch, _clock = self.latch(observe=lambda: CanProbe(False, (), "no dir"))
+        self.assertTrue(latch.should_stop())
+        self.assertEqual(latch.cause, CAN_PROBE_FAILED)
+
+    def test_clear_to_launch_checks_immediately(self):
+        latch, _clock = self.latch(observe=lambda: HELD)
+        self.assertFalse(latch.clear_to_launch())
+        quiet, _clock = self.latch()
+        self.assertTrue(quiet.clear_to_launch())
+
+    def test_without_an_observer_only_the_service_stop_applies(self):
+        latch = StopLatch(lambda: False, None)
+        self.assertFalse(latch.should_stop())
+        self.assertTrue(latch.clear_to_launch())
+
+
+class CanStopTests(BrokerHarness, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.token = f"--hang={secrets.token_hex(8)}"
+        self.calls = 0
+        self.seen_active_at = None
+        self.seen_pids = []
+
+    def active_after_launch(self, _directory=None):
+        """Quiet until the job is running, then a held lock."""
+        self.calls += 1
+        if self.hang_pids():
+            if self.seen_active_at is None:
+                self.seen_active_at = time.monotonic()
+                self.seen_pids = self.hang_pids()
+                self.assertEqual(len(self.seen_pids), 2)
+            return HELD
+        return QUIET
+
+    def monitor(self, probe):
+        return HealthMonitor(
+            Path("/unused"), probe=probe, sampler=FixedRates()
+        )
+
+    def run_with(self, probe, **keywords):
+        monitor = self.monitor(probe)
+        with mock.patch.object(
+            broker, "bubblewrap_self_test", return_value=(True, "test")
+        ), mock.patch.object(broker, "bubblewrap_command", side_effect=self.no_sandbox):
+            return broker.run_once(
+                self.args,
+                health_reader=lambda: GOOD_HEALTH,
+                monitor=monitor,
+                **keywords,
+            )
+
+    def submit_hanging(self):
+        return self.submit(arguments=[self.token])
+
+    def hang_pids(self):
+        """Pids of the job and its descendant (both carry the token)."""
+        listing = subprocess.run(
+            ["ps", "-axo", "pid=,command="], capture_output=True, text=True
+        ).stdout
+        return [
+            int(line.split(None, 1)[0])
+            for line in listing.splitlines()
+            if self.token in line and "ps -axo" not in line
+        ]
+
+    def assert_gone(self, pids):
+        deadline = time.monotonic() + 3
+        for pid in pids:
+            while True:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                if time.monotonic() > deadline:
+                    os.kill(pid, 9)
+                    self.fail(f"process {pid} survived")
+                time.sleep(0.05)
+
+    def queued_manifest(self, job_id):
+        return queue.load_json(self.root / "queued" / job_id / "manifest.json")
+
+    def test_running_job_is_stopped_fast_and_requeued_untouched(self):
+        submitted = self.submit_hanging()
+        with mock.patch.object(
+            broker, "_finish_local_job"
+        ) as finish, mock.patch.object(
+            broker, "_put_local_result"
+        ) as upload, mock.patch.object(
+            broker, "_record_local_execution_once"
+        ) as telemetry:
+            result = self.run_with(self.active_after_launch)
+        stopped_after = time.monotonic() - self.seen_active_at
+
+        self.assertEqual(
+            result,
+            {"action": "requeued", "reason": "pi-can-transmit", "job_id": submitted["id"]},
+        )
+        # 0.5 s watch + 1 s SIGTERM grace (the job and a descendant ignore
+        # SIGTERM); the usual grace would be 10 s.
+        self.assertLess(stopped_after, 4.0)
+        self.assert_gone(self.seen_pids)
+        finish.assert_not_called()
+        upload.assert_not_called()
+        telemetry.assert_not_called()
+        self.assertEqual(list((self.root / "missed").glob("*.json")), [])
+        self.assertFalse((self.root / "running" / submitted["id"]).exists())
+        self.assertFalse((self.root / "done" / submitted["id"]).exists())
+        manifest = self.queued_manifest(submitted["id"])
+        self.assertEqual(manifest["state"], "queued")
+        for field in ("worker", "lease_token", "placement", "started_at"):
+            self.assertNotIn(field, manifest)
+        self.assertEqual(manifest["requeue_reason"], "pi-can-transmit")
+        history = manifest["attempt_history"]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["reason"], "pi-can-transmit")
+        self.assertEqual(history[0]["worker"], broker.LOCAL_WORKER)
+        self.assertEqual(history[0]["attempt"], 1)
+        self.assertEqual(
+            sorted(p.name for p in (self.root / "queued" / submitted["id"] / "result").iterdir()),
+            [],
+        )
+        self.assertEqual(list(self.work.iterdir()), [])
+
+    def test_a_later_claim_gets_a_new_lease_and_the_old_token_is_rejected(self):
+        submitted = self.submit_hanging()
+        with mock.patch.object(
+            broker, "execute_claimed_job", wraps=broker.execute_claimed_job
+        ) as execute:
+            self.run_with(self.active_after_launch)
+        old_token = execute.call_args.args[2]["lease_token"]
+
+        root = queue.safe_root(self.root)
+        claimed, _reason = broker.claim_local_job(
+            root, grace_seconds=0.0, remote_max_age=45.0
+        )
+        self.assertEqual(claimed["id"], submitted["id"])
+        self.assertEqual(claimed["attempt"], 2)
+        self.assertNotEqual(claimed["lease_token"], old_token)
+        upload = self.source / "upload.txt"
+        upload.write_text("late")
+        with upload.open("rb") as handle, self.assertRaises(queue.QueueError):
+            queue.put_result(
+                root, submitted["id"], broker.LOCAL_WORKER, "late.txt", handle,
+                lease_token=old_token,
+            )
+
+    def test_a_job_claimed_by_someone_else_is_left_untouched(self):
+        submitted = self.submit_hanging()
+        other = secrets.token_hex(16)
+        manifest_path = self.root / "running" / submitted["id"] / "manifest.json"
+
+        def steal_then_report(directory=None):
+            probe = self.active_after_launch()
+            if probe.active and queue.load_json(manifest_path)["lease_token"] != other:
+                stolen = queue.load_json(manifest_path)
+                stolen["lease_token"] = other
+                queue.atomic_json(manifest_path, stolen)
+            return probe
+
+        result = self.run_with(steal_then_report)
+
+        self.assertEqual(result["action"], "deferred")
+        self.assertIn("ownership-lost", result["reason"])
+        self.assertTrue((self.root / "running" / submitted["id"]).is_dir())
+        self.assertFalse((self.root / "queued" / submitted["id"]).exists())
+        kept = queue.load_json(manifest_path)
+        self.assertEqual(kept["lease_token"], other)
+        self.assertNotIn("attempt_history", kept)
+        self.assert_gone(self.seen_pids)
+
+    def test_probe_exception_stops_and_requeues_as_probe_failed(self):
+        submitted = self.submit_hanging()
+
+        def flaky(directory=None):
+            if self.hang_pids():
+                self.seen_pids = self.hang_pids()
+                raise RuntimeError("lock table unreadable")
+            return QUIET
+
+        result = self.run_with(flaky)
+        self.assertEqual(result["action"], "requeued")
+        self.assertEqual(result["reason"], "can-probe-failed")
+        self.assertEqual(
+            self.queued_manifest(submitted["id"])["attempt_history"][-1]["reason"],
+            "can-probe-failed",
+        )
+        self.assert_gone(self.seen_pids)
+
+    def test_service_stop_still_fails_the_job_as_before(self):
+        submitted = self.submit_hanging()
+        with mock.patch.object(pi_can_stop, "DEFAULT_TERMINATE_GRACE", 0.5):
+            result = self.run_with(
+                lambda _dir=None: QUIET, should_stop=lambda: bool(self.hang_pids())
+            )
+        self.assertEqual(result["action"], "executed")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["execution"]["interrupted"])
+        self.assertFalse((self.root / "queued" / submitted["id"]).exists())
+        self.assertTrue((self.root / "failed" / submitted["id"]).is_dir())
+        self.assert_gone(self.seen_pids)
+
+    def test_can_before_the_child_is_launched_requeues_without_starting_it(self):
+        submitted = self.submit_hanging()
+        # Calls: run_once's own observation, the check before staging, then the
+        # check inside the cache scope; the third finds a lock.
+        def late(directory=None):
+            self.calls += 1
+            return HELD if self.calls >= 3 else QUIET
+
+        result = self.run_with(late)
+        self.assertEqual(result["action"], "requeued")
+        self.assertEqual(result["reason"], "pi-can-transmit")
+        self.assertEqual(self.hang_pids(), [], "a child was started")
+        self.assertTrue((self.root / "queued" / submitted["id"]).is_dir())
+        self.assertEqual(list(self.work.iterdir()), [])
+
+    def test_can_before_staging_requeues_without_touching_the_work_root(self):
+        submitted = self.submit_hanging()
+
+        def held_after_gate(directory=None):
+            self.calls += 1
+            return HELD if self.calls >= 2 else QUIET
+
+        result = self.run_with(held_after_gate)
+        self.assertEqual(result["action"], "requeued", result)
+        self.assertEqual(list(self.work.iterdir()), [])
+        self.assertEqual(self.hang_pids(), [])
+        self.assertTrue((self.root / "queued" / submitted["id"]).is_dir())
+
+    def test_an_exception_while_waiting_kills_and_reaps_the_group(self):
+        self.submit_hanging()
+        cleanup_seen = []
+
+        def failing_wait(process, **_keywords):
+            deadline = time.monotonic() + 5
+            while len(self.hang_pids()) < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            cleanup_seen.append(self.hang_pids())
+            raise broker.BrokerError("watchdog crashed")
+
+        with mock.patch.object(broker, "_wait_for_process", failing_wait):
+            result = self.run_with(lambda _dir=None: QUIET)
+        # The failure is published as today, but only after the child and its
+        # descendant are gone.
+        self.assertEqual(result["action"], "executed")
+        self.assertFalse(result["ok"])
+        self.assert_gone(cleanup_seen[0])
+
+
+if __name__ == "__main__":
+    unittest.main()

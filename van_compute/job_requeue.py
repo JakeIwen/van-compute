@@ -6,7 +6,6 @@ import datetime as dt
 import os
 from pathlib import Path
 import shutil
-from typing import Mapping
 
 from van_compute import queue
 
@@ -74,3 +73,40 @@ def requeue_running_job(
     os.replace(job_dir, destination)
     queue.atomic_json(destination / "manifest.json", manifest)
     return destination
+
+
+REQUEUED = "requeued"
+OWNERSHIP_LOST = "ownership-lost"
+MAINTENANCE = "queue-maintenance"
+
+
+def requeue_owned_job(
+    root: Path,
+    job_id: str,
+    lease_token: str,
+    *,
+    worker: str,
+    reason: str,
+    now: dt.datetime,
+    error_type: type[RuntimeError] = RuntimeError,
+) -> str:
+    """Requeue one attempt of ours; touch nothing if it is no longer ours.
+
+    The manifest is re-read under the queue lock and must still name this
+    worker and this attempt's lease token.  During queue maintenance the job is
+    left running (a restarted broker resumes it) rather than moved under it.
+    """
+    with queue.queue_lock(root):
+        if queue.maintenance_status(root) is not None:
+            return MAINTENANCE
+        try:
+            job_dir, manifest = queue.require_running_job(
+                root, job_id, worker, lease_token=lease_token
+            )
+        except queue.QueueError:
+            return OWNERSHIP_LOST
+        requeue_running_job(
+            root, job_dir, manifest, reason=reason, now=now, error_type=error_type
+        )
+    return REQUEUED
+
