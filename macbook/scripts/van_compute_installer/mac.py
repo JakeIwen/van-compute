@@ -258,6 +258,9 @@ class MacProvisionMixin:
                 ],
             ),
             ("JADX runtime", ["/opt/homebrew/bin/jadx", "--version"]),
+            # An xcrun shim: fails here if a full Xcode, which the profile
+            # cannot read, replaced the Command Line Tools as the selection.
+            ("Command Line Tools git", ["/usr/bin/git", "--version"]),
         ]
 
     def _run_sandbox_checks(

@@ -150,7 +150,10 @@ class VanComputeDeploymentTests(DeploymentFixtureMixin, unittest.TestCase):
         sandbox_calls = [
             call for call in local.calls if "/usr/bin/sandbox-exec" in call[0]
         ]
-        self.assertEqual(len(sandbox_calls), 8)
+        self.assertEqual(len(sandbox_calls), 9)
+        self.assertTrue(
+            any(call[0][-2:] == ["/usr/bin/git", "--version"] for call in sandbox_calls)
+        )
         # One staged registry proxy serves every check, each granted its port,
         # and is shut down once they finish.
         self.assertEqual(len(local.spawned), 1)
