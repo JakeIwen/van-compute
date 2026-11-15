@@ -28,7 +28,7 @@ complete; the dashboard now deploys from `~/dev/van-dashboard`, whose
 `scripts/deploy.py` runs `scripts/check_compute_provider.py` first. Broad scripts
 sync no longer preflights the provider: it uploads scripts, then the compute
 installer (`--if-needed`) applies its own drain/fence/heartbeat gates and may
-install a missing or unhealthy provider. Keep the compute installer in the owner's Terminal. Reused Pi releases are
+install a missing or unhealthy provider. Reused Pi releases are
 verified before drain, ignoring only runtime bytecode. Mac repair/`--rebuild`
 creates a new immutable `<deployment24>-<build_uuid32>` generation, never mutates
 retained releases, and skips pruning; legacy unsuffixed releases remain valid.
@@ -51,7 +51,7 @@ still runs the compute installer.
 | Path | Caller | Owner |
 | --- | --- | --- |
 | `python3 -m van_compute.broker` | `van_compute/configs/van-compute-broker.service` | `van_compute/broker.py` |
-| `macbook/scripts/install_van_compute_worker.zsh` | Owner Terminal and `scripts/pi/sync_scripts.sh` | `macbook/scripts/install_van_compute_worker.py`, `macbook/scripts/van_compute_installer/` |
+| `macbook/scripts/install_van_compute_worker.zsh` | Owner or agent shell, and `scripts/pi/sync_scripts.sh` | `macbook/scripts/install_van_compute_worker.py`, `macbook/scripts/van_compute_installer/` |
 | `macbook/scripts/install_van_compute_worker.py` | Stable wrapper copied into frozen releases | `macbook/scripts/van_compute_installer/cli.py` |
 | `macbook/launchagents/com.jacobr.van-compute-worker.plist` | Coupled installer and installed LaunchAgent | `van_compute/worker.py` |
 

@@ -429,8 +429,8 @@ its drain, fence and heartbeat gates and may install a missing or unhealthy
 provider. Do not assume broad sync verifies provider prerequisites before it
 writes.
 
-The compute safety requirements still apply: use reviewed source from the
-owner's Terminal, review the local-only plan first, and retain the coupled
+The compute safety requirements still apply: use reviewed source, review the
+local-only plan first, and retain the coupled
 Pi/Mac installer and its drain/fence/heartbeat gates. Installed compute releases
 carry their own frozen installer CLI and sibling helper package for recovery,
 independent of the deployment worktree. Broad sync reads the primary `scripts`
@@ -575,8 +575,7 @@ build UUID and is built at its final path so venv entrypoint shebangs remain val
 Incomplete generations are never reused. Rebuild/repair leaves all existing
 releases untouched and skips pruning, preserving earlier rollback environments.
 
-To deliberately refresh dependencies, use the documented rebuild option from
-the owner's Terminal:
+To deliberately refresh dependencies, use the documented rebuild option:
 
 ```zsh
 ./macbook/scripts/install_van_compute_worker.zsh --rebuild --dry-run
