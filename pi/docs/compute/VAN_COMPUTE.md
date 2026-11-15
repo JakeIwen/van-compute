@@ -126,14 +126,24 @@ quiet chain). The first stop cause latched wins:
 - So a marked running job is handled before any new claim, and before the
   health gate, the staging-capacity check, any staging directory and (under
   `--once`) the initial CAN quiet wait: killing the old group and discarding
-  its cache entry depend on neither disk space nor CAN. On the same boot (`cleanup_boot_id` matches `/proc/sys/kernel/random/boot_id`)
-  while `cleanup_group` still has members, the broker holds that group the
-  same way and claims nothing else. It then discards the job's task-cache
+  its cache entry depend on neither disk space nor CAN.
+  A marked job's group is held while it may still exist: only a recorded
+  `cleanup_boot_id` that differs from a readable `/proc/sys/kernel/random/boot_id` proves
+  a reboot ended it. A missing recorded id or an unreadable current one proves
+  nothing (fail closed), so the group's existence decides, and a live group is held
+  the same way and nothing else is claimed. A live group is the old one unless its
+  leader's start time differs from `cleanup_group_start`: then the process-group id
+  was reused by an unrelated process, the old group is gone, and the hold neither
+  kills nor waits on the live one. A leader with no `/proc` entry while the group
+  has members is still the old group (the kernel cannot reuse a pgid while members
+  remain), and a marker with no `cleanup_group_start` (written by an older broker,
+  or the leader was already reaped when the hold began) is trusted as before. The
+  broker then discards the job's task-cache
   entry under the cache's exclusive lock (never holding the queue lock), so a
   late write by a surviving process lands in unlinked files, and fails the job
-  without running it. A different boot id means a reboot ended the group; a missing
-  one skips the same-boot hold too, which on the Pi (where the boot id is always
-  readable) happens only after a reboot. The cache entry is still discarded,
+  without running it. The claim's informational
+  `resumed_at` write is skipped for a marked job and ignored on failure for any
+  other (a full disk must not come before the hold). The cache entry is still discarded,
   retried (with `cache-discard` log lines at the start and about every 60 s)
   while it is busy or its namespace cannot be inspected. The failure itself is
   published once staging space allows, waiting (logged as `failure-publication`)
