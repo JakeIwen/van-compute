@@ -1089,11 +1089,11 @@ def worker_finish(
         atomic_json(job_path / "manifest.json", manifest)
         os.replace(job_path, root / state / job_id)
         # Nothing reads a finished job's source/ (the manifest's sources records
-        # say what ran). Under the lock only rename it aside; delete it after.
-        trash = finished_source.finish_detach(root, state, job_id)
+        # say what ran). Rename it aside, an O(1) step inside this lock; the
+        # next retention run deletes the marker under its own hold of the lock.
+        finished_source.finish_detach(root, state, job_id)
         worker_heartbeat(root, worker)
-    finished_source.finish_purge(root, state, job_id, trash)
-    return manifest
+        return manifest
 
 
 def wait_for_job(root: Path, job_id: str, timeout: float, interval: float = 1.0) -> dict[str, object]:

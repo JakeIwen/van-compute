@@ -2,17 +2,23 @@
 
 Only a running job reads its `source/` (staging and bundle streaming need a
 running lease); once a job is in `done/` or `failed/` the manifest's `sources`
-records are the record of what ran. Removal is two steps so the queue lock is
-held only for a rename: `detach_source` renames `source/` to a
-`.source-trash-<token>` marker inside the same job directory (under the lock),
-and `purge_trash` deletes the marker later, outside the lock. A marker left by
-a crash, a deadline or a failure stays in the job directory, where retention's
-size accounting sees it and the `drop-source` sweep or retention removes it.
+records are the record of what ran. Removal has two steps, and both run only
+under the queue lock, because retention measures and deletes finished job
+directories assuming the lock excludes every other change inside them:
+
+- `detach_source` renames `source/` to a `.source-trash-<token>` marker inside
+  the same job directory. It is O(1), so `worker_finish` does it while
+  publishing the job.
+- `purge_job_trash` deletes a job's markers. Retention runs it under the lock
+  it already holds (before measuring history), and `drop-source --purge` runs
+  it one job per lock acquisition. Until then a marker counts as history.
 
 This module is queue-free so `queue.py` can import it. Every walk is
 descriptor-relative, never follows links, stays on the queue root's filesystem
 and refuses a tree at or above a Linux mount point (a bind mount shares the
-device number, so the device check alone does not see it).
+device number, so the device check alone does not see it). Mount points are
+read from `/proc/self/mountinfo` again immediately before each rename and each
+marker purge, never reused from an earlier inventory.
 """
 
 from __future__ import annotations
@@ -24,15 +30,11 @@ import re
 import secrets
 import stat
 import sys
-import time
 from typing import Iterator
 
 SOURCE_DIRECTORY = "source"
 TRASH_PREFIX = ".source-trash-"
 TRASH_RE = re.compile(r"\.source-trash-[0-9a-f]{16}")
-# `worker_finish` answers a Mac control RPC with a 90 s deadline on a slow SD
-# card, so it purges only this long and leaves the rest to the sweep.
-FINISH_PURGE_SECONDS = 15.0
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
 
 
@@ -40,12 +42,12 @@ class UnsafeTree(Exception):
     """A tree entry could not be handled without leaving the queue filesystem."""
 
 
-class DeadlineExceeded(Exception):
-    """The purge ran out of its time budget; what remains is still a marker."""
+def _linux() -> bool:
+    return sys.platform.startswith("linux")
 
 
 def linux_mount_points() -> frozenset[Path]:
-    if not sys.platform.startswith("linux"):
+    if not _linux():
         return frozenset()
     path = Path("/proc/self/mountinfo")
     try:
@@ -65,22 +67,18 @@ def linux_mount_points() -> frozenset[Path]:
 
 
 def mount_at_or_below(target: Path, mounts: frozenset[Path]) -> bool:
-    if sys.platform.startswith("linux"):
+    if _linux():
         return any(mount == target or mount.is_relative_to(target) for mount in mounts)
     return os.path.ismount(target)
 
 
 def is_mount(path: Path, mounts: frozenset[Path]) -> bool:
-    return path in mounts if sys.platform.startswith("linux") else os.path.ismount(path)
+    return path in mounts if _linux() else os.path.ismount(path)
 
 
-def remove_open_directory(
-    descriptor: int, device: int, deadline: float | None = None
-) -> None:
+def remove_open_directory(descriptor: int, device: int) -> None:
     """Empty an opened directory without following links or crossing devices."""
     for name in os.listdir(descriptor):
-        if deadline is not None and time.monotonic() > deadline:
-            raise DeadlineExceeded()
         details = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
         if details.st_dev != device:
             raise UnsafeTree(f"entry crosses the queue filesystem: {name}")
@@ -90,7 +88,7 @@ def remove_open_directory(
                 opened = os.fstat(child)
                 if (opened.st_dev, opened.st_ino) != (details.st_dev, details.st_ino):
                     raise UnsafeTree(f"directory changed while opening: {name}")
-                remove_open_directory(child, device, deadline)
+                remove_open_directory(child, device)
             finally:
                 os.close(child)
             os.rmdir(name, dir_fd=descriptor)
@@ -142,10 +140,13 @@ def leftover_names(
         )
 
 
-def detach_source(
-    state_root: Path, job_id: str, root_device: int, mounts: frozenset[Path]
-) -> str | None:
-    """Rename `source/` to a trash marker; return its name, or None if absent."""
+def detach_source(state_root: Path, job_id: str, root_device: int) -> str | None:
+    """Rename `source/` to a trash marker; return its name, or None if absent.
+
+    Call under the queue lock. Mount points are read fresh for this rename.
+    """
+    target = state_root / job_id / SOURCE_DIRECTORY
+    mounts = linux_mount_points()
     with _job_directory(state_root, job_id, root_device, mounts) as job:
         if job is None:
             return None
@@ -155,31 +156,30 @@ def detach_source(
             return None
         if not stat.S_ISDIR(source.st_mode) or source.st_dev != root_device:
             raise UnsafeTree(f"{job_id}/source is not a real directory on the queue filesystem")
-        if mount_at_or_below(state_root / job_id / SOURCE_DIRECTORY, mounts):
+        if mount_at_or_below(target, mounts):
             raise UnsafeTree(f"{job_id}/source is at or above a mount point")
         trash = f"{TRASH_PREFIX}{secrets.token_hex(8)}"
         os.rename(SOURCE_DIRECTORY, trash, src_dir_fd=job, dst_dir_fd=job)
         return trash
 
 
-def purge_trash(
-    state_root: Path,
-    job_id: str,
-    name: str,
-    root_device: int,
-    mounts: frozenset[Path],
-    deadline: float | None = None,
-) -> bool:
-    """Delete a trash marker; return False if the deadline left some of it."""
+def purge_trash(state_root: Path, job_id: str, name: str, root_device: int) -> None:
+    """Delete one trash marker. Call under the queue lock.
+
+    Mount points are read fresh for this marker; a mount at or below it, a
+    changed directory or a cross-device entry stops the purge with what remains
+    still a marker.
+    """
     if not TRASH_RE.fullmatch(name):
         raise UnsafeTree(f"not a source trash marker: {name}")
+    mounts = linux_mount_points()
     with _job_directory(state_root, job_id, root_device, mounts) as job:
         if job is None:
-            return True
+            return
         try:
             details = os.stat(name, dir_fd=job, follow_symlinks=False)
         except FileNotFoundError:
-            return True
+            return
         if not stat.S_ISDIR(details.st_mode) or details.st_dev != root_device:
             raise UnsafeTree(f"{job_id}/{name} is not a real directory on the queue filesystem")
         if mount_at_or_below(state_root / job_id / name, mounts):
@@ -189,45 +189,31 @@ def purge_trash(
             opened = os.fstat(child)
             if (opened.st_dev, opened.st_ino) != (details.st_dev, details.st_ino):
                 raise UnsafeTree(f"{job_id}/{name} changed while opening")
-            try:
-                remove_open_directory(child, root_device, deadline)
-            except DeadlineExceeded:
-                return False
+            remove_open_directory(child, root_device)
         finally:
             os.close(child)
         os.rmdir(name, dir_fd=job)
-        return True
+
+
+def purge_job_trash(state_root: Path, job_id: str, root_device: int) -> list[str]:
+    """Delete every trash marker in one finished job; return the names removed.
+
+    Call under the queue lock. The listing is taken now, not from an inventory.
+    """
+    names = [
+        name
+        for name in leftover_names(state_root, job_id, root_device, linux_mount_points())
+        if TRASH_RE.fullmatch(name)
+    ]
+    for name in names:
+        purge_trash(state_root, job_id, name, root_device)
+    return names
 
 
 def finish_detach(root: Path, state: str, job_id: str) -> str | None:
     """Detach a just-published job's source; never raises (call under the queue lock)."""
     try:
-        return detach_source(
-            root / state, job_id, root.stat().st_dev, linux_mount_points()
-        )
+        return detach_source(root / state, job_id, root.stat().st_dev)
     except (OSError, UnsafeTree) as exc:
         print(f"van-compute: kept source of {state}/{job_id}: {exc}", file=sys.stderr)
         return None
-
-
-def finish_purge(root: Path, state: str, job_id: str, trash: str | None) -> None:
-    """Purge what `finish_detach` returned, within the finish budget; never raises."""
-    if trash is None:
-        return
-    try:
-        complete = purge_trash(
-            root / state,
-            job_id,
-            trash,
-            root.stat().st_dev,
-            linux_mount_points(),
-            time.monotonic() + FINISH_PURGE_SECONDS,
-        )
-    except (OSError, UnsafeTree) as exc:
-        print(f"van-compute: left source trash of {state}/{job_id}: {exc}", file=sys.stderr)
-        return
-    if not complete:
-        print(
-            f"van-compute: left part of the source trash of {state}/{job_id} for drop-source",
-            file=sys.stderr,
-        )

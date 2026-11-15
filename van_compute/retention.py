@@ -15,7 +15,7 @@ import time
 from typing import Callable, Iterator
 import uuid
 
-from van_compute import finished_source, queue, upgrade_gate
+from van_compute import finished_source, queue, retention_source_trash, upgrade_gate
 from van_compute.retention_citations import (
     CitationScan,
     job_ids_from_chunks,
@@ -700,7 +700,7 @@ def prune_jobs(
         )
         plan = _history_plan(root, decisions, max_history_bytes)
         decisions = mark_budget_candidates(decisions, plan)
-        return _payload(
+        payload = _payload(
             apply=False,
             citations_root=citations_root,
             now=now,
@@ -712,10 +712,22 @@ def prune_jobs(
             plan=plan,
             retention_days=retention_days,
         )
+        device = root.stat().st_dev
+        mounts = _linux_mount_points()
+        payload["source_trash"] = retention_source_trash.preview(
+            root, RETENTION_STATES, lambda path: _tree_size(path, device, mounts)
+        )
+        return payload
 
     with _submission_gate() as gate_owner:
         with queue.queue_lock(root):
             _require_apply_allowed(root, gate_owner)
+            source_trash = retention_source_trash.purge(
+                root,
+                RETENTION_STATES,
+                is_active=lambda job_id: _active_copy_exists(root, job_id),
+                before_each=lambda: _require_apply_allowed(root, gate_owner),
+            )
             first, _initial_protected, decisions = _inspect(
                 root, citations_root, now, retention_days
             )
@@ -737,7 +749,7 @@ def prune_jobs(
                 retention_days,
             )
             after_bytes = _completed_history_size(root, _linux_mount_points())
-            return _payload(
+            payload = _payload(
                 apply=True,
                 citations_root=citations_root,
                 now=now,
@@ -750,3 +762,5 @@ def prune_jobs(
                 retention_days=retention_days,
                 after_bytes=after_bytes,
             )
+            payload["source_trash"] = source_trash
+            return payload

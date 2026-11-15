@@ -929,48 +929,72 @@ action, not an agent-facing task.
 
 ### Finished jobs drop `source/`
 
-`worker_finish` removes `<done|failed>/<job>/source` right after publishing the
-job, for successful and failed jobs alike: nothing reads a finished job's
+`worker_finish` detaches `<done|failed>/<job>/source` right after publishing
+the job, for successful and failed jobs alike: nothing reads a finished job's
 snapshot (staging and bundle streaming require a running lease,
 `stream_result` serves only `result/`, retention and requeue never open it),
 failures are rerun from the repository, and the manifest's `sources` records
 still say what ran.
 
-Removal has two steps (`van_compute/finished_source.py`). Under the queue lock
-only a rename: `source/` becomes `.source-trash-<token>` inside the same job
-directory. After the lock is released the marker is deleted, for at most 15
-seconds, because the Mac's control RPCs have a 90 s deadline and the Pi's SD
-card is slow. Both steps use opened descriptors without following links, require
-the queue root's device, re-check the opened job directory's identity, and
-refuse a tree at or above a Linux mount point (a bind mount shares the device
-number, so retention's `/proc/self/mountinfo` check is the guard). Any failure
-or an exhausted budget is logged to stderr (`kept source of ...`, `left source
-trash of ...`) and never fails the finish. A failed or interrupted cleanup can
-leave a partially deleted marker, or an intact `source/` when the rename was
-refused; neither is read by anything. Retention's size accounting counts the
-marker, retention deletes it with the job, and `drop-source` removes it sooner.
-There is no opt-out.
+Removal has two steps (`van_compute/finished_source.py`), and both run only
+under `.queue.lock`, because retention measures and deletes finished job
+directories on the assumption that the lock excludes every other change inside
+them:
 
-Jobs finished before this change keep theirs until swept. The sweep is a hidden
-queue CLI command, dry-run by default. The preview takes no lock; `--apply`
-takes `.queue.lock` only to refuse active queue maintenance, skip job IDs also
-present in `queued/` or `running/` and rename each `source/` aside, then deletes
-the markers outside the lock. It inventories no-follow and same-filesystem:
-symlinked or non-directory job entries, unreadable trees and mount-point
-conflicts are reported under `skipped`, never followed. It reports
-`jobs_with_source`, `allocated_bytes`, `dropped`, `freed_bytes` and `skipped`
-(exit 1 when anything was skipped):
+1. **Rename.** `source/` becomes `.source-trash-<token>` inside the same job
+   directory. `worker_finish` does only this, an O(1) step inside the lock it
+   already holds, so the Mac's 90 s control-RPC deadline is never spent on
+   deletion.
+2. **Purge.** `prune` (`van_compute/retention_source_trash.py`) deletes every
+   marker in `done/` and `failed/` under the lock it holds, after its apply checks and before it inventories or measures
+   history, so the budget sees the space already freed. `drop-source --purge`
+   (below) does the same one job per lock hold. Until purged, a marker counts in
+   history size like any other job content.
+
+Each rename and each marker purge reads `/proc/self/mountinfo` again
+immediately beforehand and lists the job directory again under the lock; no
+earlier inventory is reused. Both walk opened descriptors without following
+links, require the queue root's device, re-check the opened job directory's
+identity and refuse a tree at or above a mount point (a bind mount shares the
+device number, so the mountinfo check is the guard). A refused rename is
+logged to stderr (`kept source of ...`) and never fails the finish; a refused
+purge is reported under `source_trash.skipped` (prune) or `skipped`
+(drop-source) and leaves what remains as a marker, which nothing reads. Prune
+also skips markers in a job ID present in `queued/` or `running/`. There is no
+opt-out.
+
+`prune` reports `source_trash`: in a preview the markers it would purge
+(`jobs`, `markers`, `bytes`, `skipped`; the history projection still counts
+them, so a preview can list more budget deletions than apply makes), and after
+`--apply` what it purged (`jobs`, `markers`, `skipped`).
+
+Jobs finished before this change keep their `source/` until swept. The sweep
+is a hidden queue CLI command, dry-run by default; the preview takes no lock
+and changes nothing. `--apply` renames each `source/` aside and `--purge`
+(which implies `--apply`) also deletes the job's markers, taking `.queue.lock`
+once per job so claims, publication and recovery interleave between jobs.
+Under each hold it refuses active queue maintenance (aborting the sweep) and
+skips a job ID also present in `queued/` or `running/`. Its inventory is
+no-follow and same-filesystem: symlinked or non-directory job entries,
+unreadable trees and mount-point conflicts are reported under `skipped`, never
+followed. It reports `jobs_with_source`, `allocated_bytes` (both from the
+preview inventory), `detached`, `purged`, `freed_bytes` (the inventory size of
+purged jobs) and `skipped` (exit 1 when anything was skipped):
 
 ```bash
 /home/pi/van_compute/scripts/van_compute.py drop-source
-/home/pi/van_compute/scripts/van_compute.py drop-source --apply
+/home/pi/van_compute/scripts/van_compute.py drop-source --purge
 ```
 
 Run it once after the installer has deployed this change, before the 2 GiB
-history cap prunes anything. Rerunning it also clears leftover markers.
+history cap prunes anything. `--apply` alone leaves the markers for the next
+`prune --apply`, which would then delete them all within one hold of the lock;
+`--purge` frees the space now in short per-job holds. Rerunning it clears any
+leftover `source/` or marker.
 
 The lexical scanner does not decode UTF-16/UTF-32 text or JSON `\\u` escapes.
-A same-device bind mount introduced during deletion remains a residual race;
+A same-device bind mount introduced while one job or marker is being deleted
+remains a residual race (mountinfo is re-read per job and per marker);
 ordinary and pre-existing bind mounts are rejected by the mount snapshots and
 no-cross-device walk. Result streaming's pre-existing path re-open behavior is
 separate from retention and unchanged.
@@ -1056,7 +1080,8 @@ normalized. The frozen 244 protocol fixtures plus two child-environment
 fixtures must remain byte-identical, except that finished-job directory
 snapshots no longer contain `source/` (14 `source/.van-compute.json` fixtures
 were removed when `worker_finish` began dropping it; every remaining fixture's
-bytes are unchanged).
+bytes are unchanged). The randomly named `.source-trash-*` marker it leaves for
+retention is deleted state and is excluded from snapshots.
 
 1. **Ownership and placement:** Pi has one mandatory-token local identity,
    authoritative manifest re-read, health/self-test/grace gates, and local

@@ -63,6 +63,7 @@ from flask import Flask, jsonify
 
 # The ONE import/location indirection point for the subsequent package move.
 from van_compute import queue
+from van_compute import finished_source
 from van_compute import protocol
 from van_compute import broker
 from van_compute import config
@@ -370,12 +371,22 @@ class ComputeGoldenTests(unittest.TestCase):
         self.golden(name, stdout)
         return json.loads(stdout)
 
+    def snapshot_paths(self, pattern):
+        # A finished job's source/ is renamed to a randomly named
+        # .source-trash-* marker awaiting retention's purge: deleted state, not
+        # queue protocol, so it is not pinned.
+        return sorted(
+            path
+            for path in self.root.rglob(pattern)
+            if not any(part.startswith(finished_source.TRASH_PREFIX) for part in path.parts)
+        )
+
     def snapshot_tree(self, label):
-        for path in sorted(self.root.rglob("*.json")):
+        for path in self.snapshot_paths("*.json"):
             # Source declaration is already fingerprinted in the manifest, but
             # snapshot it too: every JSON actually present in the queue is pinned.
             self.golden(f"{label}/{path.relative_to(self.root).as_posix()}", path.read_bytes())
-        for path in sorted(self.root.rglob("*.tar.gz")):
+        for path in self.snapshot_paths("*.tar.gz"):
             archive_label = f"{label}/{path.relative_to(self.root).as_posix()}"
             with tarfile.open(path, "r:gz") as archive:
                 members = archive.getmembers()
