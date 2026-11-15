@@ -15,6 +15,10 @@ QUEUE_ROOT = "/home/pi/dev/obd-things/tmp/compute"
 SOURCE_HASH_FILE = "source.sha256"
 DEPLOYMENT_HASH_FILE = "deployment.sha256"
 PROVENANCE_FILE = "provenance.json"
+# Pi marker files get this explicit mode so the manifest, which the reuse check
+# compares mode by mode, does not depend on the umask of whoever ran the installer.
+# 0644 matches what umask-022 builds already recorded, keeping those releases reusable.
+PI_MARKER_MODE = 0o644
 MANIFEST_FILE = "manifest.json"
 OWNER_RE = re.compile(
     r"installer-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"

@@ -1,6 +1,7 @@
 """Exercise the real staging body with an in-memory remote transport."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -51,6 +52,37 @@ class RemoteStagingTests(DeploymentFixtureMixin, unittest.TestCase):
             self.assertFalse(any(path.startswith('macbook/') for path in records))
             for name, record in records.items():
                 self.assertEqual(record['sha256'], hashlib.sha256(remote.payload[name]).hexdigest())
+
+    def _stage_manifest(self, umask):
+        """Run the real staging body under `umask`; return its manifest records."""
+        captured = {}
+
+        class Capturing(FakeRemote):
+            def upload(inner, name, sources, destination):
+                super().upload(name, sources, destination)
+                captured['records'] = json.loads(
+                    (sources[0].parent / constants.MANIFEST_FILE).read_text())['files']
+
+        previous = os.umask(umask)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                installer = self.make_installer(directory, remote=Capturing())
+                source = installer.build_source_release()
+                release = Path(directory) / 'release'
+                release.mkdir()
+                installer._copy_source_tree(release, source)
+                installer.paths.support_root.mkdir(parents=True)
+                installer.stage_remote_release(source, release)
+        finally:
+            os.umask(previous)
+        return captured['records']
+
+    def test_stage_manifest_is_independent_of_caller_umask(self):
+        strict = self._stage_manifest(0o077)
+        relaxed = self._stage_manifest(0o022)
+        self.assertEqual(strict, relaxed)
+        for marker in (constants.SOURCE_HASH_FILE, constants.PROVENANCE_FILE):
+            self.assertEqual(strict[marker]['mode'], 0o644)
 
 
 if __name__ == '__main__':

@@ -8,7 +8,7 @@ import shutil
 import tempfile
 
 from .constants import (
-    MANIFEST_FILE, OLD_COMPUTE_ROOT, PROVENANCE_FILE, QUEUE_ROOT, RELEASE_LINK_GUARD,
+    MANIFEST_FILE, OLD_COMPUTE_ROOT, PI_MARKER_MODE, PROVENANCE_FILE, QUEUE_ROOT, RELEASE_LINK_GUARD,
     REMOTE_CONFIGS, REMOTE_RELEASES, REMOTE_ROOT, REMOTE_SCRIPTS, REMOTE_VENV,
     SOURCE_HASH_FILE,
 )
@@ -357,6 +357,8 @@ class RemoteReleaseMixin:
                 + "\n",
                 encoding="utf-8",
             )
+            for marker in (SOURCE_HASH_FILE, PROVENANCE_FILE):
+                os.chmod(pi_staging / marker, PI_MARKER_MODE)
             self._write_manifest(pi_staging)
             self.remote.upload(
                 "upload-release",
