@@ -147,7 +147,10 @@ class RemoteRunner:
         self.local.run(
             [
                 "/usr/bin/scp",
+                # -p keeps the staged modes; without it the Pi's SFTP umask
+                # masks them and the manifest no longer matches the files.
                 "-r",
+                "-p",
                 *(str(path) for path in sources),
                 f"{self.host}:{destination}",
             ]

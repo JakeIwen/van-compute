@@ -106,7 +106,7 @@ class InstallerLayoutContractTests(unittest.TestCase):
         ])
         self.assertEqual(local.calls[0][0][-1], "/bin/sh -s -- 'two words'")
         self.assertEqual(local.calls[0][1]["input_text"], "printf ok")
-        self.assertEqual(local.calls[1][0][0:2], ["/usr/bin/scp", "-r"])
+        self.assertEqual(local.calls[1][0][0:3], ["/usr/bin/scp", "-r", "-p"])
         self.assertEqual(local.calls[1][0][-1], "pi@example:/tmp/stage")
 
 
