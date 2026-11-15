@@ -16,7 +16,7 @@ from typing import Callable, Mapping
 
 from van_compute import task_cache
 from van_compute.job_cleanup_marker import (
-    clear_cleanup_unconfirmed, mark_cleanup_unconfirmed,
+    clear_cleanup_unconfirmed, mark_cleanup_unconfirmed, read_group_start,
 )
 from van_compute.pi_cleanup_hold import CleanupHold
 
@@ -44,20 +44,22 @@ def build_hold(
     tools: RecoveryTools, root: Path, job_id: str, lease_token: str,
     should_stop: Callable[[], bool],
 ) -> CleanupHold:
-    return tools.hold_class(
+    hold = tools.hold_class(
         job=job_id,
+        identify=read_group_start,
         group_exists=tools.group_exists,
         service_stopping=should_stop,
         mark=lambda group: mark_cleanup_unconfirmed(
             root, job_id, lease_token, worker=tools.worker,
             now=dt.datetime.now(dt.timezone.utc), group=group,
-            boot_id=tools.read_boot_id(),
+            boot_id=tools.read_boot_id(), group_start=hold.identity,
         ),
         unmark=lambda: clear_cleanup_unconfirmed(
             root, job_id, lease_token, worker=tools.worker
         ),
         unconfirmed_error=tools.unconfirmed_error,
     )
+    return hold
 
 
 def recover_marked_job(

@@ -29,6 +29,7 @@ import time
 from typing import Callable, Iterator
 
 from van_compute.engine_process import wait4_nohang
+from van_compute.job_cleanup_marker import GROUP_START_FIELD
 
 FIRST_ATTEMPT_SECONDS = 1.0
 FIRST_ATTEMPT_POLL_SECONDS = 0.05
@@ -85,6 +86,9 @@ class CleanupHold:
     mark: Callable[[int], None]
     unmark: Callable[[], None]
     unconfirmed_error: type[RuntimeError]
+    # Leader identity recorded with the marker; see `job_cleanup_marker`.
+    identify: Callable[[int], str | None] = lambda _group: None
+    identity: str | None = None
     kill: Callable[[int], None] = kill_group
     reap: Callable[[object], None] = wait4_nohang
     log: Callable[[dict[str, object]], None] = print_json_line
@@ -112,6 +116,12 @@ class CleanupHold:
         except Exception:  # an inspection error counts as still there
             return False
 
+    def _identify(self, group: int) -> str | None:
+        try:
+            return self.identify(group)
+        except Exception:
+            return None
+
     def _stopped(self) -> bool:
         try:
             return bool(self.service_stopping())
@@ -135,6 +145,8 @@ class CleanupHold:
         otherwise stall before the marker or any stop check.
         """
         group = process.pid
+        # Before the first kill and reap: a reaped leader leaves no /proc entry.
+        self.identity = self._identify(group)
         started = self.clock()
         reason = "process group still has members after SIGKILL"
         while True:
@@ -180,22 +192,41 @@ class CleanupHold:
         manifest: dict[str, object],
         read_boot_id: Callable[[], str | None],
     ) -> None:
-        """Hold the group a marked job left behind, if this is the same boot and
-        it still has members.  A missing or different boot id means a reboot
-        ended it."""
+        """Hold the group a marked job left behind while it may still be there.
+
+        Only a recorded boot id that differs from a readable current one proves
+        a reboot ended the group.  A missing or unreadable id proves nothing,
+        so the group's existence decides (fail closed).  A live group is the
+        old one unless its leader's start time differs from the recorded one;
+        then the pgid was reused by someone else and the old group is gone.
+        A leader with no /proc entry but a live group is still the old group
+        (the kernel cannot reuse a pgid while members remain).  A marker with
+        no recorded start time (written before it existed, or the leader was
+        already reaped) is trusted as before."""
         group = manifest.get("cleanup_group")
+        if isinstance(group, bool) or not isinstance(group, int):
+            return
         recorded = manifest.get("cleanup_boot_id")
         current = read_boot_id()
-        if (
-            isinstance(group, bool) or not isinstance(group, int)
-            or not recorded or recorded != current
-        ):
+        if recorded and current and recorded != current:
             return
-        if self._gone(group):
+        recorded_start = manifest.get(GROUP_START_FIELD)
+
+        def reused() -> bool:
+            if not isinstance(recorded_start, str):
+                return False
+            now = self._identify(group)
+            return now is not None and now != recorded_start
+
+        if reused() or self._gone(group):
             return
         # Marker already persisted: nothing to write or clear.
         self.mark = lambda _group: None
         self.unmark = lambda: None
+        # A reused pgid must neither be killed nor waited on mid-hold.
+        group_exists, kill = self.group_exists, self.kill
+        self.group_exists = lambda g: not reused() and group_exists(g)
+        self.kill = lambda g: None if reused() else kill(g)
         self._hold(group, "previous broker run's cleanup was unconfirmed", process=None)
 
     def until_done(

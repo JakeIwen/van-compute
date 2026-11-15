@@ -168,6 +168,95 @@ class UntilDoneTests(unittest.TestCase):
         self.assertIn("disk gone", fixture.logged[0]["reason"])
 
 
+class PreviousGroupTests(unittest.TestCase):
+    """A marked job's group, found again by a later broker run."""
+
+    def hold_previous(self, manifest, *, boot="boot-1", alive_checks=0,
+                      identify=None, **overrides):
+        fixture = HoldFixture(alive_checks=alive_checks, **overrides)
+        if identify is not None:
+            fixture.hold.identify = identify
+        fixture.hold.hold_previous_group(
+            {"cleanup_group": 4242, "cleanup_boot_id": "boot-1", **manifest},
+            lambda: boot,
+        )
+        return fixture
+
+    def test_a_missing_recorded_boot_id_still_holds_a_live_group(self):
+        fixture = self.hold_previous(
+            {"cleanup_boot_id": None}, alive_checks=3
+        )
+        self.assertGreaterEqual(fixture.sleeps, 1, "held instead of releasing")
+
+    def test_an_unreadable_current_boot_id_still_holds_a_live_group(self):
+        fixture = self.hold_previous({}, boot=None, alive_checks=3)
+        self.assertGreaterEqual(fixture.sleeps, 1)
+
+    def test_a_missing_boot_id_with_a_stop_is_unconfirmed_not_released(self):
+        with self.assertRaises(Unconfirmed):
+            self.hold_previous(
+                {"cleanup_boot_id": None}, boot=None, alive_checks=10**6,
+                stop_after_sleeps=1,
+            )
+
+    def test_a_different_boot_id_proves_a_reboot(self):
+        fixture = self.hold_previous({}, boot="boot-2", alive_checks=10**6)
+        self.assertEqual(fixture.sleeps, 0)
+        self.assertEqual(fixture.checks, 0)
+
+    def test_a_reused_group_id_is_not_held_or_killed(self):
+        kills = []
+        fixture = self.hold_previous(
+            {"cleanup_group_start": "100"}, alive_checks=10**6,
+            identify=lambda _group: "999", kill=kills.append,
+        )
+        self.assertEqual((fixture.sleeps, kills), (0, []))
+
+    def test_the_same_leader_start_time_is_still_the_old_group(self):
+        fixture = self.hold_previous(
+            {"cleanup_group_start": "100"}, alive_checks=3,
+            identify=lambda _group: "100",
+        )
+        self.assertGreaterEqual(fixture.sleeps, 1)
+
+    def test_a_leader_gone_with_members_left_is_still_the_old_group(self):
+        fixture = self.hold_previous(
+            {"cleanup_group_start": "100"}, alive_checks=3,
+            identify=lambda _group: None,
+        )
+        self.assertGreaterEqual(fixture.sleeps, 1)
+
+    def test_a_marker_without_a_start_time_is_trusted_as_before(self):
+        fixture = self.hold_previous(
+            {}, alive_checks=3, identify=lambda _group: "999",
+        )
+        self.assertGreaterEqual(fixture.sleeps, 1)
+
+    def test_a_group_id_reused_during_the_hold_ends_it_without_more_kills(self):
+        kills = []
+        starts = iter(["100", "100", "999"])
+        fixture = self.hold_previous(
+            {"cleanup_group_start": "100"}, alive_checks=10**6,
+            identify=lambda _group: next(starts, "999"), kill=kills.append,
+        )
+        self.assertLessEqual(len(kills), 1)
+
+
+class LeaderIdentityTests(unittest.TestCase):
+    def test_the_leader_is_identified_before_it_is_killed_and_marked(self):
+        order = []
+        fixture = HoldFixture(
+            alive_checks=40,
+            identify=lambda group: order.append("identify") or "777",
+            kill=lambda _group: order.append("kill"),
+        )
+        marked = []
+        fixture.hold.mark = lambda group: marked.append(fixture.hold.identity)
+        fixture.hold.clean_up(fixture.process)
+        self.assertEqual(order[0], "identify")
+        self.assertEqual(marked, ["777"])
+
+
 class StopSignalTests(unittest.TestCase):
     def test_handlers_set_a_flag_and_are_restored(self):
         before = signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)
