@@ -1,6 +1,7 @@
 import collections
 import contextlib
 import dataclasses
+import errno
 import datetime as dt
 import fcntl
 import functools
@@ -19,7 +20,7 @@ from unittest import mock
 
 from van_compute import (
     broker, engine_process, job_cleanup_marker, job_requeue, pi_can_stop,
-    pi_cleanup_hold, queue, task_cache,
+    pi_cleanup_hold, pi_marked_recovery, queue, task_cache,
 )
 from van_compute.can_activity import CanProbe
 from van_compute.pi_can_stop import (
@@ -772,7 +773,7 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
         self.addCleanup(self.kill_group, leader.pid)
         return leader.pid
 
-    def marked_job_with_cache(self, group, boot_id="boot-1"):
+    def marked_job_with_cache(self, group, boot_id="boot-1", group_start=None):
         self.args.task_cache_root = Path(self.temporary.name) / "caches"
         request = task_cache.CacheRequest("ns", "entry")
         store = task_cache.TaskCacheStore(self.args.task_cache_root, 10**9)
@@ -787,7 +788,7 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
         job_cleanup_marker.mark_cleanup_unconfirmed(
             self.root, submitted["id"], manifest["lease_token"],
             worker=broker.LOCAL_WORKER, now=dt.datetime.now(dt.timezone.utc),
-            group=group, boot_id=boot_id,
+            group=group, boot_id=boot_id, group_start=group_start,
         )
         later = self.submit()
         return submitted, later, store, request
@@ -878,6 +879,108 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
         except PermissionError:
             return True
 
+    def test_a_missing_boot_id_holds_the_old_group_instead_of_assuming_a_reboot(self):
+        self.hold_log = []
+        group = self.previous_group()
+        submitted, later, store, request = self.marked_job_with_cache(
+            group, boot_id=None
+        )
+        result = self.restart(request)
+        self.assertEqual(result["action"], "executed")
+        self.assertFalse(self.group_alive(group), "the group was held and killed")
+        self.assertTrue(any(l.get("group") == group for l in self.hold_log))
+        self.assertTrue((self.root / "failed" / submitted["id"]).is_dir())
+
+    def test_an_unreadable_current_boot_id_holds_the_old_group(self):
+        self.hold_log = []
+        group = self.previous_group()
+        submitted, later, store, request = self.marked_job_with_cache(group)
+        with mock.patch.object(pi_marked_recovery, "read_group_start", lambda _g: None):
+            with mock.patch.object(broker, "read_boot_id", lambda: None):
+                result = self.restart(request)
+        self.assertEqual(result["action"], "executed")
+        self.assertFalse(self.group_alive(group))
+
+    def test_a_group_id_reused_by_another_process_is_left_alone(self):
+        self.hold_log = []
+        stranger = self.previous_group()  # stands for someone else's group
+        submitted, later, store, request = self.marked_job_with_cache(
+            stranger, group_start="100"
+        )
+        with mock.patch.object(
+            pi_marked_recovery, "read_group_start", lambda _g: "999"
+        ):
+            result = self.restart(request)
+        self.assertEqual(result["action"], "executed")
+        self.assertTrue(self.group_alive(stranger), "an unrelated group was killed")
+        self.assertFalse(any(l.get("group") == stranger for l in self.hold_log))
+        self.assertFalse(store.path(request).exists())
+        self.assertTrue((self.root / "failed" / submitted["id"]).is_dir())
+
+    def test_the_marker_records_the_leader_start_time_and_clear_removes_it(self):
+        submitted = self.submit()
+        manifest, _ = broker.claim_local_job(
+            self.root, grace_seconds=0, remote_max_age=45,
+            eligibility=broker.local_eligibility,
+        )
+        job_cleanup_marker.mark_cleanup_unconfirmed(
+            self.root, submitted["id"], manifest["lease_token"],
+            worker=broker.LOCAL_WORKER, now=dt.datetime.now(dt.timezone.utc),
+            group=7, boot_id="boot-1", group_start="123",
+        )
+        running = self.root / "running" / submitted["id"] / "manifest.json"
+        self.assertEqual(queue.load_json(running)["cleanup_group_start"], "123")
+        job_cleanup_marker.clear_cleanup_unconfirmed(
+            self.root, submitted["id"], manifest["lease_token"],
+            worker=broker.LOCAL_WORKER,
+        )
+        self.assertNotIn("cleanup_group_start", queue.load_json(running))
+
+    def test_a_full_disk_cannot_stop_a_marked_job_being_claimed_for_recovery(self):
+        submitted = self.claim_and_mark(True)
+
+        def enospc(path, payload, *args, **kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with mock.patch.object(queue, "atomic_json", enospc):
+            manifest, reason = broker.claim_local_job(
+                self.root, grace_seconds=0, remote_max_age=45,
+                eligibility=broker.local_eligibility,
+            )
+        self.assertIsNotNone(manifest, reason)
+        self.assertEqual(manifest["id"], submitted["id"])
+        self.assertTrue(manifest["cleanup_unconfirmed"])
+
+    def test_a_full_disk_does_not_stop_resuming_an_unmarked_running_job(self):
+        submitted = self.claim_and_mark(False)
+
+        def enospc(path, payload, *args, **kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with mock.patch.object(queue, "atomic_json", enospc):
+            manifest, reason = broker.claim_local_job(
+                self.root, grace_seconds=0, remote_max_age=45,
+                eligibility=broker.local_eligibility,
+            )
+        self.assertIsNotNone(manifest, reason)
+
+    def test_the_old_group_is_held_even_when_the_resume_write_fails(self):
+        self.hold_log = []
+        group = self.previous_group()
+        submitted, later, store, request = self.marked_job_with_cache(group)
+
+        def enospc(path, payload, *args, **kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with mock.patch.object(queue, "atomic_json", enospc):
+            manifest, reason = broker.claim_local_job(
+                self.root, grace_seconds=0, remote_max_age=45,
+                eligibility=broker.local_eligibility,
+            )
+        self.assertIsNotNone(manifest, reason)
+        result = self.restart(request)  # recovery proper, once writes work again
+        self.assertFalse(self.group_alive(group))
+
     def test_a_reboot_skips_the_hold_but_still_discards_the_cache(self):
         self.hold_log = []
 
@@ -966,7 +1069,8 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
 
     def test_a_marked_job_is_failed_on_resume_without_running_again(self):
         submitted = self.claim_and_mark(True)
-        result = self.run_with(lambda _dir=None: QUIET)
+        with mock.patch.object(broker, "_process_group_exists", lambda _g: False):
+            result = self.run_with(lambda _dir=None: QUIET)
         self.assertEqual(result["action"], "executed")
         self.assertFalse(result["ok"])
         self.assertEqual(self.hang_pids(), [], "the job was run again")
