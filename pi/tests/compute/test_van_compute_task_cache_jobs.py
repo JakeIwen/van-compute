@@ -278,7 +278,9 @@ class MacSandboxProfileTests(unittest.TestCase):
             cache_root=self.selected if cache_root == "selected" else cache_root,
             proxy_port=self.proxy_port,
         )
-        return subprocess.run(wrapped, capture_output=True, text=True, cwd=self.job)
+        # Jobs get a clean environment; the developer's HOME is not readable.
+        environment = {"HOME": str(self.job), "TMPDIR": str(self.job) + "/", "PATH": "/usr/bin:/bin"}
+        return subprocess.run(wrapped, capture_output=True, text=True, cwd=self.job, env=environment)
 
     def test_selected_cache_is_writable_and_siblings_are_not(self):
         script = (
@@ -308,6 +310,20 @@ class MacSandboxProfileTests(unittest.TestCase):
             cache_root=None,
         )
         self.assertNotEqual(completed.returncode, 0)
+
+    def test_system_git_shim_runs_under_the_profile(self):
+        # /usr/bin/git is an xcrun shim; repo tests build fixture repositories.
+        selected = subprocess.run(["/usr/bin/xcode-select", "-p"], capture_output=True, text=True)
+        if selected.stdout.strip() != "/Library/Developer/CommandLineTools":
+            self.skipTest("needs the Command Line Tools as the selected developer directory")
+        script = (
+            'cd "$1" && /usr/bin/git init -q fixture && cd fixture && '
+            '/usr/bin/git -c user.name=t -c user.email=t@example.invalid '
+            'commit -q --allow-empty -m probe && /usr/bin/git rev-list --count HEAD'
+        )
+        completed = self.sandboxed(["/bin/sh", "-c", script, "sh", str(self.job)])
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "1")
 
     def test_installer_probe_script_passes_under_the_profile(self):
         # The shipped profile reads /opt/homebrew but not an arbitrary venv.

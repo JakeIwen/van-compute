@@ -179,6 +179,13 @@ HOME and TMP, and a private cache unless its task opts into a persistent one
 network except the package registries through the worker's proxy (see Mac
 registry proxy), declared read-only datasets only, monitored resource
 ceilings, and a writable job directory (plus its one declared cache) only.
+Outside those, jobs read only the worker release, system paths, Homebrew
+(`/opt/homebrew`), Java and the Command Line Tools (so anything an operator
+stores under those becomes readable to jobs). The last is there because `/usr/bin/git`, `make`,
+`clang` and `python3` are xcrun shims that load the real tool from
+`/Library/Developer/CommandLineTools`; obd-things' tests build fixture git
+repositories. A full Xcode selected with `xcode-select` is not readable, so
+those shims fail in the sandbox there.
 Private Mac dataset paths stay out of manifests and logical command telemetry;
 recognized text results are scrubbed before upload. Tasks that use a private
 dataset must not copy its physical path into binary output or files embedded in

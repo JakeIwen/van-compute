@@ -48,6 +48,11 @@ SANDBOX_PROFILE = r'''(version 1)
     (subpath "/private/var/db/timezone")
     (subpath "/Library/Apple")
     (subpath "/Library/Java")
+    ; /usr/bin/git, make, clang and python3 are xcrun shims: they read the
+    ; xcode-select link, then load libxcrun and the real tool from the Command
+    ; Line Tools. Read-only; a full Xcode selected instead is not covered.
+    (subpath "/Library/Developer/CommandLineTools")
+    (literal "/private/var/db/xcode_select_link")
     (subpath (param "WORKER_ROOT"))
     (subpath (param "JOB_ROOT"))
     (subpath (param "CACHE_ROOT"))
