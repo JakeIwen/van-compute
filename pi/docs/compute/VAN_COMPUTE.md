@@ -930,20 +930,36 @@ action, not an agent-facing task.
 ### Finished jobs drop `source/`
 
 `worker_finish` removes `<done|failed>/<job>/source` right after publishing the
-job, under the same queue lock, for successful and failed jobs alike: nothing
-reads a finished job's snapshot (staging and bundle streaming require a running
-lease, `stream_result` serves only `result/`, retention and requeue never open
-it), failures are rerun from the repository, and the manifest's `sources`
-records still say what ran. The removal walks opened descriptors without
-following links or leaving the queue filesystem (`van_compute/finished_source.py`).
-If it fails, the finish still succeeds, the job keeps its `source/` and the
-broker or CLI logs `kept source of <state>/<job>` to stderr. There is no opt-out.
+job, for successful and failed jobs alike: nothing reads a finished job's
+snapshot (staging and bundle streaming require a running lease,
+`stream_result` serves only `result/`, retention and requeue never open it),
+failures are rerun from the repository, and the manifest's `sources` records
+still say what ran.
+
+Removal has two steps (`van_compute/finished_source.py`). Under the queue lock
+only a rename: `source/` becomes `.source-trash-<token>` inside the same job
+directory. After the lock is released the marker is deleted, for at most 15
+seconds, because the Mac's control RPCs have a 90 s deadline and the Pi's SD
+card is slow. Both steps use opened descriptors without following links, require
+the queue root's device, re-check the opened job directory's identity, and
+refuse a tree at or above a Linux mount point (a bind mount shares the device
+number, so retention's `/proc/self/mountinfo` check is the guard). Any failure
+or an exhausted budget is logged to stderr (`kept source of ...`, `left source
+trash of ...`) and never fails the finish. A failed or interrupted cleanup can
+leave a partially deleted marker, or an intact `source/` when the rename was
+refused; neither is read by anything. Retention's size accounting counts the
+marker, retention deletes it with the job, and `drop-source` removes it sooner.
+There is no opt-out.
 
 Jobs finished before this change keep theirs until swept. The sweep is a hidden
-queue CLI command, dry-run by default, that takes `.queue.lock`, refuses active
-queue maintenance, skips job IDs also present in `queued/` or `running/`, and
-reports `jobs_with_source`, `allocated_bytes`, `dropped`, `freed_bytes` and
-`skipped` (exit 1 when anything was skipped):
+queue CLI command, dry-run by default. The preview takes no lock; `--apply`
+takes `.queue.lock` only to refuse active queue maintenance, skip job IDs also
+present in `queued/` or `running/` and rename each `source/` aside, then deletes
+the markers outside the lock. It inventories no-follow and same-filesystem:
+symlinked or non-directory job entries, unreadable trees and mount-point
+conflicts are reported under `skipped`, never followed. It reports
+`jobs_with_source`, `allocated_bytes`, `dropped`, `freed_bytes` and `skipped`
+(exit 1 when anything was skipped):
 
 ```bash
 /home/pi/van_compute/scripts/van_compute.py drop-source
@@ -951,7 +967,7 @@ reports `jobs_with_source`, `allocated_bytes`, `dropped`, `freed_bytes` and
 ```
 
 Run it once after the installer has deployed this change, before the 2 GiB
-history cap prunes anything.
+history cap prunes anything. Rerunning it also clears leftover markers.
 
 The lexical scanner does not decode UTF-16/UTF-32 text or JSON `\\u` escapes.
 A same-device bind mount introduced during deletion remains a residual race;
@@ -1036,8 +1052,11 @@ interface (`BubblewrapSandbox` / `MacSandbox`), numeric rusage, and result
 validation/archiving. It deliberately does not unify ownership, staging,
 admission, scheduling, privacy filtering, or telemetry/publication. Every
 pre-existing host difference below is retained, not silently hardened or
-normalized. The frozen 258 protocol fixtures plus two child-environment
-fixtures must remain byte-identical.
+normalized. The frozen 244 protocol fixtures plus two child-environment
+fixtures must remain byte-identical, except that finished-job directory
+snapshots no longer contain `source/` (14 `source/.van-compute.json` fixtures
+were removed when `worker_finish` began dropping it; every remaining fixture's
+bytes are unchanged).
 
 1. **Ownership and placement:** Pi has one mandatory-token local identity,
    authoritative manifest re-read, health/self-test/grace gates, and local

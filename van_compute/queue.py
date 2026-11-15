@@ -1089,13 +1089,11 @@ def worker_finish(
         atomic_json(job_path / "manifest.json", manifest)
         os.replace(job_path, root / state / job_id)
         # Nothing reads a finished job's source/ (the manifest's sources records
-        # say what ran), so drop it; a failed drop only costs disk, never the finish.
-        try:
-            finished_source.drop_finished_source(root / state, job_id)
-        except (OSError, finished_source.UnsafeTree) as exc:
-            print(f"van-compute: kept source of {state}/{job_id}: {exc}", file=sys.stderr)
+        # say what ran). Under the lock only rename it aside; delete it after.
+        trash = finished_source.finish_detach(root, state, job_id)
         worker_heartbeat(root, worker)
-        return manifest
+    finished_source.finish_purge(root, state, job_id, trash)
+    return manifest
 
 
 def wait_for_job(root: Path, job_id: str, timeout: float, interval: float = 1.0) -> dict[str, object]:

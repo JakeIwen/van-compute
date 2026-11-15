@@ -232,33 +232,14 @@ def parse_now(value: str | None) -> dt.datetime:
 
 
 def _linux_mount_points() -> frozenset[Path]:
-    if not sys.platform.startswith("linux"):
-        return frozenset()
-    path = Path("/proc/self/mountinfo")
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise queue.QueueError(f"cannot verify mount boundaries from {path}: {exc}") from None
-    mounts: set[Path] = set()
-    for line in lines:
-        fields = line.split()
-        if len(fields) < 5:
-            raise queue.QueueError(f"cannot parse mount boundary record in {path}")
-        text = fields[4]
-        for escaped, plain in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
-            text = text.replace(escaped, plain)
-        mounts.add(Path(text))
-    return frozenset(mounts)
+        return finished_source.linux_mount_points()
+    except finished_source.UnsafeTree as exc:
+        raise queue.QueueError(str(exc)) from None
 
 
-def _mount_at_or_below(target: Path, mounts: frozenset[Path]) -> bool:
-    if sys.platform.startswith("linux"):
-        return any(mount == target or queue.is_within(mount, target) for mount in mounts)
-    return os.path.ismount(target)
-
-
-def _is_mount(path: Path, mounts: frozenset[Path]) -> bool:
-    return path in mounts if sys.platform.startswith("linux") else os.path.ismount(path)
+_mount_at_or_below = finished_source.mount_at_or_below
+_is_mount = finished_source.is_mount
 
 
 def _tree_sizes(
