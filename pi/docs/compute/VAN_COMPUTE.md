@@ -113,8 +113,10 @@ quiet chain). The first stop cause latched wins:
   holds: it keeps re-killing and checking about once a second, logging a
   `cleanup-hold` JSON line when the hold starts and about every 60 s (every
   log call is best-effort and cannot end the hold). Once the hold starts, the
-  running manifest carries `cleanup_unconfirmed`, `cleanup_group` and
-  `cleanup_boot_id` (and a `cleanup-unconfirmed` attempt-history entry); the
+  running manifest carries `cleanup_unconfirmed`, `cleanup_group`,
+  `cleanup_boot_id` and `cleanup_group_start` (the group leader's start time,
+  field 22 of `/proc/<pid>/stat`, read right after the child is spawned, before
+  any wait can reap the leader) (and a `cleanup-unconfirmed` attempt-history entry); the
   write is retried every iteration. When the group is gone the marker is
   cleared (retried until it is) and the original error takes the normal
   failure or requeue path. If the broker is told to stop first (SIGTERM or
@@ -137,7 +139,9 @@ quiet chain). The first stop cause latched wins:
   kills nor waits on the live one. A leader with no `/proc` entry while the group
   has members is still the old group (the kernel cannot reuse a pgid while members
   remain), and a marker with no `cleanup_group_start` (written by an older broker,
-  or the leader was already reaped when the hold began) is trusted as before. The
+  or the leader was unreadable at launch) is trusted as before. Once a live
+  leader with a different start time has been seen, that mismatch is latched for
+  the rest of the hold: later unreadable reads never make the group the original again. The
   broker then discards the job's task-cache
   entry under the cache's exclusive lock (never holding the queue lock), so a
   late write by a surviving process lands in unlinked files, and fails the job

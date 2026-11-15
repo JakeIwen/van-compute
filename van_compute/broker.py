@@ -1074,6 +1074,8 @@ def _local_analysis_command(
 def _supervise_child(
     process, args: BrokerConfig, work: Path, stop: StopLatch, hold: CleanupHold
 ):
+    # Before any wait can reap the leader; the marker needs its identity.
+    hold.remember_leader(process.pid)
     try:
         outcome = _wait_for_process(
             process,

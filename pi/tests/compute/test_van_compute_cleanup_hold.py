@@ -4,7 +4,9 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from van_compute import engine_process, pi_cleanup_hold
+from pathlib import Path
+
+from van_compute import broker, engine_process, pi_cleanup_hold
 from van_compute.pi_cleanup_hold import CleanupHold
 
 
@@ -242,7 +244,47 @@ class PreviousGroupTests(unittest.TestCase):
         self.assertLessEqual(len(kills), 1)
 
 
+    def test_a_foreign_leader_seen_once_is_never_again_the_original_group(self):
+        # 100 (original) -> 999 (pgid reused) -> None (foreign leader reaped,
+        # its members remain): the members must not be killed as the original.
+        kills = []
+        readings = iter(["100", "999"])
+        fixture = self.hold_previous(
+            {"cleanup_group_start": "100"}, alive_checks=10**6,
+            identify=lambda _group: next(readings, None), kill=kills.append,
+        )
+        self.assertEqual(kills, [])
+
+
 class LeaderIdentityTests(unittest.TestCase):
+    def test_a_leader_reaped_before_cleanup_still_marks_its_launch_identity(self):
+        # _wait_for_process reaped the leader, then terminating the remaining
+        # group failed: /proc no longer has the leader when clean_up runs.
+        reaped = {"done": False}
+        fixture = HoldFixture(
+            alive_checks=10**6, stop_after_sleeps=2,
+            identify=lambda _group: None if reaped["done"] else "777",
+        )
+        marked = []
+        fixture.hold.mark = lambda group: marked.append(fixture.hold.identity)
+
+        def reaped_then_group_survives(*_args, **_kwargs):
+            reaped["done"] = True
+            raise broker.BrokerError("descendant survived")
+
+        stop = SimpleNamespace(
+            should_stop=lambda: False, terminate_grace=lambda: 0.0,
+            group_grace=lambda: 0.0,
+        )
+        args = SimpleNamespace(timeout=1, min_work_free_bytes=0, max_result_bytes=0)
+        with mock.patch.object(broker, "_wait_for_process", reaped_then_group_survives):
+            with self.assertRaises(Unconfirmed):
+                broker._supervise_child(
+                    fixture.process, args, Path("."), stop, fixture.hold
+                )
+        self.assertEqual(marked[:1], ["777"])
+
+
     def test_the_leader_is_identified_before_it_is_killed_and_marked(self):
         order = []
         fixture = HoldFixture(

@@ -89,6 +89,7 @@ class CleanupHold:
     # Leader identity recorded with the marker; see `job_cleanup_marker`.
     identify: Callable[[int], str | None] = lambda _group: None
     identity: str | None = None
+    identity_group: int | None = None
     kill: Callable[[int], None] = kill_group
     reap: Callable[[object], None] = wait4_nohang
     log: Callable[[dict[str, object]], None] = print_json_line
@@ -115,6 +116,13 @@ class CleanupHold:
             return not self.group_exists(group)
         except Exception:  # an inspection error counts as still there
             return False
+
+    def remember_leader(self, group: int) -> None:
+        """Record the group leader's identity.  Call right after the child is
+        spawned: the supervisor's wait reaps the leader, after which a later
+        cleanup (a surviving descendant) can no longer read it."""
+        self.identity = self._identify(group)
+        self.identity_group = group
 
     def _identify(self, group: int) -> str | None:
         try:
@@ -145,8 +153,10 @@ class CleanupHold:
         otherwise stall before the marker or any stop check.
         """
         group = process.pid
-        # Before the first kill and reap: a reaped leader leaves no /proc entry.
-        self.identity = self._identify(group)
+        # Normally recorded at launch by `remember_leader`; this is the
+        # fallback, and a reaped leader leaves no /proc entry.
+        if self.identity_group != group:
+            self.remember_leader(group)
         started = self.clock()
         reason = "process group still has members after SIGKILL"
         while True:
@@ -212,11 +222,18 @@ class CleanupHold:
             return
         recorded_start = manifest.get(GROUP_START_FIELD)
 
+        mismatch = False
+
         def reused() -> bool:
-            if not isinstance(recorded_start, str):
-                return False
+            # Latched: once a foreign leader was seen, later unreadable reads
+            # (it was reaped, its members remain) must not make the group the
+            # original again.
+            nonlocal mismatch
+            if mismatch or not isinstance(recorded_start, str):
+                return mismatch
             now = self._identify(group)
-            return now is not None and now != recorded_start
+            mismatch = now is not None and now != recorded_start
+            return mismatch
 
         if reused() or self._gone(group):
             return
