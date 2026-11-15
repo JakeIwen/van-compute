@@ -546,8 +546,15 @@ def claim_local_job(
                 return None, "another local fallback worker already owns a job"
             running = dict(running)
             running["resumed_at"] = utc_now()
-            path = root / "running" / str(running["id"]) / "manifest.json"
-            queue.atomic_json(path, running)
+            # resumed_at is informational.  A marked job's old group must be
+            # held before anything else, so no write here (ENOSPC, say) may
+            # stand in front of that; the other resumes survive a failed write.
+            if not running.get("cleanup_unconfirmed"):
+                path = root / "running" / str(running["id"]) / "manifest.json"
+                try:
+                    queue.atomic_json(path, running)
+                except OSError:
+                    pass
             return running, "resumed local fallback job"
 
         if fresh_remote_workers(root, remote_max_age, now=now):
