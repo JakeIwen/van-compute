@@ -42,6 +42,7 @@ from van_compute import (
 )
 from van_compute.backoff import HostRetryGate, RetryCancelled
 from van_compute.config import WorkerConfig
+from van_compute.path_replace import replace_paths_once
 
 # Mac releases place this module at <release>/app/van_compute/worker.py.
 WORKER_ROOT = Path(__file__).resolve().parents[2]
@@ -1268,7 +1269,6 @@ def scrub_private_paths(
             (str(Path.home()).encode(), b"{mac-home}"),
         )
     )
-    replacements.sort(key=lambda item: len(item[0]), reverse=True)
     for path in result_root.rglob("*"):
         if (
             path.is_symlink()
@@ -1277,9 +1277,7 @@ def scrub_private_paths(
         ):
             continue
         original = path.read_bytes()
-        scrubbed = original
-        for private, logical in replacements:
-            scrubbed = scrubbed.replace(private, logical)
+        scrubbed = replace_paths_once(original, replacements)
         if scrubbed != original:
             path.write_bytes(scrubbed)
 
