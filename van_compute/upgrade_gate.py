@@ -70,11 +70,12 @@ def active_submitter_count(
             if process.stat().st_uid != current_uid:
                 continue
             raw = (process / "cmdline").read_bytes()
-        except FileNotFoundError:
-            # Normal race with a process exiting between directory scan and read.
+        except (FileNotFoundError, ProcessLookupError):
+            # Normal race with a process exiting between directory scan and read:
+            # a gone entry is ENOENT, one still being torn down reads as ESRCH.
             continue
         except OSError as exc:
-            if exc.errno == errno.ENOENT:
+            if exc.errno in (errno.ENOENT, errno.ESRCH):
                 continue
             raise RuntimeError(
                 f"cannot inspect same-user process {process.name}: {exc}"

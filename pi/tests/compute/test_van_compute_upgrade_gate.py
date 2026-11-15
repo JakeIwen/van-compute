@@ -41,6 +41,34 @@ class VanComputeUpgradeGateTests(unittest.TestCase):
                 2,
             )
 
+    def test_active_submitter_scan_skips_a_process_exiting_mid_read(self):
+        # The hourly retention prune failed on the Pi with "[Errno 3] No such
+        # process" while a suite job's children were exiting.
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            for pid in ("100", "101", "102"):
+                (proc / pid).mkdir()
+                (proc / pid / "cmdline").write_bytes(b"python3\0/x/van_compute.py\0submit\0task\0")
+            original = Path.read_bytes
+
+            def read_bytes(path):
+                if path.parent.name == "101":
+                    raise ProcessLookupError(3, "No such process")
+                if path.parent.name == "102":
+                    raise PermissionError(13, "Permission denied")
+                return original(path)
+
+            with mock.patch.object(Path, "read_bytes", read_bytes):
+                with self.assertRaisesRegex(RuntimeError, "same-user process 102"):
+                    gate.active_submitter_count(proc, current_pid=999, current_uid=os.getuid())
+            (proc / "102" / "cmdline").unlink()
+            (proc / "102").rmdir()
+            with mock.patch.object(Path, "read_bytes", read_bytes):
+                self.assertEqual(
+                    gate.active_submitter_count(proc, current_pid=999, current_uid=os.getuid()),
+                    1,
+                )
+
     def test_missing_proc_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(RuntimeError, "/proc is unavailable"):
