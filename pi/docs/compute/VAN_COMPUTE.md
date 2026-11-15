@@ -306,6 +306,17 @@ DNS, no UDP). Pi jobs still have no network, and an unsandboxed Mac worker
   directions relayed, sees an unlisted host and port 80 refused, and gets
   EPERM for TCP to another loopback port and to a public address and for UDP
   to the proxy port. The echo server must see exactly the two good tunnels.
+- **Live worker mode.** The Mac worker stays unsandboxed
+  (`--allow-unsandboxed-dynamic`; Jacob, 2026-11-14), because obd-things'
+  `repo-tests` and `repo-full-suite` still fail under the profile. The tests
+  write to a hard-coded `/tmp` and create AF_UNIX sockets there, bind and
+  connect to localhost TCP for their web-server tests, and signal their own
+  child processes. Allowing the shared `/tmp` or every loopback port would
+  expose the Mac's local services to jobs, so the fix belongs in the tests,
+  with `(allow signal (target same-sandbox))` added to the profile. Git works
+  sandboxed. With all four rules a trial run passed: 1981 passed, 8 skipped,
+  about twice as slow (2026-11-14). To switch, install with
+  `VAN_COMPUTE_ALLOW_UNSANDBOXED=0`; to roll back, `=1`.
 
 ## Persistent task caches
 
