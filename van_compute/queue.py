@@ -28,7 +28,7 @@ import time
 from typing import BinaryIO, Iterator, Sequence, TextIO
 
 
-from van_compute import protocol
+from van_compute import finished_source, protocol
 
 
 DEFAULT_SOURCE_ROOT = Path("/home/pi/dev/obd-things")
@@ -1088,6 +1088,12 @@ def worker_finish(
         )
         atomic_json(job_path / "manifest.json", manifest)
         os.replace(job_path, root / state / job_id)
+        # Nothing reads a finished job's source/ (the manifest's sources records
+        # say what ran), so drop it; a failed drop only costs disk, never the finish.
+        try:
+            finished_source.drop_finished_source(root / state, job_id)
+        except (OSError, finished_source.UnsafeTree) as exc:
+            print(f"van-compute: kept source of {state}/{job_id}: {exc}", file=sys.stderr)
         worker_heartbeat(root, worker)
         return manifest
 
@@ -1115,6 +1121,14 @@ def _retention_commands():
     from van_compute import retention
 
     return retention
+
+
+def _source_sweep_commands():
+    if __name__ == "__main__":
+        sys.modules.setdefault("van_compute.queue", sys.modules[__name__])
+    from van_compute import source_sweep
+
+    return source_sweep
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1173,6 +1187,7 @@ def build_parser() -> argparse.ArgumentParser:
     result_parser.add_argument("path")
 
     _retention_commands().add_prune_parser(subparsers)
+    _source_sweep_commands().add_drop_source_parser(subparsers)
     maintenance = subparsers.add_parser("maintenance", help=argparse.SUPPRESS)
     maintenance.add_argument("action", choices=("enter", "exit", "status"))
     maintenance.add_argument("--owner")
@@ -1302,6 +1317,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "prune":
             return _retention_commands().run_prune_command(root, args, print_json)
+        if args.command == "drop-source":
+            return _source_sweep_commands().run_drop_source_command(root, args, print_json)
         if args.command == "maintenance":
             if args.action == "status":
                 if args.owner is not None:

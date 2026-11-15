@@ -927,6 +927,32 @@ checkout, citation scan, submission drain or manifest validation cannot be
 completed. `pi_compute.py` does not expose pruning; retention is an operator
 action, not an agent-facing task.
 
+### Finished jobs drop `source/`
+
+`worker_finish` removes `<done|failed>/<job>/source` right after publishing the
+job, under the same queue lock, for successful and failed jobs alike: nothing
+reads a finished job's snapshot (staging and bundle streaming require a running
+lease, `stream_result` serves only `result/`, retention and requeue never open
+it), failures are rerun from the repository, and the manifest's `sources`
+records still say what ran. The removal walks opened descriptors without
+following links or leaving the queue filesystem (`van_compute/finished_source.py`).
+If it fails, the finish still succeeds, the job keeps its `source/` and the
+broker or CLI logs `kept source of <state>/<job>` to stderr. There is no opt-out.
+
+Jobs finished before this change keep theirs until swept. The sweep is a hidden
+queue CLI command, dry-run by default, that takes `.queue.lock`, refuses active
+queue maintenance, skips job IDs also present in `queued/` or `running/`, and
+reports `jobs_with_source`, `allocated_bytes`, `dropped`, `freed_bytes` and
+`skipped` (exit 1 when anything was skipped):
+
+```bash
+/home/pi/van_compute/scripts/van_compute.py drop-source
+/home/pi/van_compute/scripts/van_compute.py drop-source --apply
+```
+
+Run it once after the installer has deployed this change, before the 2 GiB
+history cap prunes anything.
+
 The lexical scanner does not decode UTF-16/UTF-32 text or JSON `\\u` escapes.
 A same-device bind mount introduced during deletion remains a residual race;
 ordinary and pre-existing bind mounts are rejected by the mount snapshots and

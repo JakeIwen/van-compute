@@ -15,7 +15,7 @@ import time
 from typing import Callable, Iterator
 import uuid
 
-from van_compute import queue, upgrade_gate
+from van_compute import finished_source, queue, upgrade_gate
 from van_compute.retention_citations import (
     CitationScan,
     job_ids_from_chunks,
@@ -449,26 +449,11 @@ def _inventory(
     return mark_duplicate_ids(decisions)
 
 
-def _remove_open_directory(descriptor: int, device: int) -> None:
-    for name in os.listdir(descriptor):
-        details = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-        if details.st_dev != device:
-            raise _UnsafeTarget(f"entry crosses the queue filesystem: {name}")
-        if stat.S_ISDIR(details.st_mode):
-            flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-            child = os.open(name, flags, dir_fd=descriptor)
-            try:
-                opened = os.fstat(child)
-                if (opened.st_dev, opened.st_ino) != (details.st_dev, details.st_ino):
-                    raise _UnsafeTarget(f"directory changed while opening: {name}")
-                _remove_open_directory(child, device)
-            finally:
-                os.close(child)
-            os.rmdir(name, dir_fd=descriptor)
-        elif stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode):
-            os.unlink(name, dir_fd=descriptor)
-        else:
-            raise _UnsafeTarget(f"entry has an unsupported file type: {name}")
+def _remove_job_contents(descriptor: int, device: int) -> None:
+    try:
+        finished_source.remove_open_directory(descriptor, device)
+    except finished_source.UnsafeTree as exc:
+        raise _UnsafeTarget(str(exc)) from None
 
 
 def _delete_tree(
@@ -497,7 +482,7 @@ def _delete_tree(
             opened = os.fstat(target_descriptor)
             if (opened.st_dev, opened.st_ino) != expected_identity:
                 raise _UnsafeTarget(f"job {job_id} directory changed while opening")
-            _remove_open_directory(target_descriptor, device)
+            _remove_job_contents(target_descriptor, device)
         finally:
             os.close(target_descriptor)
         os.rmdir(job_id, dir_fd=state_descriptor)
