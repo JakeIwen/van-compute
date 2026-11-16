@@ -3,11 +3,14 @@
 import importlib.util
 import json
 from pathlib import Path
+import sys
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[3] / "macbook/scripts/live_check_job_cancel.py"
 spec = importlib.util.spec_from_file_location("live_check_job_cancel", SCRIPT)
 live = importlib.util.module_from_spec(spec)
+# Registered first: dataclasses look up their module while the class is built.
+sys.modules[spec.name] = live
 spec.loader.exec_module(live)
 
 JOB = "20261116T010000Z-0000abcd"
