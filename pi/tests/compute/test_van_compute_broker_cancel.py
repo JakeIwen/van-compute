@@ -171,9 +171,9 @@ class RestartRecoveryTests(CancelHarness, unittest.TestCase):
                     self.args.min_work_free_bytes = 1 << 62
                 job, _claimed = self.requested_local_job()
                 # An unmarked job holds no group, and a bare health reader
-                # brings no startup snapshot: the uncontained case, finalized
-                # at once.  The survivor evidence is tested in
-                # test_van_compute_cgroup_survivors.
+                # brings no service-cgroup gate (the foreground case), so it
+                # is finalized at once.  The gate is tested in
+                # test_van_compute_cgroup_gate.
                 with mock.patch.object(pi_marked_recovery, "build_hold") as build_hold:
                     result = self.run_once_with(health)
                 build_hold.assert_not_called()

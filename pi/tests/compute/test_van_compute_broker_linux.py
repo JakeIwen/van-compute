@@ -170,25 +170,3 @@ class LinuxCancelCleanupTests(BrokerHarness, unittest.TestCase):
         descendant = int(marker.read_text())
         with self.assertRaises(ProcessLookupError):
             os.kill(descendant, 0)
-
-
-@unittest.skipUnless(
-    hasattr(os, "pidfd_open"),
-    "a startup survivor is signalled only through a Linux pidfd",
-)
-class LinuxStartupSurvivorKillTests(unittest.TestCase):
-    def test_only_a_survivor_with_its_recorded_start_time_is_killed(self):
-        from van_compute.job_cleanup_marker import read_group_start
-        from van_compute.pi_cgroup_survivors import Survivor, kill_survivor
-
-        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-        self.addCleanup(process.wait)
-        self.addCleanup(lambda: process.poll() is None and process.kill())
-        start = read_group_start(process.pid)
-        self.assertIsNotNone(start)
-        kill_survivor(Survivor(process.pid, str(int(start) + 1)))
-        kill_survivor(Survivor(process.pid, None))
-        time.sleep(0.2)
-        self.assertIsNone(process.poll(), "a process with another identity was killed")
-        kill_survivor(Survivor(process.pid, start))
-        self.assertEqual(process.wait(5), -signal.SIGKILL)

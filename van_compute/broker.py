@@ -42,7 +42,7 @@ from van_compute.config import BrokerConfig, MissedOffloadRecord
 from van_compute.can_activity import CanObserver
 from van_compute.job_requeue import requeue_running_job
 from van_compute.job_cleanup_marker import read_boot_id
-from van_compute import pi_cancel_recovery, pi_cgroup_survivors, pi_marked_recovery
+from van_compute import pi_cancel_recovery, pi_cgroup_gate, pi_marked_recovery
 from van_compute.pi_cleanup_hold import CleanupHold, log_best_effort
 from van_compute.pi_once import run_once_command
 from van_compute.pi_can_stop import CanStopped, StopLatch, requeue_after_can_stop
@@ -1412,8 +1412,6 @@ def run_once(
         return {"action": "deferred", "reason": "queue maintenance is active"}
     job_cancel.reconcile(root)  # before any gate: cancels never wait on health
     running = _running_local_job(root)
-    if running is not None and job_cancel.is_cancel_requested(running):
-        return pi_cancel_recovery.finish(_recovery_tools(), args, root, running, should_stop, monitor)
     recovered: list[str] = []
     if running is None:
         if queue_supports_lease_tokens():
@@ -1430,6 +1428,12 @@ def run_once(
                 "remote_workers": [str(item.get("worker")) for item in remotes],
                 "recovered_jobs": recovered,
             }
+    # Ahead of any cancel recovery, resume or claim; a marked job is never held.
+    held = pi_cgroup_gate.deferral(monitor, running, recovered)
+    if held is not None:
+        return held
+    if running is not None and job_cancel.is_cancel_requested(running):
+        return pi_cancel_recovery.finish(_recovery_tools(), args, root, running, should_stop)
     # A marked job (cleanup unconfirmed) is handled before any gate or new
     # claim, so a deferral can never leave its group unattended.
     if running is None or not running.get("cleanup_unconfirmed"):
@@ -1681,7 +1685,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(raw)
     try:
         config = _validate_args(args)
-        monitor = HealthMonitor(config.can_lock_dir, survivors=pi_cgroup_survivors.capture_reported())
+        monitor = HealthMonitor(config.can_lock_dir, containment=pi_cgroup_gate.for_config(config))
         if config.health:
             # Read-only, so no broker lock: it must work beside the service.
             print(json.dumps(health_report(config, monitor), indent=2, sort_keys=True))

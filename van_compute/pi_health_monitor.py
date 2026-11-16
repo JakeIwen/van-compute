@@ -2,8 +2,7 @@
 
 The CAN quiet chain and the rate sampler both depend on being fed on every
 poll, so the service (or `--once`) builds one monitor and passes it down.  It
-also carries the startup snapshot of the previous broker's cgroup survivors
-(`pi_cgroup_survivors`), which must be taken once, before any launch.
+also carries the serve loop's service-cgroup gate (`pi_cgroup_gate`).
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ import time
 from typing import Callable
 
 from van_compute.can_activity import CanProbe, CanQuietTracker, probe_can_activity
-from van_compute.pi_cgroup_survivors import StartupSurvivors
+from van_compute.pi_cgroup_gate import CgroupGate
 from van_compute.pi_health import HealthSnapshot, read_health_snapshot
 from van_compute.pi_rates import RateSampler
 
@@ -31,7 +30,7 @@ class HealthMonitor:
         sampler: RateSampler | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
-        survivors: StartupSurvivors | None = None,
+        containment: CgroupGate | None = None,
     ) -> None:
         self._lock_dir = lock_dir
         self._probe = probe
@@ -39,8 +38,8 @@ class HealthMonitor:
         self.sampler = RateSampler() if sampler is None else sampler
         self._clock = clock
         self._sleep = sleep
-        # None: no snapshot taken (tests); cancel recovery treats it as uncontained.
-        self.survivors = survivors
+        # None outside the serve loop (foreground commands, tests): ungated.
+        self.containment = containment
 
     def observe_can(self) -> CanProbe:
         """Probe CAN once and feed the quiet chain; a probe error is a result."""

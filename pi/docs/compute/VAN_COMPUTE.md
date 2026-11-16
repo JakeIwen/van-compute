@@ -939,20 +939,27 @@ under the queue lock and diverts a requested job there.
   broker restart the request is finished before any health, CAN-quiet,
   eligibility or staging check; a marked job's old group is still held first.
   An unmarked job (the broker died before it could write a marker) moves to
-  `cancelled/` only on positive evidence that the previous instance's
-  processes are gone. `KillMode=control-group` is not that evidence: a
-  process in uninterruptible sleep survives systemd's SIGKILL and the unit
-  restarts anyway. So at start, before launching anything, the broker
-  snapshots its own service cgroup (`cgroup.procs` of the `.service` path in
-  `/proc/self/cgroup`, cgroup v2): every other member, identified by pid and
-  start time, is a previous instance's survivor (`pi_cgroup_survivors.py`).
-  While any survivor is alive (same pid and start time), recovery sends it
-  SIGKILL again (through a pidfd, so a reused pid is never signalled), leaves
-  the job `running` with its request (the installer's drain still counts it),
-  and defers the poll with the surviving pids; nothing else is claimed
-  meanwhile, as under a marked hold. A broker with no readable `.service`
-  cgroup (run by hand in the foreground, or no cgroup v2) has no containment
-  evidence and finalizes at once, as for an ordinary resume.
+  `cancelled/` only once the service-cgroup gate below is clear.
+- **Service-cgroup gate (serve loop only):** `KillMode=control-group` does not
+  prove a dead broker's processes gone: a process in uninterruptible sleep
+  survives systemd's SIGKILL and the unit restarts anyway. The broker runs its
+  one local job synchronously inside a poll and reaps every helper before the
+  poll returns, so between polls it is the only process of its own in its
+  cgroup. On every poll, after maintenance, reconcile and stale remote
+  recovery, and before an unmarked restart cancel, an ordinary resume or a new
+  local claim, it reads its cgroup's current `cgroup.procs` (the `.service`
+  path in `/proc/self/cgroup`, cgroup v2; `pi_cgroup_gate.py`). Any other
+  member, or a cgroup it cannot read or parse while running as a service,
+  defers the poll with the member pids (printed once per change) and nothing
+  local starts; a marked job's recovery still runs first, since it is what
+  kills and waits out its own old group. No pid is remembered or signalled:
+  systemd has already sent SIGKILL. A stuck leftover therefore holds the Pi
+  fallback until it exits or the Pi reboots, the same cost as a marked hold;
+  Mac claims, `queue.py worker` RPCs and cancel reconcile are unaffected. The
+  service logs one `cgroup-gate` line at start with the state and members.
+  `--once`, `--health`, `--self-test` and a broker that is not a `.service`
+  unit are ungated: a foreground run has no containment, as for an ordinary
+  resume.
 - **A finish that lands after the request** keeps its exit code and results,
   as a cancelled job; `result` can still fetch them.
 - **Crash safety:** a cancel writes `.cancel-intents/<id>` first, records the
