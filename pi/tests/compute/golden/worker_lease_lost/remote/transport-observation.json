@@ -1,0 +1,47 @@
+[
+  {
+    "argv": [
+      "worker",
+      "claim",
+      "--worker",
+      "golden-mac.00",
+      "--protocol-version",
+      "2"
+    ],
+    "stdin_base64": ""
+  },
+  {
+    "argv": [
+      "worker",
+      "stream",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--kind",
+      "source-bundle",
+      "--lease-token",
+      "00000000000000000000000000000002"
+    ],
+    "stdin_base64": "",
+    "stdout_bytes": 10240,
+    "stdout_sha256": "0788edfbd6fe89cb6ef23833fb479358f02b66292217d34719cead0b7b368ee0"
+  },
+  {
+    "argv": [
+      "worker",
+      "stream",
+      "20260722T120000Z-00000001",
+      "--worker",
+      "golden-mac.00",
+      "--kind",
+      "input",
+      "--index",
+      "0",
+      "--lease-token",
+      "00000000000000000000000000000002"
+    ],
+    "stdin_base64": "",
+    "stdout_bytes": 29,
+    "stdout_sha256": "bb0d0b03d0fd05eef502b2dab21ebcffb99154d20dd0ce85cb862d444588d6c3"
+  }
+]

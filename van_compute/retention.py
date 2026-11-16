@@ -32,7 +32,9 @@ from van_compute.retention_policy import (
 )
 
 
-RETENTION_DAYS = {"done": 60, "failed": 31}
+# Cancelled jobs carry no result anyone asked to keep; two weeks covers
+# auditing what was withdrawn.  --keep-days replaces all three ages.
+RETENTION_DAYS = {"done": 60, "failed": 31, "cancelled": 14}
 RETENTION_STATES = tuple(RETENTION_DAYS)
 SUBMITTER_DRAIN_TIMEOUT = 120.0
 SUBMITTER_POLL_INTERVAL = 0.5

@@ -1,0 +1,12 @@
+{
+  "complete": true,
+  "leases": [
+    {
+      "attempt": 1,
+      "cancel_requested": false,
+      "job": "20260722T120002Z-00000002",
+      "worker": "golden-mac.00"
+    }
+  ],
+  "worker": "golden-mac"
+}

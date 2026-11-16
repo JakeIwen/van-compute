@@ -18,9 +18,9 @@ from pathlib import Path
 import stat
 from typing import Callable
 
-from van_compute import finished_source, queue, retention
+from van_compute import finished_source, job_states, queue, retention
 
-SWEEP_STATES = ("done", "failed")
+SWEEP_STATES = job_states.TERMINAL_STATES
 
 
 def add_drop_source_parser(subparsers: argparse._SubParsersAction) -> None:

@@ -56,7 +56,7 @@ class RetentionTests(RetentionHarness, unittest.TestCase):
         result, payload, errors = self.run_prune("--keep-days", "30")
 
         self.assertEqual((result, errors), (0, ""))
-        self.assertEqual(payload["retention_days"], {"done": 30, "failed": 30})
+        self.assertEqual(payload["retention_days"], {"done": 30, "failed": 30, "cancelled": 30})
         self.assertEqual(payload["eligible_ids"], [done_old, failed_old])
         self.assertNotIn(done_at_limit, payload["eligible_ids"])
         self.assertNotIn(failed_at_limit, payload["eligible_ids"])

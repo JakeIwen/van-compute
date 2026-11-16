@@ -22,7 +22,6 @@ request, because its process group belongs to the broker, which finishes it.
 
 from __future__ import annotations
 
-import datetime as dt
 import os
 from pathlib import Path
 import sys
@@ -33,10 +32,6 @@ from van_compute import finished_source, job_lookup, job_states, queue
 INTENTS = ".cancel-intents"
 REQUESTED = "cancel_requested_at"
 DEFAULT_REASON = "cancel-command"
-
-
-def utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
 
 def is_cancel_requested(manifest: Mapping[str, object]) -> bool:
@@ -82,7 +77,7 @@ def record_request(
     if _read_intent(root, job_id) != from_state:
         queue.atomic_json(_intent_path(root, job_id), {"from": from_state})
     if not is_cancel_requested(manifest):
-        manifest[REQUESTED] = now or utc_now()
+        manifest[REQUESTED] = now or queue.utc_now()
         manifest.setdefault("cancel_reason", reason)
         queue.atomic_json(job_dir / "manifest.json", manifest)
     return manifest
@@ -91,7 +86,7 @@ def record_request(
 def _final_manifest(
     manifest: dict[str, object], from_state: str, finish: Mapping[str, object]
 ) -> dict[str, object]:
-    stamp = utc_now()
+    stamp = queue.utc_now()
     final = dict(manifest)
     final.update(finish)
     final.setdefault(REQUESTED, stamp)

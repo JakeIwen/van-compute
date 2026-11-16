@@ -388,9 +388,12 @@ downloads on every run; venvs and results stay per job.
 ## Completed-history retention
 
 The administrative `prune` command accepts `--keep-days` (one maximum age for
-both successful and failed jobs) and `--max-history-bytes` (local allocated
-space under the queue's `done/` and `failed/` directories). Without these
-options the existing 60-day successful / 31-day failed policy remains in force.
+successful, failed and cancelled jobs) and `--max-history-bytes` (local
+allocated space under the queue's `done/`, `failed/` and `cancelled/`
+directories). Without these options the 60-day successful / 31-day failed /
+14-day cancelled policy is in force; under the owner policy's `--keep-days 30`
+cancelled jobs are kept 30 days like the others, and the budget can remove
+them earlier.
 Preview is the default; `--apply` authorizes deletion.
 
 Expired uncited jobs are selected first. If history remains above the space
@@ -705,6 +708,22 @@ test -x "$RECOVERY_INSTALLER"
 The frozen `.zsh` entrypoint uses the system Python, so recovery also works when
 the release's private venv interpreter needs repair.
 
+Before a coupled rollback to a release without job cancellation, run with the
+current release still installed:
+
+```bash
+ssh vanpi '/home/pi/van_compute/scripts/van_compute.py prune --keep-days 30 --max-history-bytes 2147483648'
+ssh vanpi '/home/pi/van_compute/scripts/van_compute.py prune --apply --keep-days 30 --max-history-bytes 2147483648'
+ssh vanpi '/home/pi/van_compute/scripts/van_compute.py drop-source --purge'
+ssh vanpi 'du -sh /home/pi/dev/obd-things/tmp/compute/cancelled /home/pi/dev/obd-things/tmp/compute'
+```
+
+The older release cannot create cancelled jobs, so `cancelled/` stays frozen at
+what these commands leave; record the measured size in the rollback capacity
+note. The queue root's `ROOTFS_PATH_BUDGETS_MIB` entry is an alert threshold,
+not a quota. The next cancel-capable release prunes `cancelled/` through the
+same guarded retention.
+
 After a deployment completed successfully and released maintenance, a deliberate
 rollback is a new coupled deployment through the prior installer. For a retained
 Python-deployer release **containing these recovery fixes**, use its frozen source;
@@ -860,6 +879,22 @@ Submit work and wait for a bounded time:
   --wait 3600
 ```
 
+Withdraw a job that is no longer needed, or have a waiting caller withdraw
+its own job when the wait runs out or the caller is interrupted:
+
+```bash
+/home/pi/van_compute/scripts/pi_compute.py cancel JOB_ID
+/home/pi/van_compute/scripts/pi_compute.py run repo-tests --wait 900 --cancel-on-timeout
+```
+
+Exit statuses: 0 ok, 1 job failed, 2 error (unknown job, bad arguments,
+maintenance), 3 wait timed out with the job still live, 4 job cancelled.
+`run --cancel-on-timeout` exits 4 when its cancel lands and 128 + the signal
+number when SIGINT, SIGTERM or SIGHUP arrived but the job had already
+finished. `cancel` exits 0 and reports `cancel_result`: `cancelled`,
+`requested` (a Pi-local job the broker is stopping; it will end cancelled),
+`already-cancelled` or `already-finished`. See "Cancellation" below.
+
 Inspect and retrieve results without knowing the queue layout:
 
 ```bash
@@ -883,6 +918,45 @@ repository root. They are hashed, then transferred to the Mac as one bounded
 verified bundle rather than one SSH process per file. Repository source
 snapshots are capped at 10,000 files and 256 MiB; large captures, APKs, and
 corpora belong in `--input` files or private dataset aliases instead.
+
+## Cancellation
+
+A cancelled job ends in `cancelled/` with `state: "cancelled"` and never runs
+again on either host. Nothing leaves `cancelled/` except retention, and a
+manifest carrying `cancel_requested_at` never moves anywhere else: every claim,
+finish and requeue (stale remote recovery, the CAN stop) re-reads the manifest
+under the queue lock and diverts a requested job there.
+
+- **Queued, or running on the Mac:** cancelled at once. The Mac's lease is
+  fenced, so its later uploads and finish are refused. A current Mac worker
+  asks the Pi which leases it still holds (`queue.py worker leases`, one
+  read-only RPC per heartbeat interval while it runs anything) and stops the
+  child within about 15 s plus the usual termination grace, uploading
+  nothing. A Mac that was unreachable is told the same when it returns.
+- **Running on the Pi:** the cancel records a request; the broker stops the
+  child with the normal courtesy (SIGTERM, 10 s, then the group), discards the
+  attempt and moves the job to `cancelled/`, usually within seconds. After a
+  broker restart the request is finished before any health, CAN-quiet,
+  eligibility or staging check; a marked job's old group is still held first.
+  The service unit's `KillMode=control-group` is what contains a dead
+  broker's job; a broker run by hand in the foreground that crashes is outside
+  that guarantee, as for an ordinary resume.
+- **A finish that lands after the request** keeps its exit code and results,
+  as a cancelled job; `result` can still fetch them.
+- **Crash safety:** a cancel writes `.cancel-intents/<id>` first, records the
+  request in place (state and lease token kept), renames the job, then writes
+  the final manifest and detaches `source/`. Readers treat `cancelled/` as
+  authoritative. The broker reconciles leftover intents on every poll.
+- **Mixed releases:** the coupled installer upgrades both hosts with the queue
+  drained, so skew needs a hand-installed release. A Mac release from before
+  cancellation is degraded, not fully cancelled: the Pi still cancels the job
+  and refuses its results, but that Mac computes until the child ends or hits
+  its task timeout. A new Mac against an older Pi pauses its lease audit for
+  10 minutes when the Pi rejects the RPC; heartbeats and claims are untouched.
+  An older release after a rollback does not see `cancelled/` (its `status`
+  says "unknown job") and never reads or writes it; see the rollback step.
+- The dashboard does not show cancelled jobs yet; `metrics.py` reports the
+  four states its schema covers.
 
 ## Completed-job retention
 
@@ -1095,7 +1169,10 @@ fixtures must remain byte-identical, except that finished-job directory
 snapshots no longer contain `source/` (14 `source/.van-compute.json` fixtures
 were removed when `worker_finish` began dropping it; every remaining fixture's
 bytes are unchanged). The randomly named `.source-trash-*` marker it leaves for
-retention is deleted state and is excluded from snapshots.
+retention is deleted state and is excluded from snapshots. Job cancellation
+added 38 fixtures in three new scenarios (`queue_cli_cancel`,
+`broker_cancelled`, `worker_lease_lost`) and changed none, for 282 protocol
+fixtures in all.
 
 1. **Ownership and placement:** Pi has one mandatory-token local identity,
    authoritative manifest re-read, health/self-test/grace gates, and local

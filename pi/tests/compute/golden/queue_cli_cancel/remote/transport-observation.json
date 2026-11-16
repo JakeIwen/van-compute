@@ -1,0 +1,38 @@
+[
+  {
+    "argv": [
+      "worker",
+      "claim",
+      "--worker",
+      "golden-mac.00",
+      "--protocol-version",
+      "2"
+    ],
+    "stdin_base64": ""
+  },
+  {
+    "argv": [
+      "worker",
+      "claim",
+      "--worker",
+      "golden-mac.00",
+      "--protocol-version",
+      "2"
+    ],
+    "stdin_base64": ""
+  },
+  {
+    "argv": [
+      "worker",
+      "finish",
+      "20260722T120010Z-00000004",
+      "--worker",
+      "golden-mac.00",
+      "--exit-code",
+      "0",
+      "--lease-token",
+      "00000000000000000000000000000005"
+    ],
+    "stdin_base64": ""
+  }
+]

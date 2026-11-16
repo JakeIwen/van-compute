@@ -225,3 +225,17 @@ class CancelGuardTests(CancelHarness, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CancelledMetricsTests(CancelHarness, unittest.TestCase):
+    def test_metrics_reports_do_not_change_for_cancelled_jobs(self):
+        from van_compute import metrics
+
+        done = self.submit()
+        claimed = self.claim_remote()
+        queue.worker_finish(self.root, done["id"], MAC, 0, [], claimed["lease_token"])
+        now = dt.datetime.now(dt.timezone.utc).timestamp() + 5
+        reader = metrics.ComputeMetricsReader(self.root, clock=lambda: now)
+        before = reader.report(24)
+        job_cancel.cancel_job(self.root, self.submit()["id"])
+        self.assertEqual(metrics.ComputeMetricsReader(self.root, clock=lambda: now).report(24), before)
