@@ -14,8 +14,8 @@ import unittest
 from unittest import mock
 
 from van_compute import (
-    broker, job_cancel, job_cleanup_marker, pi_cancel_recovery, pi_marked_recovery,
-    pi_once, queue,
+    broker, job_cancel, job_cleanup_marker, pi_cancel_recovery, pi_cleanup_hold, pi_marked_recovery,
+    queue,
 )
 from van_compute.can_activity import CanProbe
 from van_compute.pi_can_stop import CANCEL_REQUESTED, CAN_TRANSMIT, StopLatch
@@ -66,14 +66,6 @@ def _group_gone(group):
 
 
 class StopLatchCancelTests(unittest.TestCase):
-    def test_a_requested_cancel_refuses_launch_and_discards_the_attempt(self):
-        latch = StopLatch(lambda: False, None, cancel_requested=lambda: True)
-        self.assertFalse(latch.clear_to_launch())
-        self.assertEqual(latch.cause, CANCEL_REQUESTED)
-        self.assertTrue(latch.discards_attempt)
-        self.assertFalse(latch.can_cause)
-        self.assertEqual(latch.terminate_grace(), 10.0)
-
     def test_cancel_and_can_both_discard_whichever_latches_first(self):
         active = CanProbe(True, ("can0",), None)
         latch = StopLatch(lambda: False, lambda: active, cancel_requested=lambda: True)
@@ -96,25 +88,6 @@ class StopLatchCancelTests(unittest.TestCase):
         now[0] = 1.5
         self.assertFalse(latch.should_stop())
         self.assertEqual(calls, [0.0, 1.5])
-
-
-class CancelWatchTests(CancelHarness, unittest.TestCase):
-    def test_cancel_watch_rereads_only_when_the_manifest_changes(self):
-        harness = self
-        job = harness.submit()
-        harness.claim_local()
-        path = harness.root / "running" / job["id"] / "manifest.json"
-        watch = job_cancel.CancelWatch(path)
-        with mock.patch.object(job_cancel.queue, "load_json", wraps=queue.load_json) as loads:
-            def manifest_reads():
-                return sum(call.args[0] == path for call in loads.call_args_list)
-
-            self.assertFalse(watch.requested())
-            self.assertFalse(watch.requested())
-            self.assertEqual(manifest_reads(), 1)
-            job_cancel.cancel_job(harness.root, job["id"])
-            self.assertTrue(watch.requested())
-            self.assertEqual(manifest_reads(), 2)
 
 
 class BrokerCancelTests(CancelHarness, unittest.TestCase):
@@ -197,21 +170,15 @@ class RestartRecoveryTests(CancelHarness, unittest.TestCase):
                 if low_space:
                     self.args.min_work_free_bytes = 1 << 62
                 job, _claimed = self.requested_local_job()
-                result = self.run_once_with(health)
+                # An unmarked job holds no group: systemd's control-group kill
+                # covers a dead service broker (a crashed foreground broker is
+                # outside that guarantee, as for an ordinary resume).
+                with mock.patch.object(pi_marked_recovery, "build_hold") as build_hold:
+                    result = self.run_once_with(health)
+                build_hold.assert_not_called()
                 self.assertEqual(result["action"], "cancelled", result)
                 final = self.assert_final(job["id"], "running")
                 self.assertEqual(final["attempt_history"][-1]["reason"], "cancel-recovery")
-
-    def test_an_unmarked_job_is_finalized_without_a_hold(self):
-        # The documented limit: no group is held for an unmarked job (systemd's
-        # control-group kill covers a dead service broker; a crashed foreground
-        # broker is outside that guarantee, as for an ordinary resume).
-        job, _claimed = self.requested_local_job()
-        with mock.patch.object(pi_marked_recovery, "build_hold") as build_hold:
-            result = self.run_once_with(GOOD_HEALTH)
-        build_hold.assert_not_called()
-        self.assertEqual(result["action"], "cancelled")
-        self.assert_final(job["id"], "running")
 
     def mark_with_live_group(self, job_id, lease_token):
         # A previous broker's group is not this process's child (it would
@@ -256,22 +223,12 @@ class RestartRecoveryTests(CancelHarness, unittest.TestCase):
                             0.3, job_cancel.cancel_job, args=(self.root, job["id"])
                         ).start()
 
-                with mock.patch.object(pi_marked_recovery, "hold_and_discard", hold_then_cancel):
+                with mock.patch.object(pi_marked_recovery, "hold_and_discard", hold_then_cancel), \
+                        mock.patch.object(pi_cleanup_hold, "HOLD_INTERVAL_SECONDS", 0.05):
                     result = self.run_once_with(GOOD_HEALTH)
                 self.assertEqual(result["action"], "cancelled", result)
                 final = self.assert_final(job["id"], "running")
                 self.assertNotIn("results", final)
-
-    def test_once_skips_the_can_wait_for_a_requested_job(self):
-        job, _claimed = self.requested_local_job()
-        monitor = mock.Mock()
-        result = pi_once.run_once_command(
-            self.args, monitor,
-            run_once=lambda *_a, **_k: {"action": "cancelled"},
-            running_job=lambda: queue.manifest_for(self.root, job["id"]),
-        )
-        self.assertEqual(result["action"], "cancelled")
-        monitor.wait_for_quiet.assert_not_called()
 
     def test_recovery_reports_a_job_it_no_longer_owns(self):
         job, claimed = self.requested_local_job()

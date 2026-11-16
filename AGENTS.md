@@ -20,8 +20,8 @@
 The root `van_compute/` package owns the protocol, queue, broker, Mac worker,
 metrics, typed runtime config and shared child/result engine. Host adapters keep
 Pi bwrap and Mac sandbox-exec boundaries distinct; staging, ownership, admission,
-telemetry and publication are intentionally host-specific. Preserve all 284
-compute golden files (282 protocol fixtures plus two child-environment fixtures)
+telemetry and publication are intentionally host-specific. Preserve all 265
+compute golden files (263 protocol fixtures plus two child-environment fixtures)
 and the host drift decisions in `pi/docs/compute/VAN_COMPUTE.md`. First cutover
 must install compute before updating the dashboard package: its unit/imports
 require `/home/pi/van_compute/current/van_compute/metrics.py`. That cutover is

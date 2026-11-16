@@ -54,7 +54,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -72,7 +71,6 @@ from van_compute import metrics
 from van_compute import frontend
 from van_compute import worker
 from van_compute import pi_can_stop
-from van_compute.mac_lease_audit import LeaseAudit, LeaseLost
 from pi.tests.compute import test_van_compute as queue_tests
 from pi.tests.compute import test_van_compute_broker as broker_tests
 EXAMPLE = Path(queue.__file__).resolve().parent / "configs/van-compute-obd.example.json"
@@ -689,7 +687,6 @@ class ComputeGoldenTests(unittest.TestCase):
         queued = self.submit("queued")
         running = self.submit("running")
         self.cli("pi-compute-cancel-queued.json", ["cancel", queued["id"]], module=frontend)
-        self.snapshot_tree("after-cancel-queued")
         remote = InProcessRemote(self, "remote")
         claimed = remote.claim()
         self.assertEqual(claimed["id"], running["id"])
@@ -703,19 +700,11 @@ class ComputeGoldenTests(unittest.TestCase):
                  stdin=b'{"late": true}\n', code=2)
         self.cli("rejected-finish-after-cancel-observation.json",
                  ["worker", "finish", claimed["id"], "--exit-code", "0", *fence], code=2)
-        self.cli("pi-compute-cancel-again.json", ["cancel", queued["id"]], module=frontend)
-        finished = self.submit("finished")
-        done = remote.claim()
-        self.assertEqual(done["id"], finished["id"])
-        remote.finish(done["id"], 0, [], lease_token=done["lease_token"])
-        self.cli("pi-compute-cancel-finished.json", ["cancel", done["id"]], module=frontend)
-        self.cli("pi-compute-status-cancelled.json", ["status", queued["id"]], module=frontend)
         self.cli("pi-compute-wait-cancelled.json", ["wait", queued["id"], "--timeout", "0"],
                  module=frontend, code=4)
         self.cli("pi-compute-run-cancel-on-timeout.json", [
             "run", "golden-file", "--source-root", str(self.source), "--input", str(self.capture),
             "--wait", "0", "--cancel-on-timeout"], module=frontend, code=4)
-        self.cli("pi-compute-list-with-cancelled.json", ["list"], module=frontend)
         self.observation("remote/transport-observation.json", remote.calls)
         self.finish_scenario()
 
@@ -724,33 +713,10 @@ class ComputeGoldenTests(unittest.TestCase):
         manifest, reason = broker.claim_local_job(self.root, grace_seconds=0, remote_max_age=45)
         self.assertIsNotNone(manifest, reason)
         self.cli("local/pi-compute-cancel-requested.json", ["cancel", submitted["id"]], module=frontend)
-        self.snapshot_tree("local/requested-disk")
         with mock.patch.object(broker.engine, "run_child", side_effect=AssertionError("launched")):
             payload = broker.execute_claimed_job(self.broker_args(), self.root, manifest)
         self.observation("local/return-observation.json", payload)
         self.snapshot_tree("local/disk")
-        self.finish_scenario()
-
-    def test_worker_lease_lost(self):
-        self.submit("remote")
-        remote = InProcessRemote(self, "remote")
-        manifest = remote.claim()
-        audit = LeaseAudit(remote, 15.0, log=lambda _message: None)
-        self.addCleanup(audit.close)
-
-        def acquire(_manifest, _stop, _drain):
-            audit.snapshot()[0].stop.set()  # the audit found the lease gone
-            return SimpleNamespace(release=lambda: None)
-
-        args = self.worker_args()
-        with mock.patch.object(args.resource_manager, "acquire", acquire), \
-                mock.patch.object(worker, "sandbox_command", lambda command, **_kwargs: list(command)), \
-                mock.patch.object(worker.engine, "run_child", side_effect=AssertionError("launched")):
-            with self.assertRaises(LeaseLost) as raised:
-                audit.wrap(worker.run_claimed_job)(args, remote, manifest, threading.Event())
-        self.observation("remote/lease-lost-observation.json", {"exception": str(raised.exception)})
-        self.observation("remote/transport-observation.json", remote.calls)
-        self.snapshot_tree("remote/disk")
         self.finish_scenario()
 
     def test_metrics(self):

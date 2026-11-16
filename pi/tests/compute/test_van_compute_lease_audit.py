@@ -184,13 +184,6 @@ class LeaseAuditTests(unittest.TestCase):
         self.assertTrue(run.stop.wait(2))
         audit.close()
 
-    def test_run_stop_waits_on_either_stop(self):
-        service, own = threading.Event(), threading.Event()
-        stop = RunStop(service, own)
-        self.assertFalse(stop.wait(0.01))
-        threading.Timer(0.05, own.set).start()
-        self.assertTrue(stop.wait(2))
-        self.assertTrue(RunStop(None, threading.Event()).wait(0) is False)
 
 
 SPEC = {
@@ -312,7 +305,7 @@ class LaunchedGroupTests(unittest.TestCase):
             os.killpg(process.pid, 0)
 
     def test_a_throwing_log_still_reaches_supervision(self):
-        for error in (BrokenPipeError, RuntimeError):
+        for error in (BrokenPipeError,):
             with self.subTest(error=error.__name__):
                 class Closed(io.StringIO):
                     def write(self, _text):

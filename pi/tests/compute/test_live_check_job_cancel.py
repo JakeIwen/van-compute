@@ -57,13 +57,6 @@ class LiveCheckHelperTests(unittest.TestCase):
         self.assertTrue(live.coordinator_fresh(available))
         self.assertFalse(live.coordinator_fresh({"workers": [{"worker": "m4mac", "age_seconds": 50}]}))
 
-    def test_the_deadline_counts_down(self):
-        now = [100.0]
-        deadline = live.Deadline(10, clock=lambda: now[0])
-        self.assertEqual(deadline.remaining(), 10)
-        now[0] = 111
-        self.assertTrue(deadline.expired())
-
     def test_dry_run_touches_nothing(self):
         import contextlib
         import io

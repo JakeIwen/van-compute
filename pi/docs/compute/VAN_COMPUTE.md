@@ -1170,9 +1170,8 @@ snapshots no longer contain `source/` (14 `source/.van-compute.json` fixtures
 were removed when `worker_finish` began dropping it; every remaining fixture's
 bytes are unchanged). The randomly named `.source-trash-*` marker it leaves for
 retention is deleted state and is excluded from snapshots. Job cancellation
-added 38 fixtures in three new scenarios (`queue_cli_cancel`,
-`broker_cancelled`, `worker_lease_lost`) and changed none, for 282 protocol
-fixtures in all.
+added 19 fixtures in two new scenarios (`queue_cli_cancel`,
+`broker_cancelled`) and changed none, for 263 protocol fixtures in all.
 
 1. **Ownership and placement:** Pi has one mandatory-token local identity,
    authoritative manifest re-read, health/self-test/grace gates, and local

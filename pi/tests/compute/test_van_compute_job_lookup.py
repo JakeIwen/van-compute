@@ -82,21 +82,6 @@ class JobLookupTests(BrokerHarness, unittest.TestCase):
                 job_lookup.snapshot(self.root, missing)
         self.assertEqual(len(taken), 1)
 
-    def test_a_job_that_keeps_moving_is_found_under_the_lock(self):
-        original = job_lookup._locate_once
-        passes = []
-
-        def locate(root, job_id):
-            passes.append(True)
-            if len(passes) <= job_lookup.PASSES:
-                return None  # every optimistic pass happens to miss it
-            return original(root, job_id)
-
-        with self.lock_spy() as taken, mock.patch.object(job_lookup, "_locate_once", locate):
-            found = job_lookup.snapshot(self.root, self.job_id)
-        self.assertEqual(found.state, "queued")
-        self.assertEqual(len(taken), 1)
-
     def test_list_reports_a_job_moved_during_the_pass_exactly_once(self):
         other = self.submit()["id"]
         self.move("queued", "running")

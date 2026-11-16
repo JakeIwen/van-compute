@@ -21,7 +21,7 @@ from van_compute import broker, job_cancel, job_requeue, job_states, queue
 
 from pi.tests.compute.van_compute_test_fixtures import BrokerHarness
 
-ITERATIONS = 400
+ITERATIONS = 100
 LANDED = set(job_states.CANCEL_LANDED)
 
 

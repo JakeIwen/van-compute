@@ -95,6 +95,10 @@ class CrashTests(CancelHarness, unittest.TestCase):
             return job["id"]
         self.assertEqual(active_queue_jobs(self.root), 0)
         self.assert_final(job["id"], origin)
+        if step == "after-final-write":
+            # The detach the crash skipped ran: source/ became a trash marker.
+            names = [p.name for p in (self.root / "cancelled" / job["id"]).iterdir()]
+            self.assertTrue(any(n.startswith(finished_source.TRASH_PREFIX) for n in names))
         return job["id"]
 
     def test_every_step_boundary_for_a_queued_job(self):
@@ -111,11 +115,6 @@ class CrashTests(CancelHarness, unittest.TestCase):
         for step in ("after-request", "after-rename"):
             with self.subTest(step=step):
                 self.check_step(step, remote=False, healthy=False)
-
-    def test_a_final_manifest_left_with_its_source_still_gets_the_detach(self):
-        job_id = self.check_step("after-final-write", remote=False, fresh_mac=True)
-        trash = [p.name for p in (self.root / "cancelled" / job_id).iterdir()]
-        self.assertTrue(any(name.startswith(finished_source.TRASH_PREFIX) for name in trash))
 
     def test_reconcile_leaves_a_pi_local_request_to_the_broker(self):
         job = self.submit()

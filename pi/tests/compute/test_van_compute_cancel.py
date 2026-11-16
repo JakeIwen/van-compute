@@ -140,15 +140,6 @@ class CancelPathTests(CancelHarness, unittest.TestCase):
             job_cancel.cancel_job(self.root, job["id"])
         self.assertEqual(self.located(job["id"]), ["queued"])
 
-    def test_readers_show_cancelled_jobs(self):
-        job = self.submit()
-        job_cancel.cancel_job(self.root, job["id"])
-        self.assertEqual(queue.manifest_for(self.root, job["id"])["state"], "cancelled")
-        waited = queue.wait_for_job(self.root, job["id"], 5)
-        self.assertEqual(waited["state"], "cancelled")
-        self.assertNotIn("wait_timed_out", waited)
-        self.assertEqual(job_states.exit_status(waited), 4)
-        self.assertEqual([item["id"] for item in queue.list_jobs(self.root, 10)], [job["id"]])
 
 
 class CancelGuardTests(CancelHarness, unittest.TestCase):

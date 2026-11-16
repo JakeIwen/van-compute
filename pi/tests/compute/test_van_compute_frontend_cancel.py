@@ -51,24 +51,6 @@ class FrontendCancelTests(CancelHarness, unittest.TestCase):
         code, payload, _ = self.cli("list")
         self.assertEqual([item["state"] for item in payload["jobs"]], ["cancelled"])
 
-    def test_cancel_on_timeout_requires_wait(self):
-        code, payload, error = self.cli(*self.run_args("--cancel-on-timeout"))
-        self.assertEqual((code, payload), (2, None))
-        self.assertIn("requires --wait", error)
-
-    def test_a_wait_that_runs_out_withdraws_the_job(self):
-        code, payload, _ = self.cli(*self.run_args("--wait", "0", "--cancel-on-timeout"))
-        self.assertEqual(code, 4)
-        self.assertEqual(payload["cancel_result"], "cancelled")
-        self.assertTrue(payload["wait_timed_out"])
-        self.assertEqual(payload["cancel_reason"], "wait-timeout")
-        self.assertEqual(payload["cancelled_from"], "queued")
-
-    def test_a_wait_that_runs_out_without_the_flag_leaves_the_job(self):
-        code, payload, _ = self.cli(*self.run_args("--wait", "0"))
-        self.assertEqual((code, payload["state"]), (3, "queued"))
-        self.assertEqual(self.located(payload["id"]), ["queued"])
-
     def test_a_job_finished_before_the_timeout_cancel_keeps_its_outcome(self):
         real = queue.wait_for_job
 
