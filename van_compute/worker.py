@@ -38,7 +38,8 @@ from typing import BinaryIO, Callable, Mapping, Sequence
 
 
 from van_compute import (
-    config, engine, limited_child, protocol, registry_proxy, task_cache,
+    config, engine, limited_child, mac_execution_record, protocol,
+    registry_proxy, task_cache,
 )
 from van_compute.backoff import HostRetryGate, RetryCancelled
 from van_compute.config import WorkerConfig
@@ -1450,41 +1451,15 @@ def execute_job(
             ),
         )
     duration_seconds = time.monotonic() - started_monotonic
-    resource_usage = child_resource_usage(outcome.usage, duration_seconds)
-    resource_usage.update(
-        {
-            "peak_process_group_rss_bytes": outcome.peak_process_group_rss_bytes,
-            "peak_process_count": outcome.peak_process_count,
-            "process_group_watchdog_interval_seconds": RESOURCE_POLL_INTERVAL,
-            "minimum_filesystem_free_bytes": (outcome.minimum_filesystem_free_bytes),
-        }
+    execution = mac_execution_record.analysis_execution(
+        manifest, outcome, task_name=task_name,
+        worker=worker_id or socket.gethostname(), started=started,
+        finished_at=utc_now(), duration_seconds=duration_seconds,
+        resource_usage=child_resource_usage(outcome.usage, duration_seconds),
+        watchdog_interval=RESOURCE_POLL_INTERVAL,
+        command=logical_command_record(task_name, embedded_execution, arguments),
+        inputs=inputs,
     )
-    execution = {
-        "schema_version": protocol.SCHEMA_VERSION,
-        "job_id": manifest.get("id"),
-        "task": task_name,
-        "worker": worker_id or socket.gethostname(),
-        "placement": "remote",
-        "started_at": started,
-        "finished_at": utc_now(),
-        "duration_seconds": round(duration_seconds, 6),
-        "duration_scope": "analysis child execution plus descendant process-group cleanup",
-        "exit_code": outcome.exit_code,
-        "timed_out": outcome.timed_out,
-        "interrupted": outcome.interrupted,
-        "resource_limit": outcome.resource_limit,
-        "resource_monitor_error": outcome.resource_monitor_error,
-        "command": logical_command_record(task_name, embedded_execution, arguments),
-        "resource_usage": resource_usage,
-        "input_bytes": sum(
-            int(item.get("size", 0)) for item in inputs if isinstance(item, dict)
-        ),
-        "source_bytes": sum(
-            int(item.get("size", 0))
-            for item in manifest.get("sources", [])
-            if isinstance(item, dict)
-        ),
-    }
     if cache_request is not None:
         execution["task_cache"] = cache_request.name
     (result_root / "execution.json").write_text(
