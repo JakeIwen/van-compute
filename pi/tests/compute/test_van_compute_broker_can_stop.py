@@ -714,9 +714,9 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
 
         self.addCleanup(self.kill_job_processes)
         clock = FakeClock()
-        factory = lambda lock_dir: HealthMonitor(
+        factory = lambda lock_dir, **startup: HealthMonitor(
             lock_dir, probe=lambda _d=None: QUIET, sampler=FixedRates(),
-            clock=clock, sleep=clock.sleep,
+            clock=clock, sleep=clock.sleep, **startup,
         )
         config = dataclasses.replace(
             self.args, once=True, can_quiet_seconds=0.0,
@@ -1020,9 +1020,9 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
         submitted, later, store, request = self.marked_job_with_cache(group)
         held = CanProbe(True, ("active-diagnostics-can0.lock",), None)
         clock = FakeClock()
-        factory = lambda lock_dir: HealthMonitor(
+        factory = lambda lock_dir, **startup: HealthMonitor(
             lock_dir, probe=lambda _d=None: held, sampler=FixedRates(),
-            clock=clock, sleep=clock.sleep,
+            clock=clock, sleep=clock.sleep, **startup,
         )
         config = dataclasses.replace(
             self.args, once=True, can_quiet_seconds=60.0,

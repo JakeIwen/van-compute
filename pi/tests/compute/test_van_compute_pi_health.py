@@ -498,7 +498,7 @@ class CommandLineTests(BrokerHarness, unittest.TestCase):
         clock = FakeClock()
         made = []
 
-        def factory(lock_dir):
+        def factory(lock_dir, **startup):
             made.append(lock_dir)
             return HealthMonitor(
                 lock_dir,
@@ -506,6 +506,7 @@ class CommandLineTests(BrokerHarness, unittest.TestCase):
                 sampler=sampler or FixedRates(),
                 clock=clock,
                 sleep=clock.sleep,
+                **startup,
             )
 
         output = StringIO()

@@ -170,9 +170,10 @@ class RestartRecoveryTests(CancelHarness, unittest.TestCase):
                 if low_space:
                     self.args.min_work_free_bytes = 1 << 62
                 job, _claimed = self.requested_local_job()
-                # An unmarked job holds no group: systemd's control-group kill
-                # covers a dead service broker (a crashed foreground broker is
-                # outside that guarantee, as for an ordinary resume).
+                # An unmarked job holds no group, and a bare health reader
+                # brings no startup snapshot: the uncontained case, finalized
+                # at once.  The survivor evidence is tested in
+                # test_van_compute_cgroup_survivors.
                 with mock.patch.object(pi_marked_recovery, "build_hold") as build_hold:
                     result = self.run_once_with(health)
                 build_hold.assert_not_called()

@@ -938,9 +938,21 @@ under the queue lock and diverts a requested job there.
   attempt and moves the job to `cancelled/`, usually within seconds. After a
   broker restart the request is finished before any health, CAN-quiet,
   eligibility or staging check; a marked job's old group is still held first.
-  The service unit's `KillMode=control-group` is what contains a dead
-  broker's job; a broker run by hand in the foreground that crashes is outside
-  that guarantee, as for an ordinary resume.
+  An unmarked job (the broker died before it could write a marker) moves to
+  `cancelled/` only on positive evidence that the previous instance's
+  processes are gone. `KillMode=control-group` is not that evidence: a
+  process in uninterruptible sleep survives systemd's SIGKILL and the unit
+  restarts anyway. So at start, before launching anything, the broker
+  snapshots its own service cgroup (`cgroup.procs` of the `.service` path in
+  `/proc/self/cgroup`, cgroup v2): every other member, identified by pid and
+  start time, is a previous instance's survivor (`pi_cgroup_survivors.py`).
+  While any survivor is alive (same pid and start time), recovery sends it
+  SIGKILL again (through a pidfd, so a reused pid is never signalled), leaves
+  the job `running` with its request (the installer's drain still counts it),
+  and defers the poll with the surviving pids; nothing else is claimed
+  meanwhile, as under a marked hold. A broker with no readable `.service`
+  cgroup (run by hand in the foreground, or no cgroup v2) has no containment
+  evidence and finalizes at once, as for an ordinary resume.
 - **A finish that lands after the request** keeps its exit code and results,
   as a cancelled job; `result` can still fetch them.
 - **Crash safety:** a cancel writes `.cancel-intents/<id>` first, records the
