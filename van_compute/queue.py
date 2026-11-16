@@ -202,12 +202,9 @@ def validate_relative_result(path: str) -> Path:
 
 
 def job_location(root: Path, job_id: str) -> tuple[str, Path] | None:
-    validate_job_id(job_id)
-    for state in STATE_DIRECTORIES:
-        candidate = root / state / job_id
-        if not candidate.is_symlink() and candidate.is_dir():
-            return state, candidate
-    return None
+    from van_compute import job_lookup
+
+    return job_lookup.locate(root, job_id)
 
 
 def validate_lease_token(lease_token: str) -> str:
@@ -588,11 +585,9 @@ def submit_job(args: argparse.Namespace) -> dict[str, object]:
 
 
 def manifest_for(root: Path, job_id: str) -> dict[str, object]:
-    found = job_location(root, job_id)
-    if found is None:
-        raise QueueError(f"unknown job {job_id}")
-    _state, path = found
-    return load_json(path / "manifest.json")
+    from van_compute import job_lookup
+
+    return job_lookup.snapshot(root, job_id).manifest
 
 
 def public_manifest(manifest: dict[str, object]) -> dict[str, object]:
@@ -628,14 +623,9 @@ def stream_result(root: Path, job_id: str, relative_text: str, output: BinaryIO)
 
 
 def list_jobs(root: Path, limit: int) -> list[dict[str, object]]:
-    jobs: list[dict[str, object]] = []
-    for state in STATE_DIRECTORIES:
-        for path in (root / state).iterdir():
-            if not path.is_symlink() and path.is_dir() and JOB_ID_RE.fullmatch(path.name):
-                try:
-                    jobs.append(load_json(path / "manifest.json"))
-                except QueueError:
-                    continue
+    from van_compute import job_lookup
+
+    jobs = job_lookup.list_manifests(root)
     jobs.sort(key=lambda item: str(item.get("submitted_at", "")), reverse=True)
     return jobs[:limit]
 
