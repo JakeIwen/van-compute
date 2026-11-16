@@ -441,13 +441,7 @@ class ComputeGoldenTests(unittest.TestCase):
                 process.kill()
                 process.wait(timeout=5)
 
-    def broker_job(self, prefix, variant="file"):
-        submitted = self.submit(prefix, "golden-directory" if variant == "directory" else "golden-file",
-                                ["--fail"] if variant == "nonzero" else [])
-        manifest, reason = broker.claim_local_job(self.root, grace_seconds=0, remote_max_age=45)
-        self.assertIsNotNone(manifest, reason)
-        self.assertEqual(manifest["id"], submitted["id"])
-        self.golden(f"{prefix}/running-manifest.json", (self.root / "running" / manifest["id"] / "manifest.json").read_bytes())
+    def broker_args(self):
         # Reuse the established harness's argument defaults and no_sandbox fake.
         harness = broker_tests.BrokerHarness()
         harness.setUp()
@@ -460,6 +454,16 @@ class ComputeGoldenTests(unittest.TestCase):
             args.max_result_bytes = MAX_RESULT_BYTES
         finally:
             harness.tearDown()
+        return args
+
+    def broker_job(self, prefix, variant="file"):
+        submitted = self.submit(prefix, "golden-directory" if variant == "directory" else "golden-file",
+                                ["--fail"] if variant == "nonzero" else [])
+        manifest, reason = broker.claim_local_job(self.root, grace_seconds=0, remote_max_age=45)
+        self.assertIsNotNone(manifest, reason)
+        self.assertEqual(manifest["id"], submitted["id"])
+        self.golden(f"{prefix}/running-manifest.json", (self.root / "running" / manifest["id"] / "manifest.json").read_bytes())
+        args = self.broker_args()
 
         def wait(process, **_kwargs):
             code = self.wait_child(process)
@@ -492,15 +496,9 @@ class ComputeGoldenTests(unittest.TestCase):
         self.snapshot_tree(f"{prefix}/disk")
         return manifest["id"]
 
-    def worker_job(self, prefix, variant="file"):
-        self.submit(prefix, "golden-directory" if variant == "directory" else "golden-file",
-                    ["--fail"] if variant == "nonzero" else [])
-        remote = InProcessRemote(self, prefix)
-        manifest = remote.claim()
-        self.assertIsNotNone(manifest)
-        self.golden(f"{prefix}/running-manifest.json", (self.root / "running" / manifest["id"] / "manifest.json").read_bytes())
+    def worker_args(self):
         work = self.base / "worker-work"
-        args = config.WorkerConfig(
+        return config.WorkerConfig(
             host="pi@vanpi.lan",
             remote_cli="/home/pi/van_compute/scripts/van_compute.py",
             remote_root=None,
@@ -531,6 +529,15 @@ class ComputeGoldenTests(unittest.TestCase):
             resource_manager=worker.SchedulerResourceManager(work, minimum_free_bytes=0,
                 maximum_result_bytes=MAX_RESULT_BYTES, free_space_reader=lambda _path: FREE_BYTES),
         )
+
+    def worker_job(self, prefix, variant="file"):
+        self.submit(prefix, "golden-directory" if variant == "directory" else "golden-file",
+                    ["--fail"] if variant == "nonzero" else [])
+        remote = InProcessRemote(self, prefix)
+        manifest = remote.claim()
+        self.assertIsNotNone(manifest)
+        self.golden(f"{prefix}/running-manifest.json", (self.root / "running" / manifest["id"] / "manifest.json").read_bytes())
+        args = self.worker_args()
 
         def wait(process, **_kwargs):
             code = self.wait_child(process)
