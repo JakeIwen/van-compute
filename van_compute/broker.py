@@ -47,7 +47,7 @@ from van_compute.pi_cleanup_hold import CleanupHold, log_best_effort
 from van_compute.pi_once import run_once_command
 from van_compute.pi_can_stop import CanStopped, StopLatch, requeue_after_can_stop
 from van_compute.pi_gate_flags import add_gate_arguments, validated_thresholds
-from van_compute.pi_health_monitor import HealthMonitor
+from van_compute.pi_health_monitor import HealthMonitor, observe_and_pick_reader
 from van_compute.pi_health import (
     HealthAssessment,
     HealthProbeError,
@@ -1394,19 +1394,6 @@ def execute_claimed_job(
     return result
 
 
-def _observe_and_pick_reader(monitor, health_reader):
-    """Observe CAN before any early return so deferrals (maintenance, a fresh
-    remote lease) keep the quiet chain unbroken.  The monitor is owned by
-    serve() or main(); building one per call would reset the chain every poll."""
-    if monitor is not None:
-        monitor.observe_can()
-    if health_reader is not None:
-        return health_reader
-    if monitor is None:
-        raise BrokerError("run_once needs a health monitor or a health reader")
-    return monitor.snapshot
-
-
 def run_once(
     args: BrokerConfig,
     *,
@@ -1416,7 +1403,7 @@ def run_once(
     monitor: HealthMonitor | None = None,
 ) -> dict[str, object]:
     gated_by_monitor = monitor is not None and health_reader is None
-    health_reader = _observe_and_pick_reader(monitor, health_reader)
+    health_reader = observe_and_pick_reader(monitor, health_reader, BrokerError)
     root = queue.safe_root(args.root)
     work_root = prepare_work_root(args.work_root)
     args.work_root = work_root

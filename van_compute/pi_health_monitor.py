@@ -73,3 +73,20 @@ class HealthMonitor:
             if self.tracker.quiet_seconds(self._clock()) >= quiet_seconds:
                 return probe
             self._sleep(CAN_WATCH_INTERVAL_SECONDS)
+
+
+def observe_and_pick_reader(
+    monitor: HealthMonitor | None,
+    health_reader: Callable[[], HealthSnapshot] | None,
+    error_type: type[Exception],
+) -> Callable[[], HealthSnapshot]:
+    """Observe CAN before any early return so deferrals (maintenance, a fresh
+    remote lease) keep the quiet chain unbroken.  The monitor is owned by
+    serve() or main(); building one per call would reset the chain every poll."""
+    if monitor is not None:
+        monitor.observe_can()
+    if health_reader is not None:
+        return health_reader
+    if monitor is None:
+        raise error_type("run_once needs a health monitor or a health reader")
+    return monitor.snapshot
