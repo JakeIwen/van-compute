@@ -587,7 +587,7 @@ def submit_job(args: argparse.Namespace) -> dict[str, object]:
 def manifest_for(root: Path, job_id: str) -> dict[str, object]:
     from van_compute import job_lookup
 
-    return job_lookup.snapshot(root, job_id).manifest
+    return job_lookup.snapshot(root, job_id).presented()
 
 
 def public_manifest(manifest: dict[str, object]) -> dict[str, object]:
@@ -602,7 +602,7 @@ def stream_result(root: Path, job_id: str, relative_text: str, output: BinaryIO)
     if found is None:
         raise QueueError(f"unknown job {job_id}")
     state, job_path = found
-    if state not in {"done", "failed"}:
+    if state not in job_states.TERMINAL_STATES:
         raise QueueError(f"job {job_id} has not finished")
     relative = validate_relative_result(relative_text)
     manifest = load_json(job_path / "manifest.json")
@@ -784,6 +784,10 @@ def worker_claim(
                 continue
             manifest = load_json(path / "manifest.json")
             if manifest.get("worker") == worker:
+                # This slot is idle, so its earlier run is over: a cancel
+                # that reached the job meanwhile ends it instead of a resume.
+                if _cancels().finalize_if_requested(root, path, "running", manifest):
+                    continue
                 token = manifest.get("lease_token")
                 if token is None:
                     token = secrets.token_hex(16)
@@ -799,15 +803,17 @@ def worker_claim(
             path for path in (root / "queued").iterdir()
             if not path.is_symlink() and path.is_dir() and JOB_ID_RE.fullmatch(path.name)
         )
-        if not queued:
+        for source in queued:
+            manifest = load_json(source / "manifest.json")
+            if manifest.get("id") != source.name:
+                raise QueueError(
+                    f"queued job manifest id does not match its directory: {source.name}"
+                )
+            if not _cancels().finalize_if_requested(root, source, "queued", manifest):
+                break
+        else:
             return None
-        source = queued[0]
         destination = root / "running" / source.name
-        manifest = load_json(source / "manifest.json")
-        if manifest.get("id") != source.name:
-            raise QueueError(
-                f"queued job manifest id does not match its directory: {source.name}"
-            )
         manifest.update(
             {
                 "state": "running",
@@ -1066,16 +1072,17 @@ def worker_finish(
             verified.append(
                 {"path": relative.as_posix(), "size": path.stat().st_size, "sha256": hash_file(path)}
             )
+        finish = {"finished_at": utc_now(), "exit_code": exit_code, "results": verified}
+        if _cancels().is_cancel_requested(manifest):
+            # A finish after a cancel request keeps its record, as cancelled.
+            manifest = _cancels().finalize_cancelled(
+                root, job_path, "running", manifest, finish=finish
+            )
+            worker_heartbeat(root, worker)
+            return manifest
         state = "done" if exit_code == 0 else "failed"
         manifest.pop("lease_token", None)
-        manifest.update(
-            {
-                "state": state,
-                "finished_at": utc_now(),
-                "exit_code": exit_code,
-                "results": verified,
-            }
-        )
+        manifest.update({"state": state, **finish})
         atomic_json(job_path / "manifest.json", manifest)
         os.replace(job_path, root / state / job_id)
         # Nothing reads a finished job's source/ (the manifest's sources records
@@ -1094,7 +1101,7 @@ def wait_for_job(root: Path, job_id: str, timeout: float, interval: float = 1.0)
     deadline = time.monotonic() + timeout
     while True:
         manifest = manifest_for(root, job_id)
-        if manifest.get("state") in {"done", "failed"}:
+        if manifest.get("state") in job_states.TERMINAL_STATES:
             return manifest
         if time.monotonic() >= deadline:
             manifest = dict(manifest)
@@ -1117,6 +1124,14 @@ def _source_sweep_commands():
     from van_compute import source_sweep
 
     return source_sweep
+
+
+def _cancels():
+    if __name__ == "__main__":
+        sys.modules.setdefault("van_compute.queue", sys.modules[__name__])
+    from van_compute import job_cancel
+
+    return job_cancel
 
 
 def _worker_commands():
@@ -1259,7 +1274,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.wait is not None:
                 manifest = wait_for_job(root, str(manifest["id"]), args.wait)
             print_json(public_manifest(manifest))
-            return 0 if manifest.get("state") != "failed" else 1
+            return job_states.exit_status(manifest)
         if args.command == "status":
             print_json(public_manifest(manifest_for(root, args.job_id)))
             return 0
@@ -1280,7 +1295,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "wait":
             manifest = wait_for_job(root, args.job_id, args.timeout)
             print_json(public_manifest(manifest))
-            return 0 if manifest.get("state") != "failed" else 1
+            return job_states.exit_status(manifest)
         if args.command == "result":
             stream_result(root, args.job_id, args.path, sys.stdout.buffer)
             return 0

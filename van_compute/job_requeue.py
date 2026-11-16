@@ -8,7 +8,7 @@ from pathlib import Path
 import secrets
 import shutil
 
-from van_compute import queue
+from van_compute import job_cancel, job_states, queue
 
 OWNERSHIP_FIELDS = (
     "worker",
@@ -32,6 +32,9 @@ def requeue_running_job(
 ) -> Path:
     """Move `running/<id>` back to `queued/` and publish its ownerless manifest.
 
+    A job with a cancel request goes to `cancelled/` instead (the returned path
+    says which); its attempt is still recorded in the history.
+
     The caller holds `queue.queue_lock(root)`; the lock is not reentrant, so
     this never takes it.  The caller also decided that this attempt may be
     abandoned (stale remote lease, CAN stop) and verified ownership.
@@ -49,6 +52,18 @@ def requeue_running_job(
             "reason": reason,
         }
     )
+    # The abandoned attempt's partial uploads are never published.
+    result_root = job_dir / "result"
+    if result_root.is_symlink():
+        raise error_type(f"job result directory is a symlink: {job_dir.name}")
+    if result_root.exists():
+        shutil.rmtree(result_root)
+    result_root.mkdir(mode=0o700)
+    if job_cancel.is_cancel_requested(manifest):
+        # A requested cancel is never requeued, whoever abandons the attempt.
+        manifest["attempt_history"] = history[-ATTEMPT_HISTORY_LIMIT:]
+        job_cancel.finalize_cancelled(root, job_dir, job_states.RUNNING, manifest)
+        return root / job_states.CANCELLED / job_dir.name
     manifest.update(
         {
             "state": "queued",
@@ -59,12 +74,6 @@ def requeue_running_job(
     )
     for field in OWNERSHIP_FIELDS:
         manifest.pop(field, None)
-    result_root = job_dir / "result"
-    if result_root.is_symlink():
-        raise error_type(f"job result directory is a symlink: {job_dir.name}")
-    if result_root.exists():
-        shutil.rmtree(result_root)
-    result_root.mkdir(mode=0o700)
     destination = root / "queued" / job_dir.name
     # Move first, then publish the requeued manifest.  A crash between
     # these operations leaves a queued directory with the superseded
@@ -77,6 +86,7 @@ def requeue_running_job(
 
 
 REQUEUED = "requeued"
+CANCELLED = "cancelled"
 OWNERSHIP_LOST = "ownership-lost"
 MAINTENANCE = "queue-maintenance"
 
@@ -130,8 +140,8 @@ def requeue_owned_job(
         if owned is None:
             return OWNERSHIP_LOST
         job_dir, manifest = owned
-        requeue_running_job(
+        destination = requeue_running_job(
             root, job_dir, manifest, reason=reason, now=now, error_type=error_type
         )
-    return REQUEUED
+    return CANCELLED if destination.parent.name == job_states.CANCELLED else REQUEUED
 

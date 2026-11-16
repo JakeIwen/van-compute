@@ -40,6 +40,17 @@ class JobSnapshot:
     path: Path
     manifest: dict[str, object]
 
+    def presented(self) -> dict[str, object]:
+        """The manifest as readers show it: anything in cancelled/ is cancelled,
+        even if a crash left its final rewrite undone."""
+        return presented(self.state, self.manifest)
+
+
+def presented(state: str, manifest: dict[str, object]) -> dict[str, object]:
+    if state == job_states.CANCELLED and manifest.get("state") != job_states.CANCELLED:
+        return {**manifest, "state": job_states.CANCELLED}
+    return manifest
+
 
 def _is_job_dir(path: Path) -> bool:
     return not path.is_symlink() and path.is_dir()
@@ -146,10 +157,10 @@ def list_manifests(root: Path) -> list[dict[str, object]]:
             if len(set(states)) == 1:
                 manifest = _read(root / states[0] / job_id)
                 if manifest is not None:
-                    found = manifest
+                    found = presented(states[0], manifest)
             if found is None:
                 relocated = find(root, job_id)
-                found = None if relocated is None else relocated.manifest
+                found = None if relocated is None else relocated.presented()
         except queue.QueueError:
             continue
         if found is not None:

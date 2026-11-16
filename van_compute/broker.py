@@ -37,7 +37,7 @@ import time
 from typing import Callable, Mapping, Sequence
 
 
-from van_compute import engine, job_states, limited_child, queue, task_cache
+from van_compute import engine, job_cancel, job_states, limited_child, queue, task_cache
 from van_compute.config import BrokerConfig, MissedOffloadRecord
 from van_compute.can_activity import CanObserver
 from van_compute.job_requeue import requeue_running_job
@@ -1418,6 +1418,7 @@ def run_once(
     now = now or dt.datetime.now(dt.timezone.utc)
     if queue.maintenance_status(root) is not None:
         return {"action": "deferred", "reason": "queue maintenance is active"}
+    job_cancel.reconcile(root)  # before any gate: cancels never wait on health
     running = _running_local_job(root)
     recovered: list[str] = []
     if running is None:
@@ -1450,7 +1451,8 @@ def run_once(
         grace_seconds=args.remote_grace,
         remote_max_age=args.remote_max_age,
         now=now,
-        eligibility=lambda candidate: runtime_eligibility(candidate, args),
+        eligibility=job_cancel.unless_cancel_requested(
+            lambda candidate: runtime_eligibility(candidate, args)),
     )
     if manifest is None:
         return {"action": "deferred", "reason": reason}
