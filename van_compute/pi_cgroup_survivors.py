@@ -18,10 +18,12 @@ unit): nothing contains the previous run, the documented foreground limit.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import signal
-from typing import Callable
+import sys
+from typing import Callable, Mapping, TextIO
 
 from van_compute.job_cleanup_marker import PROC_ROOT, read_group_start
 
@@ -135,3 +137,21 @@ def capture(
             continue  # exited between the listing and the read
         survivors.append(Survivor(pid, start))
     return StartupSurvivors(tuple(survivors), None, proc_root)
+
+
+def capture_reported(environ: Mapping[str, str] | None = None, stream: TextIO | None = None) -> StartupSurvivors:
+    """`capture`, and inside a systemd service one journal line saying which
+    containment evidence this broker has.  An unreadable cgroup otherwise
+    falls back to `uncontained` silently, and restart recovery would finalize
+    without evidence with nothing in the journal to show it."""
+    snapshot = capture()
+    if (os.environ if environ is None else environ).get("INVOCATION_ID"):
+        status, alive = snapshot.status()
+        line = {"action": "cgroup-survivors", "status": status, "survivors": list(alive)}
+        if snapshot.uncontained_reason is not None:
+            line["reason"] = snapshot.uncontained_reason
+        try:
+            print(json.dumps(line, sort_keys=True), file=sys.stderr if stream is None else stream, flush=True)
+        except Exception:  # a broken journal pipe must not stop the broker starting
+            pass
+    return snapshot

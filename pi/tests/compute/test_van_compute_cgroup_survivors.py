@@ -1,5 +1,7 @@
 """The startup cgroup snapshot and the cancel recovery that waits on it."""
 
+import io
+import json
 import shutil
 import tempfile
 import unittest
@@ -190,6 +192,33 @@ class CancelRecoveryEvidenceTests(CancelHarness, unittest.TestCase):
         self.host.list_procs(BROKER_PID, 200)
         self.assertEqual(self.recover(self.host.capture())["action"], "cancelled")
         self.assert_final(job["id"], "running")
+
+
+class StartupReportTests(unittest.TestCase):
+    def report(self, snapshot, environ, stream=None):
+        stream = io.StringIO() if stream is None else stream
+        with mock.patch.object(pi_cgroup_survivors, "capture", return_value=snapshot):
+            returned = pi_cgroup_survivors.capture_reported(environ, stream)
+        self.assertIs(returned, snapshot)
+        return stream
+
+    def test_a_service_start_says_which_containment_evidence_it_has(self):
+        unreadable = pi_cgroup_survivors.StartupSurvivors((), "cannot read cgroup.procs")
+        line = json.loads(self.report(unreadable, {"INVOCATION_ID": "x"}).getvalue())
+        self.assertEqual(
+            line,
+            {"action": "cgroup-survivors", "status": UNCONTAINED, "survivors": [],
+             "reason": "cannot read cgroup.procs"},
+        )
+        # A foreground run (--health, --once from a shell) prints nothing extra.
+        self.assertEqual(self.report(unreadable, {}).getvalue(), "")
+
+    def test_a_broken_journal_pipe_does_not_stop_the_start(self):
+        class Broken(io.StringIO):
+            def write(self, text):
+                raise BrokenPipeError
+
+        self.report(pi_cgroup_survivors.StartupSurvivors(()), {"INVOCATION_ID": "x"}, Broken())
 
 
 if __name__ == "__main__":

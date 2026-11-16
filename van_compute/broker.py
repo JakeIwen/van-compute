@@ -1694,7 +1694,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(raw)
     try:
         config = _validate_args(args)
-        monitor = HealthMonitor(config.can_lock_dir, survivors=pi_cgroup_survivors.capture())
+        monitor = HealthMonitor(config.can_lock_dir, survivors=pi_cgroup_survivors.capture_reported())
         if config.health:
             # Read-only, so no broker lock: it must work beside the service.
             print(json.dumps(health_report(config, monitor), indent=2, sort_keys=True))
