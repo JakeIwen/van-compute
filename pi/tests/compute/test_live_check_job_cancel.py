@@ -270,5 +270,40 @@ class LiveCheckPiGroupTests(unittest.TestCase):
         self.assertEqual(result["group_before"], live.INCONCLUSIVE)
 
 
+class LiveCheckOwnTaskTests(unittest.TestCase):
+    def test_the_installed_source_root_defines_the_task_the_check_submits(self):
+        import base64
+        import tempfile
+
+        from van_compute import protocol
+
+        hosts = FakeHosts()
+        with mock.patch.object(live, "pi", hosts.pi), tempfile.TemporaryDirectory() as temporary:
+            live.install_live_task()
+            for command in hosts.pi_commands:  # write what the Pi would have received
+                encoded, target = command.split("echo ")[1].split(" | base64 -d > ")
+                self.assertTrue(target.startswith(f"{live.LIVE_ROOT}/"))
+                Path(temporary, Path(target).name).write_bytes(base64.b64decode(encoded))
+            tasks = protocol.load_repo_tasks(Path(temporary))
+        self.assertIn(live.TASK, tasks)
+        self.assertIn(f"run {live.TASK} --source-root {live.LIVE_ROOT}", live.RUN_TASK)
+
+    def test_the_mac_stage_fails_when_a_claimed_job_never_launches(self):
+        # Seen live: a slot shows the job running while it is still staging the source.
+        import tempfile
+
+        hosts = FakeHosts()
+        with tempfile.NamedTemporaryFile() as log, \
+                mock.patch.object(live, "WORKER_LOG", Path(log.name)), \
+                mock.patch.object(live, "pi", hosts.pi), \
+                mock.patch.object(live, "submit", lambda: JOB), \
+                mock.patch.object(live, "status", lambda job: {"worker": "m4mac.02"}), \
+                mock.patch.object(live.time, "sleep", lambda _s: None):
+            result = live.stage_mac(live.Report(), live.Deadline(0.05))
+        self.assertIs(result["ok"], False)
+        self.assertIn("launched no process group", result["reason"])
+        self.assertIn(f"{live.PI_COMPUTE} cancel {JOB}", hosts.pi_commands)
+
+
 if __name__ == "__main__":
     unittest.main()

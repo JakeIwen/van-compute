@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Post-deploy live check of job cancellation on the real Mac and Pi.
 
-Run on the Mac after a deploy, never from the test suite.  It submits its own
-`repo-tests` jobs and cancels them (1) while queued, (2) while running on a Mac
+Run on the Mac after a deploy, never from the test suite.  It submits jobs of
+its own sleeping task (from a private source root it writes on the Pi and
+removes afterwards) and cancels them (1) while queued, (2) while running on a Mac
 slot, and (3) while running on the Pi, for which it drains and stops the Mac
 worker and always restores it.  It acts only on job ids it submitted and
 reports every foreign job id it saw; other sessions' jobs falling back to the
@@ -16,6 +17,7 @@ Prints one JSON report; exits 0 only if every stage it ran passed.
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass, field
 import json
 import os
@@ -36,7 +38,27 @@ PLIST = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
 WORKER_LOG = Path.home() / "Library/Caches/van-compute/logs/worker.stderr.log"
 MAC_BASE = "m4mac"
 PI_WORKER = "vanpi-local.00"
-TASK = "repo-tests"
+# The check brings its own task: a repository task such as `repo-tests` is still
+# staging its source when a Mac slot shows it running, and ends within a second
+# on the Pi, so neither host would hold a process group to cancel.
+LIVE_ROOT = "/home/pi/.cache/van-compute-cancel-live"
+TASK = "cancel-live-sleeper"
+LIVE_FILES = {
+    "sleeper.py": (
+        "import subprocess, sys, time\n"
+        "if len(sys.argv) == 1:  # one descendant, so a cancel has more than the leader to clear\n"
+        "    subprocess.Popen([sys.executable, sys.argv[0], 'descendant'])\n"
+        "time.sleep(900)\n"
+    ),
+    ".van-compute.json": json.dumps({"schema_version": 1, "tasks": [{
+        "name": TASK, "description": "Job-cancel live check: sleep until cancelled.",
+        "profile": "python-script", "source_paths": ["sleeper.py"],
+        "argv": ["{source:sleeper.py}"], "outputs": [],
+        "minimum_inputs": 0, "maximum_inputs": 0,
+    }]}) + "\n",
+}
+RUN_TASK = f"{PI_COMPUTE} run {TASK} --source-root {LIVE_ROOT}"
+LAUNCH_WAIT_SECONDS = 120
 OVERALL_SECONDS = 20 * 60
 LEASE_AND_GRACE_SECONDS = 80
 STALE_AGE_SECONDS = 300
@@ -181,11 +203,44 @@ def wait_until(predicate: Callable[[], bool], seconds: float, deadline: Deadline
     return predicate()
 
 
+def install_live_task() -> None:
+    for name, text in LIVE_FILES.items():
+        encoded = base64.b64encode(text.encode()).decode()  # shell-safe on the ssh command line
+        result = pi(f"mkdir -p -m 700 {LIVE_ROOT} && echo {encoded} | base64 -d > {LIVE_ROOT}/{name}")
+        if result.returncode != 0:
+            raise RuntimeError(f"could not write {LIVE_ROOT}/{name}: {result.stderr.strip()}")
+
+
+def remove_live_task() -> None:
+    """Best effort: jobs carry their own source snapshot, so a leftover root harms nothing."""
+    try:
+        result = pi(f"rm -f {' '.join(f'{LIVE_ROOT}/{name}' for name in LIVE_FILES)}; rmdir {LIVE_ROOT}")
+        failure = result.stderr.strip() if result.returncode != 0 else None
+    except Exception as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+    if failure is not None:
+        print(f"could not remove {LIVE_ROOT} on {PI_HOST}: {failure}", file=sys.stderr)
+
+
 def submit() -> str:
-    code, payload = pi_json(f"{PI_COMPUTE} run {TASK}")
+    code, payload = pi_json(RUN_TASK)
     if code != 0 or not payload:
         raise RuntimeError(f"submission failed with {code}")
     return str(payload["id"])
+
+
+def wait_for_launch(read: Callable[[], object | None], deadline: Deadline) -> object | None:
+    """A slot shows a job running before its child exists; wait for the logged launch."""
+    found: list[object] = []
+
+    def launched() -> bool:
+        value = read()
+        if value is not None:
+            found.append(value)
+        return bool(found)
+
+    wait_until(launched, LAUNCH_WAIT_SECONDS, deadline)
+    return found[-1] if found else None
 
 
 def group_alive_locally(group: int) -> bool:
@@ -233,7 +288,7 @@ class Report:
 
 def stage_queued(report: Report, deadline: Deadline) -> dict:
     for _attempt in range(2):
-        code, payload = pi_json(f"{PI_COMPUTE} run {TASK} --wait 0 --cancel-on-timeout")
+        code, payload = pi_json(f"{RUN_TASK} --wait 0 --cancel-on-timeout")
         if payload:
             report.own.append(str(payload["id"]))
         if code == 4 and payload and payload.get("cancelled_from") == "queued":
@@ -247,11 +302,14 @@ def stage_mac(report: Report, deadline: Deadline) -> dict:
     if not wait_until(lambda: str(status(job).get("worker", "")).startswith(f"{MAC_BASE}."), 120, deadline):
         pi(f"{PI_COMPUTE} cancel {job}")
         return {"ok": False, "job": job, "reason": "never ran on a Mac slot"}
-    time.sleep(3)
-    group = mac_launch_group(WORKER_LOG.read_text(errors="replace"), job)
-    alive_before = group is not None and group_alive_locally(group)
+    group = wait_for_launch(
+        lambda: mac_launch_group(WORKER_LOG.read_text(errors="replace"), job), deadline)
+    if group is None:
+        pi(f"{PI_COMPUTE} cancel {job}")
+        return {"ok": False, "job": job, "reason": "a Mac slot claimed it but launched no process group"}
+    alive_before = group_alive_locally(group)
     _code, cancelled = pi_json(f"{PI_COMPUTE} cancel {job}")
-    gone = group is not None and wait_until(lambda: not group_alive_locally(group), 30, deadline)
+    gone = wait_until(lambda: not group_alive_locally(group), 30, deadline)
     logged = lease_lost_logged(WORKER_LOG.read_text(errors="replace"), job)
     time.sleep(min(STALE_AGE_SECONDS + 60, deadline.remaining()))
     final = status(job)
@@ -267,9 +325,9 @@ def stage_pi(report: Report, deadline: Deadline) -> dict:
     if not wait_until(lambda: status(job).get("worker") == PI_WORKER, 360, deadline):
         pi(f"{PI_COMPUTE} cancel {job}")
         return {"ok": None, "job": job, "reason": "not exercised: the Pi did not run it in time"}
-    time.sleep(3)
-    journal = pi("journalctl -u van-compute-broker -o cat --since -15min").stdout
-    launch = pi_launch(journal, job)
+    launch = wait_for_launch(
+        lambda: pi_launch(pi("journalctl -u van-compute-broker -o cat --since -15min").stdout, job),
+        deadline)
     before = group_state_on_pi(*launch) if launch else None
     _code, cancelled = pi_json(f"{PI_COMPUTE} cancel {job}")
     waited = pi(f"{PI_COMPUTE} wait {job} --timeout 60", timeout=90)
@@ -457,8 +515,10 @@ def stage_pi_transaction(report: Report, deadline: Deadline, outage: MacWorkerOu
 
 
 PLAN = (
+    f"setup: write a private source root with one sleeping task at {LIVE_ROOT} on the Pi; "
+    "removed at the end",
     "queued: run --wait 0 --cancel-on-timeout; expect exit 4, cancelled_from queued",
-    "mac: submit, wait for an m4mac slot, check its pgid, cancel, expect the group gone, "
+    "mac: submit, wait for an m4mac slot and its launch line, check its pgid, cancel, expect the group gone, "
     "LeaseLost logged, still cancelled after the 300 s stale age",
     "pi: exhaustive read-only queue listing; drain (disable, SIGUSR1, poll), bootout; "
     "submit, wait for vanpi-local.00, check pgid and leader start, cancel, wait exits 4, "
@@ -481,6 +541,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.skip_pi:
         stages.append(("pi", stage_pi_transaction))
     try:
+        install_live_task()
         for name, stage in stages:
             if deadline.expired():
                 report.stages[name] = {"ok": None, "reason": "not run: overall deadline"}
@@ -491,6 +552,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 report.stages[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     finally:
         cancel_own_jobs(report)
+        remove_live_task()
     report.saw(listing())
     print(json.dumps({
         "own_jobs": report.own, "foreign_jobs_seen": sorted(report.foreign),
