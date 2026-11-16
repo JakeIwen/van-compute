@@ -317,5 +317,73 @@ class LaunchedGroupTests(unittest.TestCase):
                 self.assertEqual(outcome.exit_code, 0)
 
 
+SLEEPING_JOB = (
+    "import os, subprocess, sys, time\n"
+    "from pathlib import Path\n"
+    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+    "Path({marker!r}).write_text(str(os.getpid()))\n"
+    "time.sleep(60)\n"
+)
+
+
+class RunOnceLeaseStopTests(unittest.TestCase):
+    """`--run-once` (worker.run_once) wires the audit like the served scheduler."""
+
+    def test_a_lease_stop_ends_the_child_and_publishes_nothing(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        base = Path(temporary.name).resolve()
+        source = base / "source"
+        (source / "tools").mkdir(parents=True)
+        marker = base / "child-pid"
+        (source / "tools" / "run.py").write_text(SLEEPING_JOB.format(marker=str(marker)))
+        profile = base / "test.sb"
+        profile.write_text("test profile")
+        spec = SPEC
+        manifest = {"id": JOB, "attempt": 1, "task": "gate", "arguments": [], "inputs": [],
+                    "sources": [], "execution": spec, "lease_token": "a" * 32}
+
+        class Remote:
+            worker = "m4mac"
+            uploads = []
+
+            def heartbeat(self):
+                return {}
+
+            def claim(self):
+                return manifest
+
+            def json_command(self, *_arguments):
+                # The Pi no longer lists this lease, but only once the child runs.
+                return {"worker": "m4mac", "complete": marker.exists(), "leases": []}
+
+            def put_result(self, *args, **_kwargs):
+                self.uploads.append(("put-result", args))
+
+            def finish(self, *args, **_kwargs):
+                self.uploads.append(("finish", args))
+
+        remote = Remote()
+        args = worker_config(work_root=base / "work", sandbox_profile=profile,
+                             heartbeat_interval=0.05)
+        with mock.patch.object(worker, "make_remote", return_value=remote), \
+                mock.patch.object(worker, "prepare_job", return_value=(source, [], [])), \
+                mock.patch.object(worker, "sandbox_command", lambda command, **_k: list(command)):
+            with self.assertRaises(LeaseLost):
+                worker.run_once(args)
+        self.assertEqual(remote.uploads, [])
+        group = int(marker.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(group, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            os.killpg(group, 9)
+            self.fail("the stopped run's process group survived")
+
+
 if __name__ == "__main__":
     unittest.main()
