@@ -201,7 +201,7 @@ class RetentionTests(RetentionHarness, unittest.TestCase):
     def test_budget_includes_completed_state_directory_overhead(self):
         expected = sum(
             (self.root / state).stat().st_blocks * 512
-            for state in ("done", "failed")
+            for state in retention.RETENTION_STATES
         )
         maximum = max(1, expected - 1)
         result, payload, errors = self.run_prune(
