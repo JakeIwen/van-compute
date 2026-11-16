@@ -958,7 +958,10 @@ under the queue lock and diverts a requested job there.
 - **Crash safety:** a cancel writes `.cancel-intents/<id>` first, records the
   request in place (state and lease token kept), renames the job, then writes
   the final manifest and detaches `source/`. Readers treat `cancelled/` as
-  authoritative. The broker reconciles leftover intents on every poll.
+  authoritative. The broker reconciles leftover intents on every poll, and
+  under the queue lock deletes any other file in `.cancel-intents/` (an
+  intent write whose process died before its rename), so nothing accumulates
+  there.
 - **Mixed releases:** the coupled installer upgrades both hosts with the queue
   drained, so skew needs a hand-installed release. A Mac release from before
   cancellation is degraded, not fully cancelled: the Pi still cancels the job

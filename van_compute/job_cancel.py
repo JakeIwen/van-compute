@@ -17,7 +17,8 @@ A manifest with `cancel_requested_at` never moves anywhere but `cancelled/`,
 and nothing leaves `cancelled/` except retention.  A remote job is finalized
 at once (its lease fences every late upload); a Pi-local job only gets the
 request, because its process group belongs to the broker, which finishes it.
-`reconcile` completes whatever a crash left between steps.
+`reconcile` completes whatever a crash left between steps, and removes an
+intent write a crash interrupted.
 """
 
 from __future__ import annotations
@@ -185,24 +186,40 @@ def _reconcile_one(root: Path, job_id: str) -> str:
     return "cancelled"
 
 
+def _remove_abandoned_writes(root: Path, names: list[str]) -> None:
+    """Delete intent-write temporaries a dead process left.  Lock held.
+
+    Intents are written only under the queue lock, so an `atomic_json`
+    temporary still present once the lock is held belongs to a writer that
+    died mid-write; nothing else ever selects or prunes it."""
+    for name in names:
+        try:
+            (root / INTENTS / name).unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"van-compute: cannot remove {INTENTS}/{name}: {exc}", file=sys.stderr)
+
+
 def reconcile(root: Path) -> dict[str, str]:
     """Finish cancels a crash left between steps.  Cheap when nothing is pending.
 
     Runs on every broker poll, independent of Mac availability and Pi health.
     A requested Pi-local running job is left to the broker.  Never raises for
-    one bad entry: it is logged and retried on the next poll.
+    one bad entry: it is logged and retried on the next poll.  Any other name
+    in the intents directory is an abandoned write, removed under the lock.
     """
     try:
         names = os.listdir(root / INTENTS)
     except FileNotFoundError:
         return {}
     pending = sorted(name for name in names if queue.JOB_ID_RE.fullmatch(name))
-    if not pending:
+    abandoned = [name for name in names if not queue.JOB_ID_RE.fullmatch(name)]
+    if not pending and not abandoned:
         return {}
     outcome: dict[str, str] = {}
     with queue.queue_lock(root):
         if queue.maintenance_status(root) is not None:
             return {}
+        _remove_abandoned_writes(root, abandoned)
         for job_id in pending:
             try:
                 outcome[job_id] = _reconcile_one(root, job_id)

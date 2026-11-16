@@ -7,6 +7,9 @@ in cancelled/, final manifest, source detached, intent gone.
 """
 
 from pathlib import Path
+import signal
+import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -14,6 +17,19 @@ from van_compute import broker, finished_source, job_cancel, queue
 
 from pi.tests.compute.test_van_compute_cancel import MAC, CancelHarness
 from pi.tests.compute.van_compute_test_fixtures import GOOD_HEALTH
+
+
+REPO = Path(__file__).resolve().parents[3]
+
+# A cancel whose process is killed inside its first write (the intent), after
+# `atomic_json` created its temporary and before the rename.
+KILLED_IN_INTENT_WRITE = """
+import os, signal, sys
+from pathlib import Path
+from van_compute import job_cancel
+os.fsync = lambda _fd: os.kill(os.getpid(), signal.SIGKILL)
+job_cancel.cancel_job(Path(sys.argv[1]), sys.argv[2])
+"""
 
 
 class Crash(Exception):
@@ -131,6 +147,22 @@ class CrashTests(CancelHarness, unittest.TestCase):
         queue.set_maintenance(self.root, "golden-admin", False)
         self.assertEqual(job_cancel.reconcile(self.root), {job["id"]: "completed"})
         self.assert_final(job["id"], "queued")
+
+    def test_reconcile_removes_an_intent_write_its_dead_writer_left(self):
+        job = self.submit()
+        killed = subprocess.run(
+            [sys.executable, "-c", KILLED_IN_INTENT_WRITE, str(self.root), job["id"]],
+            cwd=REPO, capture_output=True,
+        )
+        self.assertEqual(killed.returncode, -signal.SIGKILL, killed.stderr)
+        leftovers = self.intents()
+        self.assertEqual(len(leftovers), 1)
+        self.assertTrue(leftovers[0].startswith(f".{job['id']}."), leftovers)
+        self.assertEqual(job_cancel.reconcile(self.root), {})
+        self.assertEqual(self.intents(), [])
+        # The cancel never reported success: the job is untouched.
+        self.assertEqual(self.located(job["id"]), ["queued"])
+        self.assertNotIn("cancel_requested_at", self.manifest("queued", job["id"]))
 
     def test_a_remote_request_stranded_in_running_stays_fenced_to_its_owner(self):
         job = self.submit()
