@@ -15,12 +15,14 @@ import stat
 import time
 from typing import Callable
 
+from van_compute import job_states
+
 
 DEFAULT_QUEUE_ROOT = Path("/home/pi/dev/obd-things/tmp/compute")
 # Keep telemetry readable if a queue protocol rollout is interrupted. A unit
 # test pins this value to van_compute_protocol.WORKER_PROTOCOL_VERSION.
 WORKER_PROTOCOL_VERSION = 2
-STATE_DIRECTORIES = ("queued", "running", "done", "failed")
+STATE_DIRECTORIES = job_states.METRICS_STATES
 JOB_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{8}")
 # Keep task queries aligned with van_compute_protocol._NAME_RE without
 # importing the executable protocol surface into the read-only metrics reader.
@@ -33,7 +35,7 @@ MAX_DIAGNOSTIC_TEXT = 4096
 MAX_MISSED_EVENT_BYTES = 64 * 1024
 MAX_SCANNED_MISSED_EVENTS = 2000
 MAX_RECENT_MISSED_EVENTS = 50
-LOCAL_WORKER_PREFIXES = ("vanpi-local", "pi-local")
+LOCAL_WORKER_PREFIXES = job_states.LOCAL_WORKER_PREFIXES
 SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 
 
@@ -326,11 +328,7 @@ def _placement(value: object, worker: object = None, *, default: str = "remote")
     return default
 
 
-def _is_local_worker(worker: str) -> bool:
-    return any(
-        worker == prefix or worker.startswith(f"{prefix}.")
-        for prefix in LOCAL_WORKER_PREFIXES
-    )
+_is_local_worker = job_states.is_local_worker
 
 
 def _workload_fingerprint(manifest: dict[str, object]) -> str | None:

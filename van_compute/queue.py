@@ -28,12 +28,12 @@ import time
 from typing import BinaryIO, Iterator, Sequence, TextIO
 
 
-from van_compute import finished_source, protocol
+from van_compute import finished_source, job_states, protocol
 
 
 DEFAULT_SOURCE_ROOT = Path("/home/pi/dev/obd-things")
 DEFAULT_QUEUE_ROOT = DEFAULT_SOURCE_ROOT / "tmp" / "compute"
-STATE_DIRECTORIES = ("queued", "running", "done", "failed")
+STATE_DIRECTORIES = job_states.STATE_DIRECTORIES
 JOB_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{8}")
 WORKER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 LEASE_TOKEN_RE = re.compile(r"[0-9a-f]{32}")
@@ -54,7 +54,7 @@ MISSED_REASONS = (
     "agent-choice",
     "other",
 )
-JOB_PLACEMENTS = ("remote", "pi-local")
+JOB_PLACEMENTS = job_states.JOB_PLACEMENTS
 
 
 class QueueError(RuntimeError):

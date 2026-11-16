@@ -37,7 +37,7 @@ import time
 from typing import Callable, Mapping, Sequence
 
 
-from van_compute import engine, limited_child, queue, task_cache
+from van_compute import engine, job_states, limited_child, queue, task_cache
 from van_compute.config import BrokerConfig, MissedOffloadRecord
 from van_compute.can_activity import CanObserver
 from van_compute.job_requeue import requeue_running_job
@@ -62,8 +62,9 @@ from van_compute.pi_health import (
 
 protocol = queue.protocol
 
-LOCAL_WORKER = "vanpi-local.00"
-LOCAL_WORKER_PREFIX = "vanpi-local"
+LOCAL_WORKER = job_states.LOCAL_WORKER
+LOCAL_WORKER_PREFIX = job_states.LOCAL_WORKER_PREFIX
+_is_local_worker = job_states.is_local_worker
 LOCAL_PROFILES = frozenset(
     {
         "repo-test",
@@ -181,15 +182,6 @@ def prepare_work_root(path: Path) -> Path:
                 f"work root must be disk-backed; {resolved} is on {filesystem_type}"
             )
     return resolved
-
-
-def _is_local_worker(worker: str) -> bool:
-    return (
-        worker == "pi-local"
-        or worker.startswith("pi-local.")
-        or worker == LOCAL_WORKER_PREFIX
-        or worker.startswith(f"{LOCAL_WORKER_PREFIX}.")
-    )
 
 
 def _compatible_worker_protocol(payload: Mapping[str, object]) -> bool:
