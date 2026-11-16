@@ -164,7 +164,7 @@ class LeaseAudit:
         return reply
 
     def audit_once(self) -> list[ActiveRun]:
-        """One audit round; returns the runs it stopped."""
+        """One audit round; returns the runs it newly stopped."""
         if self._unsupported_until is not None and self.clock() < self._unsupported_until:
             return []
         runs = self.snapshot()
@@ -185,6 +185,10 @@ class LeaseAudit:
         current = {id(run) for run in self.snapshot()}
         for run in runs:
             key = (run.identity, run.job_id, run.attempt)
+            # A run already told to stop stays registered until its child is
+            # gone; stopping and logging it again each round adds nothing.
+            if run.stop.is_set():
+                continue
             if id(run) in current and (key not in held or key in cancelled):
                 run.stop.set()
                 stopped.append(run)

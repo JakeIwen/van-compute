@@ -110,6 +110,14 @@ class LeaseAuditTests(unittest.TestCase):
         self.assertFalse(kept.stop.is_set())
         self.assertEqual(len(logs), 2)
 
+    def test_a_pending_lease_stop_is_logged_once_per_run(self):
+        audit, _remote, logs = self.audit([reply(), reply()])
+        run = audit._register("m4mac.01", {"id": JOB, "attempt": 1})
+        self.assertEqual(audit.audit_once(), [run])
+        self.assertEqual(audit.audit_once(), [])  # its child is still stopping
+        self.assertTrue(run.stop.is_set())
+        self.assertEqual(len(logs), 1)
+
     def test_a_later_attempt_on_the_pi_means_this_attempt_lost_its_lease(self):
         audit, _remote, _logs = self.audit([reply(("m4mac.01", JOB, 2, False))])
         run = audit._register("m4mac.01", {"id": JOB, "attempt": 1})
