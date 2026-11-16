@@ -8,6 +8,7 @@
   `models.py` owns deployment records and `runners.py` owns local SSH/SCP adapters
   and the background helper-process seam; `sandbox_cache.py` and `sandbox_proxy.py`
   hold the sandbox cache and registry-proxy probes.
+- `macbook/scripts/live_check_job_cancel.py`: post-deploy live check of job cancellation on the real hosts (queued, Mac-running and Pi-running cancels; drains and always restores the Mac worker). Run by hand after a deploy, never by the suite; `--dry-run` prints the plan.
 - `macbook/launchagents/`: worker LaunchAgent template.
 - `pi/tests/compute/`: self-contained compute and deployment regression suites; `van_compute_test_fixtures.py` and deployment support modules hold shared fixtures.
 - `pi/docs/compute/VAN_COMPUTE.md`: architecture, deployment, rollback, and host-compatibility decisions.
