@@ -4,6 +4,7 @@ import datetime as dt
 import io
 import json
 import unittest
+from unittest import mock
 
 from van_compute import broker, job_cancel, job_requeue, job_states, queue
 
@@ -212,6 +213,25 @@ class CancelGuardTests(CancelHarness, unittest.TestCase):
         )
         self.assertEqual(outcome, job_requeue.REQUEUED)
         self.assertEqual(self.located(job["id"]), ["queued"])
+
+    def test_one_failed_read_does_not_hide_a_request_in_an_unchanged_manifest(self):
+        job = self.submit()
+        self.claim_local()
+        job_cancel.cancel_job(self.root, job["id"])
+        watch = job_cancel.CancelWatch(self.root / "running" / job["id"] / "manifest.json")
+        real_load = queue.load_json
+        reads = []
+
+        def flaky_load(path):
+            reads.append(path)
+            if len(reads) == 1:
+                raise queue.QueueError("transient read failure")
+            return real_load(path)
+
+        with mock.patch.object(job_cancel.queue, "load_json", flaky_load):
+            self.assertFalse(watch.requested())
+            self.assertTrue(watch.requested())  # same file, never rewritten
+        self.assertEqual(len(reads), 2)
 
 
 if __name__ == "__main__":

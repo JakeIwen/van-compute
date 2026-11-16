@@ -241,8 +241,9 @@ class CancelWatch:
 
     Manifests can be megabytes, so the file is re-read only when its identity
     changes (`atomic_json` always replaces the inode).  Any read error counts
-    as "not requested": the lock-held guards still catch the request when the
-    attempt ends.
+    as "not requested" for that check: the identity is remembered only after a
+    successful read, so the next check reads the same file again (the
+    lock-held guards still catch the request when the attempt ends).
     """
 
     def __init__(self, path: Path) -> None:
@@ -257,8 +258,8 @@ class CancelWatch:
             info = os.stat(self.path)
             identity = (info.st_ino, info.st_mtime_ns, info.st_size)
             if identity != self._identity:
-                self._identity = identity
                 self._requested = is_cancel_requested(queue.load_json(self.path))
+                self._identity = identity
         except (OSError, queue.QueueError):
             return False
         return self._requested
