@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Callable, Mapping
 
 from van_compute.can_activity import CanProbe
+from van_compute.job_cancel import is_cancel_requested
 from van_compute.pi_cleanup_hold import stop_flag_signals
 
 
@@ -16,8 +17,10 @@ def run_once_command(
     running_job: Callable[[], Mapping[str, object] | None],
 ) -> dict[str, object]:
     running = running_job()
-    if running is not None and running.get("cleanup_unconfirmed"):
-        # Recovery of a marked job must not wait on, or defer for, CAN.
+    if running is not None and (
+        running.get("cleanup_unconfirmed") or is_cancel_requested(running)
+    ):
+        # Recovery of a marked or cancelled job must not wait on, or defer for, CAN.
         waited = CanProbe(False, (), None)
     else:
         waited = monitor.wait_for_quiet(config.can_quiet_seconds)

@@ -117,12 +117,18 @@ class CleanupHold:
         except Exception:  # an inspection error counts as still there
             return False
 
-    def remember_leader(self, group: int) -> None:
+    def remember_leader(self, group: int, *, launched: bool = False) -> None:
         """Record the group leader's identity.  Call right after the child is
         spawned: the supervisor's wait reaps the leader, after which a later
-        cleanup (a surviving descendant) can no longer read it."""
+        cleanup (a surviving descendant) can no longer read it.
+
+        `launched` also logs the group and leader start (the proof a live
+        check uses).  It is called outside the supervisor's cleanup handler, so
+        the line goes through `_log`, which never raises."""
         self.identity = self._identify(group)
         self.identity_group = group
+        if launched:
+            self._log(action="job-launched", group=group, leader_start=self.identity)
 
     def _identify(self, group: int) -> str | None:
         try:

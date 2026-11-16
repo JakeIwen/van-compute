@@ -1,9 +1,12 @@
-"""Stop a running Pi-local job when a CAN transmitter appears, and requeue it.
+"""The latched stop cause of a running Pi-local job: CAN, cancel or service stop.
 
 The start gate keeps jobs from beginning while CAN is active; this covers a
-transmitter that takes its lock after the job began.  The first stop cause wins
-and decides what happens to the job: a service stop fails it as before, a CAN
-cause terminates it fast and puts it back in the queue untouched.
+transmitter that takes its lock after the job began, and a cancel requested
+while the job runs.  The first stop cause wins and decides what happens to the
+job: a service stop fails it as before; a CAN cause terminates it fast and
+puts it back in the queue untouched; a cancel terminates it with the normal
+courtesy and discards the attempt the same way, which the requeue turns into
+`cancelled/` because the manifest carries the request.
 """
 
 from __future__ import annotations
@@ -26,6 +29,10 @@ CAN_PROBE_FAILED = "can-probe-failed"
 # broke the chain before the launch.
 CAN_NOT_QUIET = "pi-can-not-quiet"
 CAN_CAUSES = frozenset({CAN_TRANSMIT, CAN_PROBE_FAILED, CAN_NOT_QUIET})
+CANCEL_REQUESTED = "cancel-requested"
+# Causes whose attempt is thrown away (no upload, no worker_finish).
+DISCARD_CAUSES = CAN_CAUSES | {CANCEL_REQUESTED}
+CANCEL_WATCH_INTERVAL_SECONDS = 1.0
 # SIGTERM to SIGKILL for a CAN stop: with the 0.5 s watch this keeps the job
 # alive about 1.5 s after a lock appears, instead of the usual 10 s courtesy.
 CAN_TERMINATE_GRACE = 1.0
@@ -33,7 +40,7 @@ NORMAL_GROUP_GRACE = 2.0
 
 
 class CanStopped(Exception):
-    """Unwinds a job's execution to its requeue; never a failure."""
+    """Unwinds a discarded attempt (CAN or cancel) to its requeue; never a failure."""
 
 
 class StopLatch:
@@ -48,8 +55,11 @@ class StopLatch:
         clock: Callable[[], float] = time.monotonic,
         quiet_seconds: Callable[[], float] | None = None,
         required_quiet_seconds: float = 0.0,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> None:
         self._service_stop = service_stop
+        self._cancel_requested = cancel_requested
+        self._last_cancel_check: float | None = None
         self._observe_can = observe_can
         self._quiet_seconds = quiet_seconds
         self._required_quiet = required_quiet_seconds
@@ -62,6 +72,27 @@ class StopLatch:
     @property
     def can_cause(self) -> bool:
         return self.cause in CAN_CAUSES
+
+    @property
+    def discards_attempt(self) -> bool:
+        return self.cause in DISCARD_CAUSES
+
+    def _check_cancel(self, *, now: bool = False) -> None:
+        """Latch a requested cancel; the watch errs toward "not requested"."""
+        if self.cause is not None or self._cancel_requested is None:
+            return
+        clock = self._clock()
+        if not now and self._last_cancel_check is not None and (
+            clock - self._last_cancel_check < CANCEL_WATCH_INTERVAL_SECONDS
+        ):
+            return
+        self._last_cancel_check = clock
+        try:
+            requested = self._cancel_requested()
+        except Exception:
+            requested = False
+        if requested:
+            self._latch(CANCEL_REQUESTED)
 
     def _latch(self, cause: str, detail: str | None = None) -> None:
         if self.cause is None:
@@ -90,6 +121,7 @@ class StopLatch:
         wait can outlast the tracker's observation gap and silently break the
         chain the gate relied on.
         """
+        self._check_cancel(now=True)
         if self.cause is None:
             self._check_can()
             if (
@@ -101,7 +133,7 @@ class StopLatch:
                     CAN_NOT_QUIET,
                     f"quiet {quiet:.0f} s, below {self._required_quiet:.0f} s",
                 )
-        return not self.can_cause
+        return not self.discards_attempt
 
     def should_stop(self) -> bool:
         if self.cause is not None:
@@ -114,12 +146,13 @@ class StopLatch:
         # toward the faster kill.
         if due:
             self._check_can()
+        self._check_cancel()
         if self.cause is None and self._service_stop():
             self._latch(SERVICE_STOP)
         return self.cause is not None
 
-    def raise_if_can_stopped(self) -> None:
-        if self.can_cause:
+    def raise_if_discarded(self) -> None:
+        if self.discards_attempt:
             raise CanStopped(self.cause)
 
     def terminate_grace(self) -> float:
@@ -140,7 +173,8 @@ def requeue_after_can_stop(
     work: Path | None,
     error_type: type[RuntimeError],
 ) -> dict[str, object]:
-    """Discard local work, then return the job to the queue if it is still ours.
+    """Discard local work, then return the job to the queue if it is still ours
+    (or to cancelled/, when it carries a cancel request).
 
     Nothing is validated, packaged, uploaded or recorded as telemetry, and
     `worker_finish` is never called: the attempt simply did not happen.
@@ -158,6 +192,8 @@ def requeue_after_can_stop(
     )
     if outcome == job_requeue.REQUEUED:
         return {"action": "requeued", "reason": cause, "job_id": job_id}
+    if outcome == job_requeue.CANCELLED:
+        return {"action": "cancelled", "reason": cause, "job_id": job_id}
     # Not ours any more (or the queue is under maintenance): leave it alone.
     return {
         "action": "deferred",

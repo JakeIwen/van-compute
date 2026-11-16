@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from van_compute import task_cache
+from van_compute.job_cancel import CancelWatch
 from van_compute.job_cleanup_marker import (
     clear_cleanup_unconfirmed, mark_cleanup_unconfirmed, read_group_start,
 )
@@ -62,11 +63,11 @@ def build_hold(
     return hold
 
 
-def recover_marked_job(
-    tools: RecoveryTools, args, manifest, hold: CleanupHold, cache_store
+def hold_and_discard(
+    tools: RecoveryTools, manifest, hold: CleanupHold, cache_store
 ) -> None:
-    """Hold a previous run's group, discard the job's cache entry, then wait
-    (logged) for the staging space the failure's publication needs."""
+    """Hold a previous run's group until it is gone, then discard the job's
+    cache entry (the killed group may have left it half written)."""
     hold.hold_previous_group(manifest, tools.read_boot_id)
     request = task_cache.request_for_manifest(manifest)
     if cache_store is not None and request is not None:
@@ -76,11 +77,28 @@ def recover_marked_job(
             entry=f"{request.namespace}/{request.name}",
         )
 
+
+def recover_marked_job(
+    tools: RecoveryTools, args, manifest, hold: CleanupHold, cache_store,
+    cancel_requested: Callable[[], bool] = lambda: False,
+) -> bool:
+    """Hold and discard, then wait (logged) for the staging space the
+    failure's publication needs.
+
+    A cancel requested meanwhile ends the wait: a cancelled job publishes
+    nothing.  Returns True when a cancel was seen."""
+    hold_and_discard(tools, manifest, hold, cache_store)
+    if cancel_requested():
+        return True
+
     def space_reason() -> str | None:
+        if cancel_requested():
+            return None
         ok, reason = tools.capacity_check(manifest, args)
         return None if ok else reason
 
     hold.until_done("failure-publication", space_reason)
+    return cancel_requested()
 
 
 def require_local_eligibility(tools: RecoveryTools, args, manifest) -> None:
@@ -100,7 +118,8 @@ def prepare_claim(
 ) -> tuple[bool, task_cache.TaskCacheStore | None, CleanupHold]:
     """Recover a marked job, or check an ordinary one's eligibility.
 
-    Returns (marked, cache store, hold).
+    Returns (marked, cache store, hold); `marked` is False once a cancel
+    request arrived during recovery, since there is no failure to publish.
     """
     marked = bool(manifest.get("cleanup_unconfirmed"))
     cache_store = (
@@ -109,7 +128,11 @@ def prepare_claim(
     )
     hold = build_hold(tools, root, job_id, lease_token, should_stop)
     if marked:
-        recover_marked_job(tools, args, manifest, hold, cache_store)
+        watch = CancelWatch(root / "running" / job_id / "manifest.json")
+        if recover_marked_job(tools, args, manifest, hold, cache_store, watch.requested):
+            # Nothing to fail or publish: the caller's pre-staging launch check
+            # sees the request and discards the attempt into cancelled/.
+            marked = False
     else:
         require_local_eligibility(tools, args, manifest)
     return marked, cache_store, hold

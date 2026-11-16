@@ -42,7 +42,7 @@ from van_compute.config import BrokerConfig, MissedOffloadRecord
 from van_compute.can_activity import CanObserver
 from van_compute.job_requeue import requeue_running_job
 from van_compute.job_cleanup_marker import read_boot_id
-from van_compute import pi_marked_recovery
+from van_compute import pi_cancel_recovery, pi_marked_recovery
 from van_compute.pi_cleanup_hold import CleanupHold, log_best_effort
 from van_compute.pi_once import run_once_command
 from van_compute.pi_can_stop import CanStopped, StopLatch, requeue_after_can_stop
@@ -1067,7 +1067,7 @@ def _supervise_child(
     process, args: BrokerConfig, work: Path, stop: StopLatch, hold: CleanupHold
 ):
     # Before any wait can reap the leader; the marker needs its identity.
-    hold.remember_leader(process.pid)
+    hold.remember_leader(process.pid, launched=True)
     try:
         outcome = _wait_for_process(
             process,
@@ -1102,7 +1102,15 @@ def _recovery_tools() -> pi_marked_recovery.RecoveryTools:
     )
 
 
-def _requeue_for_can(root, job_id, lease_token, stop, work):
+def _stop_latch_for(args, job_path, should_stop, observe_can, quiet_seconds):
+    return StopLatch(
+        should_stop, observe_can, quiet_seconds=quiet_seconds,
+        required_quiet_seconds=args.health_thresholds.can_quiet_seconds,
+        cancel_requested=job_cancel.CancelWatch(job_path / "manifest.json").requested,
+    )
+
+
+def _discard_attempt(root, job_id, lease_token, stop, work):
     return requeue_after_can_stop(
         root,
         job_id,
@@ -1134,13 +1142,10 @@ def execute_claimed_job(
     marked, cache_store, hold = pi_marked_recovery.prepare_claim(
         _recovery_tools(), args, root, manifest, job_id, lease_token, should_stop
     )
-    stop = StopLatch(
-        should_stop, observe_can, quiet_seconds=quiet_seconds,
-        required_quiet_seconds=args.health_thresholds.can_quiet_seconds,
-    )
+    stop = _stop_latch_for(args, job_path, should_stop, observe_can, quiet_seconds)
     # A marked job fails below instead of requeueing, so it is never run again.
     if not marked and not stop.clear_to_launch():
-        return _requeue_for_can(root, job_id, lease_token, stop, None)
+        return _discard_attempt(root, job_id, lease_token, stop, None)
     broker_active_started = time.monotonic()
     work_root = prepare_work_root(args.work_root)
     with tempfile.TemporaryDirectory(prefix=f"{job_id}-", dir=work_root) as temporary:
@@ -1225,7 +1230,7 @@ def execute_claimed_job(
                         result_root=result_root,
                         supervise=lambda p: _supervise_child(p, args, work, stop, hold),
                     )
-            stop.raise_if_can_stopped()
+            stop.raise_if_discarded()
             duration = time.monotonic() - started_monotonic
             resource_usage = _resource_usage(outcome.usage, duration)
             resource_usage.update(
@@ -1330,8 +1335,8 @@ def execute_claimed_job(
         else:
             exit_code = outcome.exit_code
 
-        if stop.can_cause:
-            return _requeue_for_can(root, job_id, lease_token, stop, work)
+        if stop.discards_attempt:
+            return _discard_attempt(root, job_id, lease_token, stop, work)
 
         uploaded: list[str] = []
         upload_started = time.monotonic()
@@ -1420,6 +1425,8 @@ def run_once(
         return {"action": "deferred", "reason": "queue maintenance is active"}
     job_cancel.reconcile(root)  # before any gate: cancels never wait on health
     running = _running_local_job(root)
+    if running is not None and job_cancel.is_cancel_requested(running):
+        return pi_cancel_recovery.finish(_recovery_tools(), args, root, running, should_stop)
     recovered: list[str] = []
     if running is None:
         if queue_supports_lease_tokens():

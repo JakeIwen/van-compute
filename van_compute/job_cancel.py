@@ -239,3 +239,31 @@ def cancel_job(
             return job_states.CANCEL_REQUESTED, manifest
         final = finalize_cancelled(root, found.path, found.state, manifest, reason=reason)
         return job_states.CANCEL_CANCELLED, final
+
+
+class CancelWatch:
+    """Cheap repeated check of one running manifest for a cancel request.
+
+    Manifests can be megabytes, so the file is re-read only when its identity
+    changes (`atomic_json` always replaces the inode).  Any read error counts
+    as "not requested": the lock-held guards still catch the request when the
+    attempt ends.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._identity: tuple[int, int, int] | None = None
+        self._requested = False
+
+    def requested(self) -> bool:
+        if self._requested:
+            return True
+        try:
+            info = os.stat(self.path)
+            identity = (info.st_ino, info.st_mtime_ns, info.st_size)
+            if identity != self._identity:
+                self._identity = identity
+                self._requested = is_cancel_requested(queue.load_json(self.path))
+        except (OSError, queue.QueueError):
+            return False
+        return self._requested
