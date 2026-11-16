@@ -84,6 +84,11 @@ def mac_work(entries: Iterable[Entry], base: str = MAC_BASE) -> list[Entry]:
     ]
 
 
+def unattributed_running(entries: Iterable[Entry]) -> list[Entry]:
+    """Running jobs whose owner could not be read: they might be on the Mac."""
+    return [entry for entry in entries if entry.state == "running" and not entry.worker]
+
+
 def foreign_ids(entries: Iterable[Entry], own: Iterable[str]) -> list[str]:
     mine = set(own)
     return sorted({entry.id for entry in entries if entry.id not in mine and not entry.id.startswith(".")})
@@ -115,9 +120,11 @@ def lease_lost_logged(log_text: str, job_id: str) -> bool:
     return f"job {job_id} attempt" in log_text and "no longer leased" in log_text
 
 
-def coordinator_fresh(available: dict, base: str = MAC_BASE) -> bool:
+def coordinator_fresh(available: dict, base: str = MAC_BASE,
+                      max_age: float = FRESH_HEARTBEAT_SECONDS) -> bool:
+    """A heartbeat younger than max_age; restoration passes the time since it began."""
     for item in available.get("workers", []):
-        if item.get("worker") == base and float(item.get("age_seconds", 1e9)) < FRESH_HEARTBEAT_SECONDS:
+        if item.get("worker") == base and float(item.get("age_seconds", 1e9)) <= min(max_age, FRESH_HEARTBEAT_SECONDS):
             return True
     return False
 
@@ -185,14 +192,30 @@ def group_alive_locally(group: int) -> bool:
     return run(["/usr/bin/pgrep", "-g", str(group)]).returncode == 0
 
 
-def group_alive_on_pi(group: int, leader_start: str | None) -> bool:
-    if pi(f"/usr/bin/pgrep -g {group}").returncode != 0:
-        return False
-    if leader_start is None:
-        return True
-    stat = pi(f"cat /proc/{group}/stat").stdout
-    fields = stat.rpartition(")")[2].split()
-    return len(fields) > 19 and fields[19] == leader_start
+GONE, ALIVE, INCONCLUSIVE = "gone", "alive", "inconclusive"
+
+
+def group_state_on_pi(group: int, leader_start: str | None) -> str:
+    """GONE only on positive proof; a transport or inspection error never certifies it."""
+    try:
+        members = pi(f"/usr/bin/pgrep -g {group}")
+        if members.returncode == 1:  # pgrep: no match
+            return GONE
+        if members.returncode != 0:
+            return INCONCLUSIVE
+        if leader_start is None:
+            return ALIVE
+        leader = pi(f"cat /proc/{group}/stat")
+    except Exception:
+        return INCONCLUSIVE
+    if leader.returncode == 1:  # cat: leader reaped but descendants remain
+        return ALIVE
+    if leader.returncode != 0:
+        return INCONCLUSIVE
+    fields = leader.stdout.rpartition(")")[2].split()
+    if len(fields) <= 19:
+        return INCONCLUSIVE
+    return ALIVE if fields[19] == leader_start else GONE
 
 
 # -- stages ---------------------------------------------------------------------------
@@ -247,14 +270,14 @@ def stage_pi(report: Report, deadline: Deadline) -> dict:
     time.sleep(3)
     journal = pi("journalctl -u van-compute-broker -o cat --since -15min").stdout
     launch = pi_launch(journal, job)
-    alive_before = launch is not None and group_alive_on_pi(*launch)
+    before = group_state_on_pi(*launch) if launch else None
     _code, cancelled = pi_json(f"{PI_COMPUTE} cancel {job}")
     waited = pi(f"{PI_COMPUTE} wait {job} --timeout 60", timeout=90)
-    gone = launch is not None and not group_alive_on_pi(*launch)
-    ok = bool(cancelled and cancelled.get("cancel_result") == "requested" and alive_before
-              and waited.returncode == 4 and gone)
-    return {"ok": ok, "job": job, "launch": launch, "alive_before": alive_before,
-            "wait_exit": waited.returncode, "gone": gone}
+    after = group_state_on_pi(*launch) if launch else None
+    ok = bool(cancelled and cancelled.get("cancel_result") == "requested" and before == ALIVE
+              and waited.returncode == 4 and after == GONE)
+    return {"ok": ok, "job": job, "launch": launch, "group_before": before,
+            "wait_exit": waited.returncode, "group_after": after}
 
 
 # -- the Mac worker transaction ------------------------------------------------------
@@ -263,10 +286,21 @@ def stage_pi(report: Report, deadline: Deadline) -> dict:
 class MacWorkerOutage:
     """Stop the Mac worker the way the installer drains it; always restore it."""
 
-    def __init__(self, report: Report) -> None:
+    def __init__(self, report: Report, heartbeat_seconds: float = 120) -> None:
         self.report = report
-        self.domain = f"gui/{os.getuid()}/{LABEL}"
+        self.uid = os.getuid()
+        self.domain = f"gui/{self.uid}/{LABEL}"
+        self.heartbeat_seconds = heartbeat_seconds
+        # Stays True until restoration has succeeded, so a failed attempt can be retried.
         self.stopped = False
+        self.unknown: list[str] = []
+
+    def manual_restore_commands(self) -> list[str]:
+        return [
+            f"launchctl enable {self.domain}",
+            f"launchctl bootstrap gui/{self.uid} {PLIST}",
+            f"ssh {PI_HOST} {QUEUE_CLI} available   # expect a {MAC_BASE} entry with a small age_seconds",
+        ]
 
     def _loaded(self) -> bool:
         return run(["/bin/launchctl", "print", self.domain]).returncode == 0
@@ -274,7 +308,9 @@ class MacWorkerOutage:
     def _mac_busy(self) -> bool:
         entries = listing()
         self.report.saw(entries)
-        return any(entry.state == "running" for entry in mac_work(entries))
+        # An unreadable manifest hides its owner; killing the worker could kill that job.
+        self.unknown = [entry.id for entry in unattributed_running(entries)]
+        return bool(self.unknown) or any(entry.state == "running" for entry in mac_work(entries))
 
     def stop(self) -> bool:
         """False when Mac work appeared: restored, and the stage is skipped."""
@@ -293,44 +329,123 @@ class MacWorkerOutage:
         run(["/bin/launchctl", "bootout", self.domain])
         return not self._mac_busy()
 
+    def _launchctl(self, failures: list[str], *args: str) -> bool:
+        try:
+            result = run(["/bin/launchctl", *args])
+        except Exception as exc:
+            failures.append(f"launchctl {args[0]}: {type(exc).__name__}: {exc}")
+            return False
+        if result.returncode != 0:
+            failures.append(f"launchctl {args[0]} exited {result.returncode}: {result.stderr.strip()}")
+            return False
+        return True
+
+    def _reload(self, failures: list[str]) -> bool:
+        ok = self._launchctl(failures, "enable", self.domain)
+        if not self._loaded():
+            ok = self._launchctl(failures, "bootstrap", f"gui/{self.uid}", str(PLIST)) and ok
+        return ok
+
     def restore(self) -> dict:
         if not self.stopped:
             return {"restored": "not stopped"}
-        self.stopped = False
-        run(["/bin/launchctl", "enable", self.domain])
-        if not self._loaded():
-            run(["/bin/launchctl", "bootstrap", f"gui/{os.getuid()}", str(PLIST)])
-        end = time.monotonic() + 120
-        while time.monotonic() < end:
-            _code, available = pi_json(f"{QUEUE_CLI} available")
-            if available and coordinator_fresh(available):
-                return {"restored": True, "fresh_heartbeat": True}
+        began = time.monotonic()
+        failures: list[str] = []
+        for attempt in range(3):
+            failures.clear()
+            if self._reload(failures):
+                break
+            time.sleep(2)
+        fresh = False
+        end = began + self.heartbeat_seconds
+        while not failures and time.monotonic() < end:
+            try:
+                _code, available = pi_json(f"{QUEUE_CLI} available")
+            except Exception:
+                available = None
+            # Older than this attempt means it predates the outage.
+            if available and coordinator_fresh(available, max_age=time.monotonic() - began):
+                fresh = True
+                break
             time.sleep(5)
-        return {"restored": True, "fresh_heartbeat": False}
+        if not fresh and not failures:
+            failures.append("no heartbeat from the Mac worker written after restoration began")
+        if not failures:
+            self.stopped = False
+            return {"restored": True, "fresh_heartbeat": True}
+        manual = self.manual_restore_commands()
+        print("MAC WORKER NOT RESTORED (" + "; ".join(failures) + "). Run by hand:\n  "
+              + "\n  ".join(manual), file=sys.stderr)
+        return {"restored": False, "fresh_heartbeat": fresh, "restore_failures": failures,
+                "manual_restore": manual}
 
 
-def stage_pi_transaction(report: Report, deadline: Deadline) -> dict:
-    outage = MacWorkerOutage(report)
-    previous = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+class SignalLatch:
+    """Raise on the first signal, then only latch: cleanup must never be interrupted."""
 
-    def interrupted(signum, _frame):
+    SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+    def __init__(self) -> None:
+        self.cleaning = False
+        self.raised = False
+        self.latched: list[int] = []
+        self.previous: dict[int, object] = {}
+
+    def _handle(self, signum, _frame) -> None:
+        if self.cleaning or self.raised:
+            self.latched.append(signum)
+            return
+        self.raised = True
         raise KeyboardInterrupt(f"signal {signum}")
 
-    for number in previous:
-        signal.signal(number, interrupted)
-    try:
-        if not outage.stop():
-            return {"ok": None, "reason": "skipped: Mac work appeared while draining", **outage.restore()}
-        time.sleep(min(LEASE_AND_GRACE_SECONDS, deadline.remaining()))
-        result = stage_pi(report, deadline)
-    finally:
-        restored = outage.restore()
-        for number, handler in previous.items():
+    def __enter__(self) -> "SignalLatch":
+        self.previous = {number: signal.getsignal(number) for number in self.SIGNALS}
+        for number in self.SIGNALS:
+            signal.signal(number, self._handle)
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        for number, handler in self.previous.items():
             signal.signal(number, handler)
+
+
+TERMINAL_STATES = ("cancelled", "done", "failed")
+
+
+def cancel_own_jobs(report: Report) -> None:
+    for job in report.own:
+        try:
+            if status(job).get("state") not in TERMINAL_STATES:
+                pi(f"{PI_COMPUTE} cancel {job}")
+        except Exception as exc:  # keep going: restoration and other jobs still matter
+            print(f"could not cancel {job}: {exc}", file=sys.stderr)
+
+
+def stage_pi_transaction(report: Report, deadline: Deadline, outage: MacWorkerOutage | None = None) -> dict:
+    outage = outage or MacWorkerOutage(report)
+    with SignalLatch() as latch:
+        try:
+            if outage.stop():
+                time.sleep(min(LEASE_AND_GRACE_SECONDS, deadline.remaining()))
+                result = stage_pi(report, deadline)
+            elif outage.unknown:
+                result = {"ok": False, "reason": "aborted before stopping the worker: running job "
+                          f"owner unreadable: {', '.join(outage.unknown)}"}
+            else:
+                result = {"ok": None, "reason": "skipped: Mac work appeared while draining"}
+        finally:
+            latch.cleaning = True
+            cancel_own_jobs(report)
+            restored = outage.restore()
     result.update(restored)
-    result["final_state"] = status(result["job"]).get("state") if "job" in result else None
-    if not restored.get("fresh_heartbeat"):
-        result["ok"] = False
+    if restored.get("restored") is False or latch.latched:
+        result["ok"] = False  # also when the Pi stage was skipped or aborted
+        if latch.latched:
+            result["signals_during_cleanup"] = latch.latched
+    try:
+        result["final_state"] = status(result["job"]).get("state") if "job" in result else None
+    except Exception:
+        result["final_state"] = None
     return result
 
 
@@ -358,17 +473,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     stages = [("queued", stage_queued), ("mac", stage_mac)]
     if not args.skip_pi:
         stages.append(("pi", stage_pi_transaction))
-    for name, stage in stages:
-        if deadline.expired():
-            report.stages[name] = {"ok": None, "reason": "not run: overall deadline"}
-            continue
-        try:
-            report.stages[name] = stage(report, deadline)
-        except Exception as exc:  # report and move on; the outage restores itself
-            report.stages[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    for job in report.own:
-        if status(job).get("state") not in ("cancelled", "done", "failed"):
-            pi(f"{PI_COMPUTE} cancel {job}")
+    try:
+        for name, stage in stages:
+            if deadline.expired():
+                report.stages[name] = {"ok": None, "reason": "not run: overall deadline"}
+                continue
+            try:
+                report.stages[name] = stage(report, deadline)
+            except Exception as exc:  # report and move on; the outage restores itself
+                report.stages[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        cancel_own_jobs(report)
     report.saw(listing())
     print(json.dumps({
         "own_jobs": report.own, "foreign_jobs_seen": sorted(report.foreign),
