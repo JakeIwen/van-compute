@@ -90,6 +90,7 @@ class FakeHosts:
         self.pi_commands = []
         self.on_enable = None
         self.entries_after_kill = None
+        self.slow_reply = None
 
     def run(self, command, timeout=60):
         verb = command[1]
@@ -107,6 +108,12 @@ class FakeHosts:
             return done(self.bootstrap_code, err="boom")
         return done()
 
+    def pi_json(self, command):
+        payload = {"workers": [{"worker": "m4mac", "age_seconds": self.heartbeat_age}]}
+        if self.slow_reply:
+            self.slow_reply()
+        return 0, payload
+
     def pi(self, command, timeout=60):
         self.pi_commands.append(command)
         return done()
@@ -117,8 +124,7 @@ class FakeHosts:
             mock.patch.object(live, "pi", self.pi),
             mock.patch.object(live, "listing", lambda: self.entries),
             mock.patch.object(live, "status", lambda job: {"state": "running"}),
-            mock.patch.object(live, "pi_json", lambda command: (0, {
-                "workers": [{"worker": "m4mac", "age_seconds": self.heartbeat_age}]})),
+            mock.patch.object(live, "pi_json", self.pi_json),
             mock.patch.object(live.time, "sleep", lambda _seconds: None),
             mock.patch.object(live, "MAC_BASE", "m4mac"),
         ]
@@ -167,6 +173,46 @@ class LiveCheckRestorationTests(unittest.TestCase):
         self.assertIs(result["ok"], False)
         self.assertIs(result["restored"], False)
         self.assertFalse(result["fresh_heartbeat"])
+
+    def test_a_heartbeat_from_before_restoration_is_rejected_even_when_the_reply_is_slow(self):
+        hosts = FakeHosts(heartbeat_age=2.0)
+        clock = [0.0]
+        hosts.entries_after_kill = None
+        hosts.slow_reply = lambda: clock.__setitem__(0, clock[0] + 5.0)
+        with mock.patch.object(live.time, "monotonic", lambda: clock[0]):
+            _report, result = hosts.transaction(lambda r, d: {"ok": True})
+        self.assertIs(result["restored"], False)
+
+    def restore_with_failing_inspection(self, failures):
+        hosts = FakeHosts()
+        hosts.loaded = False  # booted out, as after the drain
+        left = [failures]
+
+        def flaky_print(command, timeout=60):
+            if command[1] == "print" and left[0] != 0:
+                left[0] -= 1
+                raise subprocess.TimeoutExpired(command, timeout)
+            return FakeHosts.run(hosts, command, timeout)
+
+        err = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for patch in hosts.patches():
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(live, "run", flaky_print))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            outage = live.MacWorkerOutage(live.Report(), heartbeat_seconds=0.05)
+            outage.stopped = True
+            return hosts, outage.restore(), err.getvalue()
+
+    def test_one_failed_launchctl_inspection_is_retried_through_bootstrap(self):
+        hosts, restored, _err = self.restore_with_failing_inspection(1)
+        self.assertIn("bootstrap", hosts.launchctl)
+        self.assertIs(restored["restored"], True)
+
+    def test_a_persistently_failing_launchctl_inspection_reports_the_manual_commands(self):
+        _hosts, restored, err = self.restore_with_failing_inspection(99)
+        self.assertIs(restored["restored"], False)
+        self.assertIn("launchctl bootstrap", err)
 
     def test_a_failed_bootstrap_exits_nonzero_and_prints_the_manual_commands(self):
         hosts = FakeHosts(bootstrap_code=5)

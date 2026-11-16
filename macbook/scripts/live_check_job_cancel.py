@@ -342,7 +342,12 @@ class MacWorkerOutage:
 
     def _reload(self, failures: list[str]) -> bool:
         ok = self._launchctl(failures, "enable", self.domain)
-        if not self._loaded():
+        try:
+            loaded = self._loaded()
+        except Exception as exc:  # a transient inspection failure must not skip the retries
+            failures.append(f"launchctl print: {type(exc).__name__}: {exc}")
+            return False
+        if not loaded:
             ok = self._launchctl(failures, "bootstrap", f"gui/{self.uid}", str(PLIST)) and ok
         return ok
 
@@ -359,12 +364,14 @@ class MacWorkerOutage:
         fresh = False
         end = began + self.heartbeat_seconds
         while not failures and time.monotonic() < end:
+            # Taken before the RPC: the Pi computes the age before replying, so a slow reply
+            # may only make the check stricter, never let a pre-restoration heartbeat pass.
+            allowed = time.monotonic() - began
             try:
                 _code, available = pi_json(f"{QUEUE_CLI} available")
             except Exception:
                 available = None
-            # Older than this attempt means it predates the outage.
-            if available and coordinator_fresh(available, max_age=time.monotonic() - began):
+            if available and coordinator_fresh(available, max_age=allowed):
                 fresh = True
                 break
             time.sleep(5)
