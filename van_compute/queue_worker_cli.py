@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from van_compute import queue
+from van_compute import lease_report, queue
 
 
 def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -27,6 +27,9 @@ def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
             item.add_argument("--slots-busy", type=int)
         else:
             item.add_argument("--placement", choices=queue.JOB_PLACEMENTS, default="remote")
+    leases = worker_subparsers.add_parser("leases")
+    leases.add_argument("--worker", required=True)
+    leases.add_argument("--protocol-version", required=True, type=int)
     stream = worker_subparsers.add_parser("stream")
     stream.add_argument("job_id")
     stream.add_argument("--worker", required=True)
@@ -101,6 +104,10 @@ def run_worker_command(
                 )
             }
         )
+        return 0
+    if command == "leases":
+        queue.require_worker_protocol_version(args.protocol_version)
+        print_json(lease_report.leases_for(root, args.worker))
         return 0
     if command == "stream":
         return _stream(root, args)

@@ -38,9 +38,10 @@ from typing import BinaryIO, Callable, Mapping, Sequence
 
 
 from van_compute import (
-    config, engine, limited_child, mac_execution_record, protocol,
+    config, engine, limited_child, mac_execution_record, mac_launch, protocol,
     registry_proxy, task_cache,
 )
+from van_compute.mac_lease_audit import LeaseAudit
 from van_compute.backoff import HostRetryGate, RetryCancelled
 from van_compute.config import WorkerConfig
 from van_compute.path_replace import replace_paths_once
@@ -1169,6 +1170,7 @@ def wait_for_analysis_process(
     minimum_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
     free_space_reader: Callable[[Path], int] = filesystem_free_bytes,
 ) -> AnalysisOutcome:
+    mac_launch.log_launched_group(process.pid, work_path)
     outcome = engine.wait_for_process(
         process,
         host=engine.Host.MAC,
@@ -1431,10 +1433,12 @@ def execute_job(
         "--",
         *command,
     ]
+    mac_launch.require_launch(stop_event, WorkerShutdown)
     started = utc_now()
     started_monotonic = time.monotonic()
     # The cache stays locked until the child and its process group are reaped.
     with cache_scope:
+        mac_launch.require_launch(stop_event, WorkerShutdown)
         outcome = engine.run_child(
             child_command,
             cwd=source_root,
@@ -1855,11 +1859,13 @@ def run_once(args: WorkerConfig) -> dict[str, object]:
         name=f"van-compute-heartbeat-{remote.worker}",
     )
     heartbeat_thread.start()
+    audit = LeaseAudit(remote, args.heartbeat_interval, transport_errors=(TransportUnavailable,))
     try:
-        return run_claimed_job(args, remote, manifest)
+        return audit.wrap(run_claimed_job)(args, remote, manifest)
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join()
+        audit.close()
 
 
 class PersistentScheduler:
@@ -1885,7 +1891,6 @@ class PersistentScheduler:
         self.multiplexers = list(
             multiplexers or ([] if multiplexer is None else [multiplexer])
         )
-        self.job_runner = job_runner
         if remote_factory is not None:
             self.remotes = [
                 remote_factory(f"{args.worker}.{index:02d}")
@@ -1915,6 +1920,9 @@ class PersistentScheduler:
             base=retry_base,
             cap=RECOVERY_BACKOFF_CAP,
         )
+        self.lease_audit = LeaseAudit(self.coordinator, args.heartbeat_interval,
+                                      stop_event=stop_event, transport_errors=(TransportUnavailable,))
+        self.job_runner = self.lease_audit.wrap(job_runner)
         for remote in [*self.remotes, self.coordinator]:
             remote.retry_gate = self.retry_gate
             remote.stop_event = self.stop_event
@@ -2116,6 +2124,7 @@ class PersistentScheduler:
             self._slot_changed.set()
             for thread in threads:
                 thread.join()
+            self.lease_audit.close()
 
 
 def run_scheduler(

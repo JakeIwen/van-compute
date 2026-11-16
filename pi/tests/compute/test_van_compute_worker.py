@@ -114,7 +114,7 @@ class RunOnceTests(unittest.TestCase):
             def claim():
                 return {"id": "20260722T120000Z-00000001"}
 
-        def run_job(_args, _remote, manifest):
+        def run_job(_args, _remote, manifest, _stop=None):  # stop: the lease audit's
             job_started.set()
             self.assertTrue(release_job.wait(2), "test job was not released")
             return {"ok": True, "job": manifest["id"]}
