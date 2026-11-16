@@ -39,7 +39,11 @@ class CancelledRetentionTests(RetentionHarness, unittest.TestCase):
         young = self.add_job("cancelled", age_days=1)
         baseline = self.eligible()
         self.assertEqual(baseline["eligible_ids"], [])
-        payload = self.eligible("--max-history-bytes", "1")
+        # A 1-byte budget is unsatisfiable where state directories take blocks
+        # (ext4), so prune may exit 1; the young job is still selected.
+        code, payload, errors = self.prune("--max-history-bytes", "1")
+        self.assertIn(code, (0, 1))
+        self.assertEqual(errors, "")
         self.assertIn(young, payload["eligible_ids"])
 
     def test_citations_protect_a_cancelled_job(self):
