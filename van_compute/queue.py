@@ -25,7 +25,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from typing import BinaryIO, Iterator, Sequence, TextIO
+from typing import BinaryIO, Callable, Iterator, Sequence, TextIO
 
 
 from van_compute import finished_source, job_states, protocol
@@ -1093,7 +1093,10 @@ def worker_finish(
         return manifest
 
 
-def wait_for_job(root: Path, job_id: str, timeout: float, interval: float = 1.0) -> dict[str, object]:
+def wait_for_job(
+    root: Path, job_id: str, timeout: float, interval: float = 1.0,
+    interrupted: Callable[[], bool] | None = None,
+) -> dict[str, object]:
     if not math.isfinite(timeout) or timeout < 0:
         raise QueueError("wait timeout must be a finite non-negative number")
     if not math.isfinite(interval) or interval <= 0:
@@ -1103,6 +1106,8 @@ def wait_for_job(root: Path, job_id: str, timeout: float, interval: float = 1.0)
         manifest = manifest_for(root, job_id)
         if manifest.get("state") in job_states.TERMINAL_STATES:
             return manifest
+        if interrupted is not None and interrupted():
+            return {**manifest, "wait_interrupted": True}
         if time.monotonic() >= deadline:
             manifest = dict(manifest)
             manifest["wait_timed_out"] = True

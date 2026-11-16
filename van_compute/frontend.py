@@ -18,7 +18,7 @@ import sys
 from typing import Sequence
 
 
-from van_compute import queue
+from van_compute import caller_signals, job_cancel, job_states, queue
 
 protocol = queue.protocol
 MAX_WAIT_SECONDS = 24 * 60 * 60
@@ -122,6 +122,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="include bounded stdout/stderr text when the waited job completes",
     )
+    run.add_argument(
+        "--cancel-on-timeout",
+        action="store_true",
+        help="cancel the job if --wait runs out or this command is interrupted "
+        "(SIGINT, SIGTERM, SIGHUP); exits 4 when the cancel lands",
+    )
 
     tasks = subparsers.add_parser("tasks", help="list named tasks the repository exposes")
     tasks.add_argument(
@@ -138,6 +144,11 @@ def build_parser() -> argparse.ArgumentParser:
     wait.add_argument("--timeout", type=float, default=3600.0)
     wait.add_argument("--stdout", action="store_true")
 
+    cancel = subparsers.add_parser(
+        "cancel", help="withdraw one queued or running job (idempotent)"
+    )
+    cancel.add_argument("job_id")
+
     result = subparsers.add_parser("result", help="write one result file to stdout")
     result.add_argument("job_id")
     result.add_argument("path")
@@ -145,6 +156,60 @@ def build_parser() -> argparse.ArgumentParser:
     listing = subparsers.add_parser("list", help="list recent jobs")
     listing.add_argument("--limit", type=int, default=20)
     return parser
+
+
+def _wait_status(manifest: dict[str, object]) -> int:
+    if manifest.get("wait_timed_out"):
+        return job_states.EXIT_WAIT_TIMED_OUT
+    return job_states.exit_status(manifest)
+
+
+def _withdraw(
+    root: Path, manifest: dict[str, object], reason: str, signal_number: int | None
+) -> tuple[dict[str, object], int]:
+    """Cancel a job its caller gave up on; returns (manifest to print, exit status)."""
+    interrupted = 128 + signal_number if signal_number is not None else None
+    try:
+        result, current = job_cancel.cancel_job(root, str(manifest["id"]), reason)
+    except (queue.QueueError, OSError) as exc:
+        if interrupted is None:
+            raise
+        print(f"pi-compute: cancel after signal failed: {exc}", file=sys.stderr)
+        return manifest, interrupted
+    flags = {key: True for key in ("wait_timed_out", "wait_interrupted") if manifest.get(key)}
+    payload = {**current, **flags, "cancel_result": result}
+    if result in job_states.CANCEL_LANDED:
+        return payload, job_states.EXIT_CANCELLED
+    # It finished first: report that outcome, or the interruption.
+    return payload, interrupted if interrupted is not None else job_states.exit_status(current)
+
+
+def _run(root: Path, args: argparse.Namespace) -> int:
+    """Submit, optionally wait, and withdraw the job if its caller gave up."""
+    with caller_signals.latched(args.cancel_on_timeout) as caught:
+        try:
+            manifest = queue.submit_job(args)
+        except (queue.QueueError, protocol.ProtocolError, OSError) as exc:
+            if not caught.is_set():
+                raise
+            print(f"pi-compute: {exc}", file=sys.stderr)
+            return 128 + int(caught.number)
+        if args.wait is not None and not caught.is_set():
+            manifest = queue.wait_for_job(
+                root, str(manifest["id"]), args.wait, interrupted=caught.is_set
+            )
+        status = _wait_status(manifest)
+        if caught.is_set():
+            manifest, status = _withdraw(root, manifest, "caller-signal", caught.number)
+        elif args.cancel_on_timeout and manifest.get("wait_timed_out"):
+            manifest, status = _withdraw(root, manifest, "wait-timeout", None)
+    try:
+        print_json(_present_manifest(root, manifest, include_output=args.stdout))
+    except OSError:
+        if not caught.is_set():
+            raise
+        # A closed terminal (SIGHUP) does not change what happened.
+    return status
 
 
 def _task_listing(source_root: Path) -> dict[str, object]:
@@ -198,13 +263,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "run":
             if args.wait is not None:
                 _validate_wait(args.wait, "--wait")
-            manifest = queue.submit_job(args)
-            if args.wait is not None:
-                manifest = queue.wait_for_job(root, str(manifest["id"]), args.wait)
-            print_json(_present_manifest(root, manifest, include_output=args.stdout))
-            if manifest.get("wait_timed_out"):
-                return 3
-            return 1 if manifest.get("state") == "failed" else 0
+            elif args.cancel_on_timeout:
+                parser.error("--cancel-on-timeout requires --wait")
+            return _run(root, args)
+        if args.command == "cancel":
+            result, manifest = job_cancel.cancel_job(root, args.job_id)
+            print_json(
+                {**_present_manifest(root, manifest, include_output=False), "cancel_result": result}
+            )
+            return job_states.EXIT_OK
         if args.command == "status":
             print_json(
                 _present_manifest(
@@ -218,9 +285,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _validate_wait(args.timeout, "--timeout")
             manifest = queue.wait_for_job(root, args.job_id, args.timeout)
             print_json(_present_manifest(root, manifest, include_output=args.stdout))
-            if manifest.get("wait_timed_out"):
-                return 3
-            return 1 if manifest.get("state") == "failed" else 0
+            return _wait_status(manifest)
         if args.command == "list":
             if not 1 <= args.limit <= 1000:
                 raise queue.QueueError("--limit must be from 1 through 1000")
