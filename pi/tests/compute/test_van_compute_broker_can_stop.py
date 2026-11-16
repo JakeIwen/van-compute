@@ -134,11 +134,11 @@ class CanStopTests(BrokerHarness, unittest.TestCase):
     def active_after_launch(self, _directory=None):
         """Quiet until the job is running, then a held lock."""
         self.calls += 1
-        if self.hang_pids():
+        # Wait for the descendant too: an assertion here would latch a probe fault.
+        if len(self.hang_pids()) >= 2:
             if self.seen_active_at is None:
                 self.seen_active_at = time.monotonic()
                 self.seen_pids = self.hang_pids()
-                self.assertEqual(len(self.seen_pids), 2)
                 self.watcher = threading.Thread(target=self.watch_until_dead)
                 self.watcher.start()
             return HELD
